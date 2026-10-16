@@ -12,6 +12,7 @@ import { ALL_GOOGLE_SERVICES, DEFAULT_CALENDAR_ID } from '../core/google/types.t
 import { CALENDAR_FUTURE_DAYS_MAX, CALENDAR_HORIZON_DAYS } from '../core/google/calendar-window.ts';
 import { parseExcludeLabelTokens } from '../core/google/loops-exclusion.ts';
 import { parseContactsDir } from '../core/google/source-config.ts';
+import { APPLE_ONLY_FLAGS, APPLE_SHARED_FLAGS, AppleAddFlagError, appleAddPlatformWarning, buildAppleAddOptions } from './sources-apple-flags.ts';
 
 export const SOURCE_LIFECYCLE_COMMANDS = ['add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'] as const;
 export function isSourceLifecycleCommand(value: string): boolean {
@@ -41,7 +42,8 @@ export function parseSourceLifecycleArgs(args: string[], generatedId = randomUUI
     'federated', 'no-federated', 'no-federate', 'refederate', 'no-harden']);
   const valued = new Set(['request-id', 'expected-incarnation', 'brain', 'path', 'url', 'name', 'clone-dir',
     'pat-file', 'kind', 'account', 'access', 'token-command', 'token-env', 'services', 'history-days',
-    'future-days', 'loops-exclude-labels', 'contacts-dir', 'calendar-id', 'scope', 'repos', 'dir', 'app-id', 'app-pem', 'app-install']);
+    'future-days', 'loops-exclude-labels', 'contacts-dir', 'calendar-id', 'scope', 'repos', 'dir', 'app-id', 'app-pem', 'app-install',
+    ...APPLE_ONLY_FLAGS]);
   for (let i = 0; i < rest.length; i++) {
     const token = rest[i];
     if (!token.startsWith('-')) { positionals.push(token); continue; }
@@ -102,17 +104,22 @@ export function parseSourceLifecycleArgs(args: string[], generatedId = randomUUI
 
   if (flags.has('federated') && flags.has('no-federated')) throw invalid('Choose one federation setting.', 'Pass either --federated or --no-federated, not both.');
   const kind = values.get('kind');
-  if (kind !== undefined && !['google', 'github'].includes(kind)) throw invalid('Source kind must be github or google.',
-    'Pass --kind github or --kind google; a directory or Git remote source uses --path or --url instead of --kind.');
+  if (kind !== undefined && !['google', 'github', 'apple'].includes(kind)) throw invalid('Source kind must be github, google or apple.',
+    'Pass --kind github, --kind google or --kind apple; a directory or Git remote source uses --path or --url instead of --kind.');
   if ([values.has('path'), values.has('url'), kind !== undefined].filter(Boolean).length > 1) throw invalid('--path, --url and --kind are mutually exclusive.',
-    'Give exactly one of --path (a local directory), --url (an https Git remote) or --kind (github or google).');
+    'Give exactly one of --path (a local directory), --url (an https Git remote) or --kind (github, google or apple).');
   const googleOnly = ['account', 'access', 'token-command', 'services', 'history-days', 'future-days', 'loops-exclude-labels', 'contacts-dir', 'calendar-id'];
   const githubOnly = ['scope', 'repos', 'app-id', 'app-pem', 'app-install'];
-  const kindOptions = [...googleOnly, ...githubOnly, 'dir', 'token-env'];
-  for (const key of kindOptions) if (values.has(key) && !kind) throw invalid(`--${key} requires --kind github or google.`,
-    `Add ${googleOnly.includes(key) ? '--kind google' : githubOnly.includes(key) ? '--kind github' : '--kind github or --kind google'} for --${key}, or remove --${key}.`);
+  const appleOnly: readonly string[] = APPLE_ONLY_FLAGS;
+  const appleShared: readonly string[] = APPLE_SHARED_FLAGS;
+  const kindOptions = [...googleOnly, ...githubOnly, ...appleOnly, 'dir', 'token-env'];
+  for (const key of kindOptions) if (values.has(key) && !kind) throw invalid(`--${key} requires --kind github, google or apple.`,
+    `Add ${appleOnly.includes(key) ? '--kind apple' : googleOnly.includes(key) ? '--kind google' : githubOnly.includes(key) ? '--kind github' : '--kind github, --kind google or --kind apple'} for --${key}, or remove --${key}.`);
+  for (const key of appleOnly) {
+    if (values.has(key) && kind !== 'apple') throw invalid(`--${key} requires --kind apple.`, `--${key} configures an Apple source: use --kind apple, or remove --${key} from this ${kind} source.`);
+  }
   for (const key of googleOnly) {
-    if (values.has(key) && kind !== 'google') throw invalid(`--${key} requires --kind google.`, `--${key} configures a Google source: use --kind google, or remove --${key} from this ${kind} source.`);
+    if (values.has(key) && kind !== 'google' && !(kind === 'apple' && appleShared.includes(key))) throw invalid(`--${key} requires --kind google.`, `--${key} configures a Google source: use --kind google, or remove --${key} from this ${kind} source.`);
   }
   for (const key of githubOnly) {
     if (values.has(key) && kind !== 'github') throw invalid(`--${key} requires --kind github.`, `--${key} configures a GitHub source: use --kind github, or remove --${key} from this ${kind} source.`);
@@ -167,6 +174,20 @@ export function parseSourceLifecycleArgs(args: string[], generatedId = randomUUI
       ...(futureDays !== undefined ? { futureDays } : {}), ...(loopsExcludeLabels.length > 0 ? { loopsExcludeLabels } : {}),
       dir: absolute(values.get('dir') ?? defaultCloneDir(`${id}-google`)), access: access as 'vault' | 'command' | 'env',
       tokenCommand: values.get('token-command'), tokenEnv: values.get('token-env') };
+  }
+  if (kind === 'apple') {
+    const notApple = ['access', 'token-command', 'token-env', 'loops-exclude-labels', 'calendar-id', 'scope', 'repos', 'app-id', 'app-pem', 'app-install'].find(key => values.has(key));
+    if (notApple) throw invalid(`--${notApple} does not apply to --kind apple.`, `An Apple source has no credential and no ${notApple} setting; remove --${notApple}. Calendar selection is --calendar-ids.`);
+    try {
+      opts.apple = buildAppleAddOptions({ services: values.get('services'), account: values.get('account'), historyDays: values.get('history-days'),
+        futureDays: values.get('future-days'), calendarIds: values.get('calendar-ids'), contactsDir: values.get('contacts-dir'),
+        mailMailboxes: values.get('mail-mailboxes'), mailDays: values.get('mail-days'), dir: absolute(values.get('dir') ?? defaultCloneDir(`${id}-apple`)) });
+    } catch (error) {
+      if (error instanceof AppleAddFlagError) throw invalid(error.message, error.suggestion);
+      throw error;
+    }
+    const warning = appleAddPlatformWarning();
+    if (warning) process.stderr.write(`${warning}\n`);
   }
   return { operation: 'source_add', params: { options: opts, request_id: requestId, ...(dryRun ? { dry_run: true } : {}) },
     brain: values.get('brain'), legacyOnly: values.has('pat-file'), json: flags.has('json') };

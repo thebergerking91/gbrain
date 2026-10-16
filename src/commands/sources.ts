@@ -142,17 +142,20 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   const id = args[0];
   if (!id) {
     console.error(
-      'Usage: gbrain sources add <id> [--path <path> | --url <https-url> | --kind github|google] ' +
+      'Usage: gbrain sources add <id> [--path <path> | --url <https-url> | --kind github|google|apple] ' +
         '[--name <display>] [--federated|--no-federated] [--clone-dir <path>] [--force]\n' +
         '       github kind: [--token-env <env>] [--scope auto|repos] ' +
         '[--repos owner/name,...] [--dir <path>] ' +
         '[--app-id <n> --app-pem <path>] [--app-install <n>]\n' +
+        '       apple kind (macOS): [--services calendar,contacts,mail] [--account <label>] [--calendar-ids <a,b>] [--mail-mailboxes INBOX,Sent] [--mail-days <n>]   (permissions: gbrain apple setup)\n' +
         '       google kind: --account <email> [--services gmail,calendar,contacts] ' +
         '[--history-days <n>] [--future-days <n>] [--loops-exclude-labels <a,b>] [--contacts-dir <dir>] [--calendar-id <id>] [--dir <path>]   (connect first: gbrain google connect)\n' +
         '                    [--access vault|command|env] [--token-command "<cmd>"] [--token-env <VAR>]   (non-vault Google access: gog/gcloud/gateway)',
     );
     process.exit(2);
   }
+
+  if (args.some((a, i) => a === '--kind' && args[i + 1] === 'apple')) return (await import('./sources-apple-add.ts')).runAddApple(engine, args);
 
   let localPath: string | null = null;
   let remoteUrl: string | undefined;
@@ -1911,6 +1914,7 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     // v0.40.3.0 contextual retrieval (from master)
     case 'set-cr-mode': return runSetCrMode(engine, rest);
     case 'set-calendar': return (await import('./sources-set-calendar.ts')).runSetCalendar(engine, rest);
+    case 'set-services': return (await import('./sources-set-services.ts')).runSetServices(engine, rest);
     case 'set-trust':  { const { runSetTrust } = await import('./sources-trust.ts'); return runSetTrust(engine, rest); }
     // #4739 non-destructive local_path pointer repair
     case 'set-path':   { const { runSetPath } = await import('./sources-set-path.ts'); return runSetPath(engine, rest); }
@@ -1998,6 +2002,7 @@ Subcommands:
                                     "default" to clear (NULL falls through
                                     to the global search.mode bundle).
   set-calendar <id> <calendar-id> [--yes]  Point a Google source at another calendar (ids: gbrain google calendars).
+  set-services <id> --add|--remove <svc> [--yes]  Opt an Apple source in/out of calendar, contacts or mail (pages stay).
   set-trust <id> <tier>|--clear     Trust default for this source's sync and import (operator_curated or lower).
   set-path <id> <path> [--force]    Repair a source's local_path pointer
                                     (DB column only, never touches disk).
