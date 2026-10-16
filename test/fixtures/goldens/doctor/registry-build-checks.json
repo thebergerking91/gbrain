@@ -506,6 +506,10 @@
         "name": "google_calendar_readable"
       },
       {
+        "category": "ops",
+        "name": "apple_permissions"
+      },
+      {
         "category": "brain",
         "name": "extractor_facts_expired"
       },

@@ -1,0 +1,369 @@
+/**
+ * apple sweep — the Contacts, Calendar and Mail sweeps of the apple source
+ * kind. Each sweep:
+ *
+ *   1. asks the injected reader for the configured window (a reader error is
+ *      SOURCE-level: it propagates, commits nothing for that service, and is
+ *      never counted toward an item hold);
+ *   2. renders every item deterministically and hash-diffs it against the
+ *      state (`id → sha256(path + markdown)`); an unchanged item whose page is
+ *      still there costs nothing, so an identical rerun adds/modifies 0;
+ *   3. writes changed items through the item holds: an item whose render or
+ *      import fails on 3 consecutive runs is held and no longer blocks the run;
+ *   4. on `--full` only, removes the pages of items inside the window that the
+ *      complete listing no longer names. An incremental sweep never deletes
+ *      anything upstream stopped listing (a staged rename of one item's own
+ *      page excepted). More than 200 removals at once needs
+ *      GBRAIN_ALLOW_MASS_RECONCILE=1; a refusal removes nothing and marks the
+ *      run partial.
+ *
+ * Ownership is keyed on the marker frontmatter field (`apple_event_id`,
+ * `apple_contact_id`, `apple_thread_id`), never on the path alone: a
+ * hand-authored page at a contact's path is skipped, never overwritten.
+ */
+import type { ConnectorHoldSession } from '../connectors/connector-hold-session.ts';
+import { massReconcileAllowed } from '../sync-reconcile.ts';
+import { assertInlineBody } from '../page-body/page-shape.ts';
+import {
+  calendarItemKey,
+  contactDisplayName,
+  renderedHash,
+  groupMailThreads,
+  mailPriorFromPage,
+  personSlugFromContact,
+  renderCalendarEventPage,
+  renderMailThreadPage,
+  renderPersonPage,
+  type RenderedPage,
+} from './render.ts';
+import {
+  deletePageByRelPath,
+  importRendered,
+  loadLivePaths,
+  loadOwnedPages,
+  type ActivePack,
+  type AppleSyncDeps,
+  type AppleSyncSummary,
+} from './sweep-shared.ts';
+import type { AppleCalendarEvent, AppleContact, AppleMailMessage, AppleSourceState } from './types.ts';
+
+const DAY_MS = 86_400_000;
+
+/** Removals one `--full` reconcile may make without GBRAIN_ALLOW_MASS_RECONCILE=1. */
+export const APPLE_MASS_RECONCILE_LIMIT = 200;
+
+export interface AppleSweepCtx {
+  deps: AppleSyncDeps;
+  state: AppleSourceState;
+  activePack: ActivePack;
+  summary: AppleSyncSummary;
+  countedSlugs: Set<string>;
+  holds: ConnectorHoldSession;
+}
+
+const byId = <T,>(key: (x: T) => string) => (a: T, b: T): number => {
+  const ka = key(a);
+  const kb = key(b);
+  return ka < kb ? -1 : ka > kb ? 1 : 0;
+};
+
+const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+// ── Item holds ───────────────────────────────────────────────────────────────
+
+/** Counts one item failure (hold bookkeeping, summary, log). Managed write errors are rethrown by the hold session. */
+async function failItem(ctx: AppleSweepCtx, holdKey: string, error: unknown, version: string | null, page: RenderedPage | null): Promise<void> {
+  const { deps, summary, holds } = ctx;
+  const wasHeld = holds.isHeld(holdKey);
+  const classified = await holds.fail(holdKey, error, { version, slug: page ? page.relPath.replace(/\.md$/, '') : null });
+  summary.failedFiles++;
+  deps.log(`[apple] ${holdKey} failed${classified.scope === 'rate_limit' ? ' (rate limited; not counted toward a hold)' : ''}: ${messageOf(error)}`);
+  // A held item that fails again after being re-admitted does not make the run partial.
+  if (!wasHeld || classified.scope === 'rate_limit') summary.status = 'partial';
+}
+
+/** One item through the holds. True when it was written. */
+async function attemptItem(ctx: AppleSweepCtx, holdKey: string, version: string, page: RenderedPage, work: () => Promise<void>): Promise<boolean> {
+  if (!ctx.holds.shouldAttempt(holdKey, version)) {
+    ctx.deps.tick(`${holdKey} held`);
+    return false;
+  }
+  try {
+    await work();
+    ctx.holds.succeed(holdKey);
+    ctx.deps.tick(holdKey);
+    return true;
+  } catch (e) {
+    await failItem(ctx, holdKey, e, version, page);
+    return false;
+  }
+}
+
+/** Run a pure render; a throw is an item failure (version unknown), never a sweep failure. */
+async function safeRender<T>(ctx: AppleSweepCtx, holdKey: string, render: () => T): Promise<{ ok: true; value: T } | { ok: false }> {
+  try {
+    return { ok: true, value: render() };
+  } catch (e) {
+    if (!ctx.holds.shouldAttempt(holdKey, null)) return { ok: false };
+    await failItem(ctx, holdKey, e, null, null);
+    return { ok: false };
+  }
+}
+
+// ── Full reconcile ───────────────────────────────────────────────────────────
+
+/**
+ * Removes `gone` pages (already restricted to the sweep's window by the
+ * caller). Returns whether the removal ran; a refusal aborts the whole
+ * cleanup and marks the run partial.
+ */
+async function reconcileRemovals(ctx: AppleSweepCtx, service: string, gone: Array<{ key: string; path: string }>): Promise<boolean> {
+  if (gone.length === 0) return true;
+  if (gone.length > APPLE_MASS_RECONCILE_LIMIT && !massReconcileAllowed()) {
+    ctx.deps.log(`[apple] mass-delete guard refused ${gone.length} ${service} deletes for source ${ctx.deps.sourceId} (set GBRAIN_ALLOW_MASS_RECONCILE=1 to allow)`);
+    ctx.summary.status = 'partial';
+    return false;
+  }
+  for (const g of gone) await deletePageByRelPath(ctx.deps, g.path, ctx.summary);
+  return true;
+}
+
+const signalOf = (ctx: AppleSweepCtx): { signal?: AbortSignal } => (ctx.deps.opts.signal ? { signal: ctx.deps.opts.signal } : {});
+const aborted = (ctx: AppleSweepCtx): boolean => ctx.deps.opts.signal?.aborted === true;
+
+const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+
+// ── Calendar ─────────────────────────────────────────────────────────────────
+
+export async function sweepCalendar(ctx: AppleSweepCtx): Promise<void> {
+  const { deps, state, summary } = ctx;
+  const nowMs = deps.now();
+  const from = new Date(nowMs - deps.cfg.historyDays * DAY_MS);
+  const to = new Date(nowMs + deps.cfg.futureDays * DAY_MS);
+  // A reader error propagates: source-level, nothing is committed or held.
+  const listed = await deps.readers.calendar({ from, to, calendarIds: deps.cfg.calendarIds, ...signalOf(ctx) });
+  summary.itemsSeen.calendar = listed.length;
+
+  const events = new Map<string, AppleCalendarEvent>();
+  for (const ev of listed) events.set(calendarItemKey(ev), ev);
+
+  const pathByKey = new Map<string, string>();
+  const startByKey = new Map<string, string>();
+  for (const o of await loadOwnedPages(deps, 'apple_event_id')) {
+    const id = str(o.frontmatter.apple_event_id);
+    const cal = str(o.frontmatter.apple_calendar_id);
+    if (id === null || cal === null) continue;
+    const key = `${cal}:${id}`;
+    pathByKey.set(key, o.sourcePath);
+    startByKey.set(key, str(o.frontmatter.start) ?? '');
+  }
+
+  const live = new Set<string>();
+  for (const key of [...events.keys()].sort()) {
+    if (aborted(ctx)) return;
+    const ev = events.get(key)!;
+    const holdKey = `calendar:${key}`;
+    const rendered = await safeRender(ctx, holdKey, () => renderCalendarEventPage(ev, deps.cfg.account));
+    if (!rendered.ok) { live.add(key); continue; }
+    const page = rendered.value;
+    // Cancelled: not rendered, not live; an incremental sweep leaves any existing page alone.
+    if (!page) continue;
+    live.add(key);
+    const hash = renderedHash(page.relPath, page.markdown);
+    const existing = pathByKey.get(key);
+    if (state.calendar.hashes[key] === hash && existing === page.relPath) continue;
+    await attemptItem(ctx, holdKey, hash, page, async () => {
+      await importRendered(deps, page.relPath, page.markdown, ctx.activePack, summary, ctx.countedSlugs,
+        { apple_event_id: ev.id, apple_calendar_id: ev.calendarId });
+      // Staged rename (the event moved to another day or title): the new page lands first.
+      if (existing && existing !== page.relPath) await deletePageByRelPath(deps, existing, summary);
+      state.calendar.hashes[key] = hash;
+      pathByKey.set(key, page.relPath);
+      startByKey.set(key, ev.start);
+    });
+  }
+  if (aborted(ctx)) return;
+
+  if (deps.opts.full) {
+    const gone: Array<{ key: string; path: string }> = [];
+    for (const [key, path] of pathByKey) {
+      if (live.has(key)) continue;
+      const start = Date.parse(startByKey.get(key) ?? '');
+      // Only events starting inside the listed window can be judged gone.
+      if (Number.isFinite(start) && start >= from.getTime() && start < to.getTime()) gone.push({ key, path });
+    }
+    if (await reconcileRemovals(ctx, 'calendar', gone)) {
+      for (const g of gone) delete state.calendar.hashes[g.key];
+      for (const key of Object.keys(state.calendar.hashes)) {
+        if (!live.has(key) && !pathByKey.has(key)) delete state.calendar.hashes[key];
+      }
+    }
+  }
+  state.calendar.window = { from: from.toISOString(), to: to.toISOString() };
+}
+
+// ── Contacts ─────────────────────────────────────────────────────────────────
+
+export async function sweepContacts(ctx: AppleSweepCtx): Promise<void> {
+  const { deps, state, summary } = ctx;
+  const dir = deps.cfg.contactsDir;
+  const listed = await deps.readers.contacts({ ...signalOf(ctx) });
+  summary.itemsSeen.contacts = listed.length;
+
+  const contacts = new Map<string, AppleContact>();
+  for (const c of listed) contacts.set(c.id, c);
+
+  const pathById = new Map<string, string>();
+  const ownerByPath = new Map<string, string>();
+  for (const o of await loadOwnedPages(deps, 'apple_contact_id')) {
+    const id = str(o.frontmatter.apple_contact_id);
+    if (id === null) continue;
+    pathById.set(id, o.sourcePath);
+    ownerByPath.set(o.sourcePath, id);
+  }
+  const livePaths = await loadLivePaths(deps, `${dir}/`);
+
+  const live = new Set<string>();
+  // Sorted so a name collision resolves the same way on every run.
+  for (const c of [...contacts.values()].sort(byId((x) => x.id))) {
+    if (aborted(ctx)) return;
+    const holdKey = `contacts:${c.id}`;
+    const rendered = await safeRender(ctx, holdKey, () => {
+      const baseSlug = personSlugFromContact(c, false, dir);
+      if (!baseSlug) return null;
+      const baseOwner = ownerByPath.get(`${baseSlug}.md`);
+      return renderPersonPage(c, baseOwner !== undefined && baseOwner !== c.id, dir);
+    });
+    if (!rendered.ok) { live.add(c.id); continue; }
+    const page = rendered.value;
+    if (!page) continue;
+    live.add(c.id);
+    const owner = ownerByPath.get(page.relPath);
+    if (owner === undefined && livePaths.has(page.relPath)) {
+      // Hand-authored (or another connector's) page: body and frontmatter untouched.
+      deps.log(`[apple] skipping hand-authored ${page.relPath}`);
+      continue;
+    }
+    if (owner !== undefined && owner !== c.id) {
+      deps.log(`[apple] skipping ${page.relPath}: owned by another contact`);
+      continue;
+    }
+    const hash = renderedHash(page.relPath, page.markdown);
+    const existing = pathById.get(c.id);
+    if (state.contacts.hashes[c.id] === hash && existing === page.relPath) continue;
+    await attemptItem(ctx, holdKey, hash, page, async () => {
+      await importRendered(deps, page.relPath, page.markdown, ctx.activePack, summary, ctx.countedSlugs, { apple_contact_id: c.id });
+      // Staged rename (renamed contact or changed contacts dir): retire the old page once the new one exists.
+      if (existing && existing !== page.relPath && ownerByPath.get(existing) === c.id) {
+        await deletePageByRelPath(deps, existing, summary);
+        ownerByPath.delete(existing);
+      }
+      ownerByPath.set(page.relPath, c.id);
+      pathById.set(c.id, page.relPath);
+      state.contacts.hashes[c.id] = hash;
+    });
+  }
+  if (aborted(ctx)) return;
+
+  if (deps.opts.full) {
+    const gone: Array<{ key: string; path: string }> = [];
+    for (const [id, path] of pathById) if (!live.has(id)) gone.push({ key: id, path });
+    if (await reconcileRemovals(ctx, 'contacts', gone)) {
+      for (const g of gone) delete state.contacts.hashes[g.key];
+      for (const id of Object.keys(state.contacts.hashes)) {
+        if (!live.has(id) && !pathById.has(id)) delete state.contacts.hashes[id];
+      }
+    }
+  }
+}
+
+// ── Mail ─────────────────────────────────────────────────────────────────────
+
+export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
+  const { deps, state, summary } = ctx;
+  const since = new Date(deps.now() - deps.cfg.mailDays * DAY_MS);
+  const messages: AppleMailMessage[] = await deps.readers.mail({ since, mailboxes: deps.cfg.mailMailboxes, ...signalOf(ctx) });
+  summary.itemsSeen.mail = messages.length;
+
+  const pathByThread = new Map<string, string>();
+  const frontmatterByThread = new Map<string, Record<string, unknown>>();
+  for (const o of await loadOwnedPages(deps, 'apple_thread_id')) {
+    const id = str(o.frontmatter.apple_thread_id);
+    if (id === null) continue;
+    pathByThread.set(id, o.sourcePath);
+    frontmatterByThread.set(id, o.frontmatter);
+  }
+
+  const live = new Set<string>();
+  for (const thread of groupMailThreads(messages)) {
+    if (aborted(ctx)) return;
+    const holdKey = `mail:${thread.threadId}`;
+    const first = await safeRender(ctx, holdKey, () => renderMailThreadPage(thread, deps.cfg.account));
+    if (!first.ok) { live.add(thread.threadId); continue; }
+    let page = first.value;
+    if (!page) continue; // automated mail renders nothing
+    live.add(thread.threadId);
+    const existing = pathByThread.get(thread.threadId);
+    if (state.mail.hashes[thread.threadId] === renderedHash(page.relPath, page.markdown) && existing === page.relPath) continue;
+    if (existing) {
+      // The window no longer lists the oldest messages of a long thread: carry them forward from the page.
+      let prior;
+      try { prior = await loadMailPrior(ctx, existing, frontmatterByThread.get(thread.threadId) ?? {}); } catch (e) {
+        if (ctx.holds.shouldAttempt(holdKey, null)) await failItem(ctx, holdKey, e, null, null);
+        continue;
+      }
+      if (prior) {
+        const carried = await safeRender(ctx, holdKey, () => renderMailThreadPage(thread, deps.cfg.account, prior));
+        if (!carried.ok) continue;
+        if (carried.value) page = carried.value;
+      }
+    }
+    const final = page;
+    const hash = renderedHash(final.relPath, final.markdown);
+    if (state.mail.hashes[thread.threadId] === hash && existing === final.relPath) continue;
+    await attemptItem(ctx, holdKey, hash, final, async () => {
+      await importRendered(deps, final.relPath, final.markdown, ctx.activePack, summary, ctx.countedSlugs,
+        { apple_thread_id: thread.threadId, apple_message_ids: thread.messages.map((m) => m.id) });
+      if (existing && existing !== final.relPath) await deletePageByRelPath(deps, existing, summary);
+      state.mail.hashes[thread.threadId] = hash;
+      pathByThread.set(thread.threadId, final.relPath);
+    });
+  }
+  if (aborted(ctx)) return;
+
+  if (deps.opts.full) {
+    const gone: Array<{ key: string; path: string }> = [];
+    for (const [tid, path] of pathByThread) {
+      if (live.has(tid)) continue;
+      const firstDate = Date.parse(str(frontmatterByThread.get(tid)?.first_message_date) ?? '');
+      // Threads that began before the mail window are out of enumeration scope.
+      if (Number.isFinite(firstDate) && firstDate >= since.getTime()) gone.push({ key: tid, path });
+    }
+    if (await reconcileRemovals(ctx, 'mail', gone)) {
+      for (const g of gone) delete state.mail.hashes[g.key];
+      for (const tid of Object.keys(state.mail.hashes)) {
+        if (!live.has(tid) && !pathByThread.has(tid)) delete state.mail.hashes[tid];
+      }
+    }
+  }
+  state.mail.since = since.toISOString();
+}
+
+/**
+ * The prior mail page, for carrying forward messages the reader window no
+ * longer lists. A mail thread page is inline by construction (bounded message
+ * bodies); a segmented one is refused with `page_body_segmented` rather than
+ * rewritten without its older messages.
+ */
+async function loadMailPrior(ctx: AppleSweepCtx, relPath: string, frontmatter: Record<string, unknown>) {
+  const rows = await ctx.deps.engine.executeRaw<{ compiled_truth: string | null; title: string | null; body_storage: string | null; slug: string }>(
+    `SELECT compiled_truth, title, body_storage, slug FROM pages WHERE source_id = $1 AND source_path = $2 AND deleted_at IS NULL LIMIT 1`,
+    [ctx.deps.sourceId, relPath],
+  );
+  const row = rows[0];
+  if (row) assertInlineBody({ body_storage: row.body_storage as 'inline' | 'segmented' | null, slug: row.slug, source_id: ctx.deps.sourceId }, 'apple mail carry-forward');
+  const body = row?.compiled_truth;
+  return typeof body === 'string' ? mailPriorFromPage(relPath, frontmatter, body, row?.title ?? null) : null;
+}
+
+export { contactDisplayName };

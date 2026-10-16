@@ -48,7 +48,7 @@ interface FencePage { id: number; source_id: string; slug: string; compiled_trut
 
 async function candidates(engine: BrainEngine, sourceIds: string[]): Promise<FencePage[]> {
   return engine.executeRaw<FencePage>(`SELECT p.id,p.source_id,p.slug,p.compiled_truth,p.timeline FROM pages p JOIN sources s ON s.id=p.source_id
-    WHERE p.source_id=ANY($1::text[]) AND p.deleted_at IS NULL AND s.config->>'kind' IN ('google','github')
+    WHERE p.source_id=ANY($1::text[]) AND p.deleted_at IS NULL AND s.config->>'kind' IN ('google','github','apple')
       AND (p.timeline LIKE '%gbrain:facts:%' OR p.timeline LIKE '%gbrain:takes:%') ORDER BY p.id`, [sourceIds]);
 }
 
