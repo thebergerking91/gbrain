@@ -167,12 +167,38 @@ async function defaultReaders(deps: AppleCommandDeps): Promise<AppleReaders> {
 
 // ── setup ────────────────────────────────────────────────────────────────────
 
+const shellArg = (s: string): string => /^[a-zA-Z0-9_@%+=:,./-]+$/.test(s) ? s : "'" + s.replace(/'/g, "'\\''") + "'";
+
 function setupCommand(f: Flags, services: AppleService[], extra: string[] = []): string {
   const parts = ['gbrain', 'apple', 'setup', '--services', services.join(',')];
   if (f.account) parts.push('--account', f.account);
   if (f.source) parts.push('--source', f.source);
+  for (const [key, value] of Object.entries(f.extra)) parts.push(key, value);
   if (f.noSync) parts.push('--no-sync');
-  return [...parts, ...extra].join(' ');
+  if (f.json) parts.push('--json');
+  if (f.yes) parts.push('--yes');
+  if (f.consentExtraction) parts.push('--consent-loops-extraction');
+  parts.push('--sync-budget-ms', String(f.budgetMs));
+  return [...parts, ...extra].map(shellArg).join(' ');
+}
+
+/** Explicit id always wins; account labels are not unique ids. */
+function setupSource(rows: AppleSourceRow[], f: Flags, sourceId: string, account: string): AppleSourceRow | undefined {
+  if (f.source) return rows.find(s => s.id === sourceId);
+  const matches = rows.filter(s => s.cfg.account === account);
+  if (matches.length > 1) throw new Error('More than one Apple source has this account label; pass --source <id> explicitly.');
+  return matches[0];
+}
+
+const sameScopeValue = (a: unknown, b: unknown): boolean => JSON.stringify(Array.isArray(a) ? [...a].sort() : a) === JSON.stringify(Array.isArray(b) ? [...b].sort() : b);
+function setupScopeMismatch(f: Flags, requested: AppleSourceConfig, stored: AppleSourceConfig): string | undefined {
+  if (!sameScopeValue(requested.services, stored.services)) return 'services';
+  if (f.account !== undefined && requested.account !== stored.account) return 'account';
+  const fields = { '--history-days': 'historyDays', '--future-days': 'futureDays', '--calendar-ids': 'calendarIds',
+    '--contacts-dir': 'contactsDir', '--mail-mailboxes': 'mailMailboxes', '--mail-days': 'mailDays', '--mail-owner-addresses': 'mailOwnerAddresses' } as const;
+  for (const [flag, field] of Object.entries(fields)) if (f.extra[flag] !== undefined && !sameScopeValue(requested[field as keyof AppleSourceConfig], stored[field as keyof AppleSourceConfig])) return flag;
+  if (f.consentExtraction && !stored.loopsExtractConsent) return 'extraction_consent';
+  return undefined;
 }
 
 async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promise<number> {
@@ -183,6 +209,9 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
       `It reads Calendar, Contacts and Mail through macOS frameworks; this host is ${platform}.`,
       'Run `gbrain apple setup` on the Mac whose Calendar, Contacts and Mail you want. Nothing was changed here.'));
   }
+  if (f.revokeExtraction) return fail(errorEnvelope('invalid_value', 'Extraction revocation is a loops command, not a setup option.',
+    'Setup must not silently ignore a request to revoke paid Mail extraction.',
+    'Run gbrain apple loops --source <id> --revoke-loops-extraction first; setup reads nothing until then.'));
   let services: AppleService[];
   let addOpts;
   try {
@@ -203,38 +232,57 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
     if (error instanceof AppleAddFlagError) return fail(errorEnvelope(error.code, error.message, 'The service list is the privacy scope of this source, so a bad value never widens it.', error.suggestion));
     throw error;
   }
-  const sourceId = f.source ?? deriveAppleSourceId(addOpts.account ?? 'local');
+  let sourceId = f.source ?? deriveAppleSourceId(addOpts.account ?? 'local');
+
+  // Resolve the registered source and its effective privacy scope BEFORE confirmation or probing.
+  const preflight = await openEngine(deps);
+  let existingBeforeProbe: AppleSourceRow | undefined;
+  const { appleAddConfig } = await import('../core/apple/source-add-config.ts');
+  const requested = parseAppleSourceConfig(appleAddConfig(addOpts, addOpts.dir, false), addOpts.dir);
+  let effectiveCfg: AppleSourceConfig = requested;
+  if (preflight) try {
+    try { existingBeforeProbe = setupSource(await listAppleSources(preflight.engine), f, sourceId, addOpts.account ?? APPLE_DEFAULT_ACCOUNT); }
+    catch (e) { return fail(errorEnvelope('ambiguous_source', String(e), 'Account labels are not unique.', 'Re-run with --source <id>.'), 2); }
+    if (existingBeforeProbe) {
+      const mismatch = setupScopeMismatch(f, requested, existingBeforeProbe.cfg);
+      if (mismatch) return fail(errorEnvelope(mismatch === 'services' ? 'service_scope_mismatch' : 'source_scope_mismatch',
+        `Source ${existingBeforeProbe.id} has a different ${mismatch} scope.`, 'Setup never silently ignores explicit selectors.',
+        'Use the source configuration commands to change its scope explicitly, or pass a new --source id.'), 2);
+      sourceId = existingBeforeProbe.id;
+    } else {
+      const [taken] = await preflight.engine.executeRaw('SELECT id FROM sources WHERE id=$1', [sourceId]);
+      if (taken) return fail(errorEnvelope('source_id_taken', `Source id "${sourceId}" is already used.`, 'It is not an available Apple source.', 'Pick another --source id.'));
+    }
+    effectiveCfg = existingBeforeProbe?.cfg ?? requested;
+  } finally { await preflight.close(); }
+  // Pin retries to the actual source and every selected read window, including inherited scope.
+  f = { ...f, source: sourceId, account: effectiveCfg.account, extra: { ...f.extra } };
+  if (services.includes('mail')) {
+    f.extra['--mail-mailboxes'] = effectiveCfg.mailMailboxes.join(',');
+    f.extra['--mail-days'] = String(effectiveCfg.mailDays);
+    if (effectiveCfg.mailOwnerAddresses.length) f.extra['--mail-owner-addresses'] = effectiveCfg.mailOwnerAddresses.join(',');
+  }
+  if (services.includes('calendar')) {
+    f.extra['--history-days'] = String(effectiveCfg.historyDays);
+    f.extra['--future-days'] = String(effectiveCfg.futureDays);
+    if (effectiveCfg.calendarIds.length) f.extra['--calendar-ids'] = effectiveCfg.calendarIds.join(',');
+  }
+  if (services.includes('contacts')) f.extra['--contacts-dir'] = effectiveCfg.contactsDir;
 
   // Mail first, before any probe: probing Mail triggers a macOS Automation prompt, so consent comes before it.
   if (services.includes('mail') && !f.yes && !f.confirmMail) {
     const command = setupCommand(f, services, ['--confirm-mail']);
     const message = 'Mail is the most sensitive service: gbrain will read the subject, sender, recipients, date and plain-text body of recent messages '
-      + `(mailboxes ${(addOpts.mailMailboxes ?? ['INBOX', 'Sent']).join(', ')}, last ${addOpts.mailDays ?? 30} days) from Mail.app and store them as pages in your brain. `
+      + `(mailboxes ${effectiveCfg.mailMailboxes.join(', ')}, last ${effectiveCfg.mailDays} days) from Mail.app and store them as pages in your brain. `
       + 'Attachments are never downloaded. Nothing leaves this Mac except the text sent to your configured AI provider if atom extraction runs on those pages, or if you separately consent to commitment extraction (--consent-loops-extraction, which needs --mail-owner-addresses and sends Mail thread text to the chat provider configured for this brain). '
+      + (effectiveCfg.loopsExtractConsent ? 'Commitment extraction is currently enabled for this source and sends eligible Mail threads to your configured chat provider. ' : '')
       + `Skip Mail with --services calendar,contacts. Confirm Mail by re-running with --confirm-mail (or --yes).`;
     emitEnvelope(out, { ok: false, status: 'awaiting_confirmation', services, source_id: sourceId, next: { command, user_message: message } },
       [showUserBlock(message, command), '', `Next: ${command}`]);
     return 2;
   }
 
-  // Refuse a scope mismatch before probing: setup must never use a narrower consent
-  // invocation to sync the broader service set already stored on an existing source.
-  const preflight = await openEngine(deps);
-  if (!preflight) {
-    return fail(errorEnvelope('no_brain', 'No gbrain brain is configured yet.', 'There is no brain to check for an existing Apple source.',
-      'Run `gbrain init`, then re-run `gbrain apple setup`.', { command: 'gbrain init' }), 2);
-  }
-  let existingBeforeProbe: Awaited<ReturnType<typeof listAppleSources>>[number] | undefined;
-  try {
-    existingBeforeProbe = (await listAppleSources(preflight.engine)).find((s) => s.cfg.account === (addOpts.account ?? APPLE_DEFAULT_ACCOUNT) || s.id === sourceId);
-  } finally {
-    await preflight.close();
-  }
-  if (existingBeforeProbe && (existingBeforeProbe.cfg.services.length !== services.length || services.some((s) => !existingBeforeProbe!.cfg.services.includes(s)))) {
-    return fail(errorEnvelope('service_scope_mismatch', `Source ${existingBeforeProbe.id} is already configured for ${existingBeforeProbe.cfg.services.join(', ')}.`,
-      'Setup refuses to probe and sync a different service scope; use sources set-services explicitly first, then confirm the new Mail scope if needed.',
-      `Run gbrain sources set-services ${existingBeforeProbe.id} --add|--remove <service>, then gbrain sync --source ${existingBeforeProbe.id}.`), 2);
-  }
+  if (!preflight) return fail(errorEnvelope('no_brain', 'No gbrain brain is configured yet.', 'Cannot resolve the effective Apple source.', 'Run gbrain init first.'), 2);
 
   // Probe every selected service (the only Apple access setup makes before the sync).
   const readers = await defaultReaders(deps);
@@ -287,7 +335,10 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
   }
   try {
     const { engine } = handle;
-    const existing = (await listAppleSources(engine)).find((s) => s.cfg.account === (addOpts.account ?? APPLE_DEFAULT_ACCOUNT) || s.id === sourceId);
+    const existing = (await listAppleSources(engine)).find(s => s.id === sourceId);
+    if ((existingBeforeProbe && (!existing || !sameScopeValue(existing.config, existingBeforeProbe.config))) || (!existingBeforeProbe && existing)) {
+      return fail(errorEnvelope('source_scope_changed', 'Apple source changed during setup.', 'The probed/confirmed source must match execution.', 'Re-run the same setup command to confirm the current scope.'), 2);
+    }
     let registeredId = sourceId;
     let registered = false;
     if (existing) {

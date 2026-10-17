@@ -14,6 +14,8 @@
  *   - collapsed to one line with link/HTML brackets neutralised (headings and
  *     metadata lines, see `inline`).
  */
+import { compactMailMessage } from './loop-evidence.ts';
+import type { AppleLoopMessage } from './types.ts';
 import { createHash } from 'node:crypto';
 
 import { isNoiseSender, sha8, subjectSlug } from '../google/google-render.ts';
@@ -344,7 +346,8 @@ export interface MailPrior {
   blocks: string[];
   /** Timestamp aligned with ids; parsed from rendered headings for legacy pages. */
   dates: string[];
-  latest: { date: string; from: string; to: string[]; cc: string[]; mailbox: string };
+  loopMessages?: AppleLoopMessage[];
+  latest: { id?: string; date: string; from: string; to: string[]; cc: string[]; mailbox: string };
   participants: string[];
   senders: string[];
   mailboxes: string[];
@@ -398,7 +401,8 @@ export function mailPriorFromPage(relPath: string, frontmatter: Record<string, u
   });
   return {
     relPath, subject: titleText(title), firstDate: frontmatter.first_message_date, ids, blocks, dates,
-    latest: { date: typeof frontmatter.date === 'string' ? frontmatter.date : frontmatter.first_message_date,
+    loopMessages: Array.isArray(frontmatter.apple_loop_messages) ? frontmatter.apple_loop_messages as AppleLoopMessage[] : [],
+    latest: { id: ids[ids.length - 1], date: typeof frontmatter.date === 'string' ? frontmatter.date : frontmatter.first_message_date,
       from: typeof frontmatter.from === 'string' ? frontmatter.from : '', to: strList(frontmatter.to), cc: strList(frontmatter.cc),
       mailbox: typeof frontmatter.mailbox === 'string' ? frontmatter.mailbox : '' },
     participants: strList(frontmatter.participants), senders: strList(frontmatter.senders), mailboxes: strList(frontmatter.mailboxes),
@@ -412,7 +416,7 @@ export function mailPriorFromPage(relPath: string, frontmatter: Record<string, u
  * page holds that the reader no longer lists are carried forward verbatim.
  */
 export function renderMailThreadPage(thread: AppleMailThread, account: string, prior?: MailPrior | null): RenderedPage | null {
-  const current = [...thread.messages].sort((a, b) => Date.parse(a.date) - Date.parse(b.date) || a.id.localeCompare(b.id));
+  const current = [...thread.messages].sort((a, b) => Date.parse(a.date) - Date.parse(b.date) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   if (current.length === 0 || current.every((m) => isNoiseSender(bareAddress(m.from)))) return null;
   const listed = new Set(current.map((m) => m.id));
   const keepIdx = prior ? prior.ids.map((id, i) => (listed.has(id) ? -1 : i)).filter((i) => i >= 0) : [];
@@ -433,13 +437,21 @@ export function renderMailThreadPage(thread: AppleMailThread, account: string, p
   if (carrying && prior) for (const i of keepIdx) entries.set(prior.ids[i]!, { date: prior.dates[i] ?? prior.firstDate, block: prior.blocks[i]! });
   for (const m of current) entries.set(m.id, { date: m.date, block: mailMessageBlock(m) });
   const merged = [...entries.entries()].map(([id, value]) => ({ id, ...value }))
-    .sort((a, b) => Date.parse(a.date) - Date.parse(b.date) || a.id.localeCompare(b.id));
+    .sort((a, b) => Date.parse(a.date) - Date.parse(b.date) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const currentLatest = current[current.length - 1]!;
-  const latest = carrying && prior && Date.parse(prior.latest.date) > Date.parse(currentLatest.date) ? prior.latest : currentLatest;
+  const latest = carrying && prior && (Date.parse(prior.latest.date) > Date.parse(currentLatest.date)
+    || (Date.parse(prior.latest.date) === Date.parse(currentLatest.date) && (prior.latest.id ?? '') > currentLatest.id)) ? prior.latest : currentLatest;
   const ids = merged.map((m) => m.id);
+  const loopById = new Map((carrying ? prior?.loopMessages ?? [] : []).map(m => [m.id, m]));
+  for (const m of current) {
+    const compact = compactMailMessage(m);
+    if (compact) loopById.set(m.id, compact); else loopById.delete(m.id);
+  }
+  const loopMessages = ids.flatMap(id => loopById.has(id) ? [loopById.get(id)!] : []);
   const fm: string[] = [
     '---', 'type: email', `title: ${yamlStr(subject)}`, `apple_thread_id: ${yamlStr(thread.threadId)}`,
     `apple_message_ids: ${yamlList(ids)}`, `apple_message_dates: ${yamlList(merged.map((m) => m.date))}`,
+    `apple_loop_messages: ${JSON.stringify(loopMessages)}`, `message_id: ${yamlStr(ids[ids.length - 1] ?? '')}`,
     `account: ${yamlStr(account)}`, `mailbox: ${yamlStr(latest.mailbox)}`, `mailboxes: ${yamlList(mailboxes)}`,
     `from: ${yamlStr(latest.from)}`, `to: ${yamlList(latest.to)}`, `cc: ${yamlList(latest.cc)}`,
     `date: ${yamlStr(latest.date)}`, `first_message_date: ${yamlStr(firstDate)}`, `message_count: ${ids.length}`,

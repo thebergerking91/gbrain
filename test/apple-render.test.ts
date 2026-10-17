@@ -323,3 +323,33 @@ describe('render details (review fixes)', () => {
     expect(mailPriorFromPage('emails/x.md', fm, 'Hand-edited body', 'Quarterly plan')).toBeNull();
   });
 });
+
+
+// F10: chronology was covered for different dates, not timestamp ties. Rereading only the lower id
+// must preserve the higher-id sender/mailbox. Reverting the tie comparison changes this observable FM.
+test('F10 equal-date carry-forward uses the same date-plus-id ordering for latest metadata and evidence', () => {
+  const base: AppleMailMessage={id:'a',threadId:'tie',mailbox:'INBOX',subject:'Example tie',from:'external@example.com',to:['owner@example.com'],cc:[],date:'2026-01-02T03:04:00Z',body:'Can you review?',read:true,automated:false,bulk:false};
+  const z={...base,id:'z',from:'owner@example.com',to:['external@example.com'],mailbox:'Sent',body:'Here is the review.'};
+  const full=renderMailThreadPage(groupMailThreads([base,z])[0]!, 'local')!;
+  const parsed=parseMarkdown(full.markdown,full.relPath);
+  const body=full.markdown.slice(full.markdown.indexOf('\n---\n',4)+5);
+  const prior=mailPriorFromPage(full.relPath,parsed.frontmatter,body,parsed.title)!;
+  const slice=renderMailThreadPage(groupMailThreads([base])[0]!, 'local',prior)!;
+  const fm=parseMarkdown(slice.markdown,slice.relPath).frontmatter;
+  expect(fm.apple_message_ids).toEqual(['a','z']);expect(fm.message_id).toBe('z');
+  expect(fm.from).toBe('owner@example.com');expect(fm.mailbox).toBe('Sent');
+  expect(fm.apple_loop_messages).toHaveLength(2);
+});
+
+
+test('F10 mixed-case equal-time ids use canonical lexical order everywhere, not locale-dependent metadata', () => {
+  const a: AppleMailMessage={id:'Z',threadId:'mixed-tie',mailbox:'INBOX',subject:'Example tie',from:'external@example.com',to:['owner@example.com'],cc:[],date:'2026-01-02T03:04:00Z',body:'Can you review?',read:true,automated:false,bulk:false};
+  const z={...a,id:'a',from:'owner@example.com',mailbox:'Sent'};
+  const full=renderMailThreadPage(groupMailThreads([a,z])[0]!, 'local')!;
+  const parsed=parseMarkdown(full.markdown,full.relPath);
+  expect(parsed.frontmatter.apple_message_ids).toEqual(['Z','a']);
+  expect(parsed.frontmatter.from).toBe('owner@example.com');
+  const prior=mailPriorFromPage(full.relPath,parsed.frontmatter,full.markdown.slice(full.markdown.indexOf('\n---\n',4)+5),parsed.title)!;
+  const carried=renderMailThreadPage(groupMailThreads([a])[0]!, 'local',prior)!;
+  expect(parseMarkdown(carried.markdown,carried.relPath).frontmatter.from).toBe('owner@example.com');
+});

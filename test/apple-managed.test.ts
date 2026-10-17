@@ -4,7 +4,7 @@
  * real persistence owner (PGLite, plus Postgres when the harness provides it).
  * Modeled on google-managed-delta-abort. Fake readers; synthetic data only.
  */
-import { afterAll, beforeAll, expect, test } from 'bun:test';
+import { afterAll, beforeAll, expect, spyOn, test } from 'bun:test';
 import { runAppleSync } from '../src/core/apple/apple-source.ts';
 import { parseAppleSourceConfig } from '../src/core/apple/source-config.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
@@ -173,3 +173,30 @@ test('managed apple sweep: Mail loop state lands in the checkpoint, open loops a
     expect((await answer()).sources).toEqual([]);
   }
 }), 180_000);
+
+
+// F6 also protects the managed checkpoint, including a save deferred behind pending publication.
+// The existing saveState seam models that boundary; publishHolds and the waiting readback remain real.
+// Removing Mail bookkeeping from the deferred save exposes the old complete stamp again.
+test('F6 managed partial and deferred saves publish durable incomplete coverage instead of retaining a fresh checkpoint', async () => withEnv(env, async () => {
+  const { loopsOperations }=await import('../src/core/ops/loops.ts');
+  const {ManagedConnectorSync}=await import('../src/core/persistence/connector-sync.ts');
+  for(const engine of engines) {
+    const raw={kind:'apple',a_services:'mail',a_mail_owner_addresses:'owner@example.com'};
+    const f=await source(engine,raw),cfg=parseAppleSourceConfig({...raw,a_dir:f.dir},f.dir);
+    let unavailable=false;
+    const rd:AppleReaders={...readers({contacts:[]}),async mail(){return unavailable ? {messages:[],unavailableThreads:['missing']} : {messages:[{id:'recovered',threadId:'missing',mailbox:'INBOX',subject:'Example recovery',from:'external@example.com',to:['owner@example.com'],cc:[],date:new Date(Date.now()-60*3_600_000).toISOString(),body:'Can you review?',read:true,automated:false,bulk:false}]};}};
+    const run=()=>runAppleSync(engine,f.id,cfg,{...options,sourceId:f.id},{readers:rd,log:()=>{}});
+    const ctx={engine,config:{},logger:{info(){},warn(){},error(){}},dryRun:false,remote:false,sourceId:f.id} as never;
+    const answer=async()=>loopsOperations.find(o=>o.name==='open_loops')!.handler(ctx,{source_id:f.id,group_by:'counterparty',include_context:false}) as Promise<{stale:boolean;completeness:string}>;
+    await completeBaselineSweep(engine,f.id,run);await disposePersistenceConsumer(engine);
+    expect((await answer()).stale).toBe(false);
+    unavailable=true;
+    const deferred=spyOn(ManagedConnectorSync.prototype,'saveState').mockImplementation(async function(this:InstanceType<typeof ManagedConnectorSync>){this.deferred=true;});
+    try {await run();}finally{deferred.mockRestore();}
+    await disposePersistenceConsumer(engine);
+    expect((await answer()).stale).toBe(true);expect((await answer()).completeness).toBe('partial');
+    unavailable=false;await completeBaselineSweep(engine,f.id,run);await disposePersistenceConsumer(engine);
+    expect((await answer()).stale).toBe(false);expect((await answer()).completeness).toBe('complete');
+  }
+}),180_000);

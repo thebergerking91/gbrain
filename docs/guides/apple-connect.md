@@ -24,7 +24,7 @@ gbrain apple setup
 
 `setup` is idempotent (re-running is always safe) and walks the chain:
 
-1. confirms **Mail** with you (it is the most sensitive service; see
+1. resolves the effective source and privacy scope, then confirms **Mail** with you (it is the most sensitive service; see
    [Mail confirmation](#mail-confirmation)),
 2. probes each selected service for the macOS permission it needs. A service
    macOS has **not asked about yet** (`permission_not_determined`, not a denial)
@@ -135,6 +135,18 @@ and the exact command to run. The confirmation message states what is read
 configured mailboxes), and that attachments are never downloaded. Opting Mail out
 (`--services calendar,contacts`) needs no confirmation.
 
+An explicit `--source` takes precedence over account labels. Without it, duplicate
+account labels are refused (`ambiguous_source`). Setup inherits omitted selectors
+from the selected existing source, discloses its actual Mail mailboxes/window,
+and refuses **any explicit selector difference** (`source_scope_mismatch`;
+`service_scope_mismatch` for services) before a probe or sync. This includes
+calendar ids/windows, contacts directory, Mail mailboxes/days, owner addresses and
+extraction consent. Change an existing source explicitly with its configuration
+commands (`apple loops` for owner addresses/consent), or choose a new source id. `--revoke-loops-extraction` is refused on setup rather than silently ignored; use the `apple loops` subcommand.
+Confirmation and permission-retry commands preserve selectors, quoting, consent
+flags, sync budget and `--no-sync`. A configuration change during probes refuses
+execution (`source_scope_changed`) and requires confirming the current scope.
+
 ## What the pages look like
 
 - **Calendar** (`type: meeting`): `calendar/YYYY/MM/YYYY-MM-DD-<title>-<id8>.md`
@@ -158,7 +170,11 @@ modifies nothing.
 
 Mail reads are incremental: after the first run only messages since two days
 before the newest one already seen are read (`--full` re-reads the whole
-`--mail-days` window), capped per run by `a_mail_max`.
+`--mail-days` window), capped per run by `a_mail_max`. A paginated walk freezes its starting window and
+records its purpose, scope/owner digest and the union of seen thread ids in
+`mail.walk`. Full reconciliation waits for the **entire** full walk, never just
+its final suffix. A new full walk or changed identity discards an incompatible
+resume cursor. Continue syncing to drain a capped walk; the cap is not raised.
 
 Calendar notes: birthday calendars are skipped, and subscription calendars
 (holidays, sports) are read only when selected with `--calendar-ids`. A recurring
@@ -187,8 +203,12 @@ gbrain apple loops --source apple-local --mail-owner-addresses me@example.com   
   (sender, recipients, subject, plain-text body) to the chat provider configured for this brain, one call per
   eligible thread, within the daily `loops.extraction_max_usd_per_day` cap. It runs only when **both**
   `loops.extraction_enabled` (global, default on) **and** this source's `--consent-loops-extraction` (default
-  off, needs owner addresses) are set; the job handler re-checks both when it runs. Withdraw with
-  `gbrain apple loops --revoke-loops-extraction`. Turning it on re-reads the mail window once.
+  off, needs owner addresses) are set; enqueue and every model attempt (including a truncation retry) re-read the current registered source, regardless of mutable page markers. The judge receives the configured owner addresses and aliases as trusted system context, separately from untrusted Mail text. Withdraw with
+  `gbrain apple loops --revoke-loops-extraction`. Enabling it re-candidates eligible durable pages on the next sweep without requiring new mail.
+  Global-off, provider, spend and queue-depth deferrals are retried from those pages on every sweep.
+  Queue completion alone is not proof of extraction: skipped/failed revisions remain recoverable;
+  only an extracted outcome settles a revision. The existing recent-thread extraction window and
+  spend/depth caps still apply; no additional Apple read is needed for quiet catch-up.
 - **Freshness.** `waiting` treats an Apple source as fresh only after a Mail sweep that was complete and
   detected loops in that same run. A Contacts or Calendar sync, a truncated or partly unreadable Mail run,
   a held or unimported thread, or a message the helper could not classify keeps the answer stale (`waiting`
@@ -198,8 +218,24 @@ gbrain apple loops --source apple-local --mail-owner-addresses me@example.com   
   from headers the helper reports; the Gmail category rule and `loops.extraction_exclude_labels` have no Apple
   equivalent. If that exclusion is configured, paid extraction for Apple sources is **withheld**
   (`excluded_label_unsupported`) rather than ignored; tracking is unaffected. `loops mute` works on Apple sources.
-- **Bounded state.** The detector keeps the last 12 short messages of up to 100 recent threads in the source's
-  cursor state (a 120-character excerpt each), so a grace-held loop can open later without re-reading Mail.
+- **Durable evidence, bounded cache.** Each Mail page carries `apple_loop_messages`, aligned with
+  **all** `apple_message_ids`, including direction, timestamp, classification and a 120-character
+  quote-trimmed excerpt (questions beyond the excerpt retain a question mark). Incremental rendering
+  carries this evidence forward alongside the full message blocks. Detection uses this complete
+  merged evidence, not the cursor's diagnostic cache of 12 messages / 100 threads. Quiet grace
+  obligations are re-evaluated from durable pages on every sweep, so eviction cannot erase them.
+  `message_id` identifies the latest message using the same date-plus-id ordering as page blocks.
+- **Recovery and upgrades.** Unavailable/failed threads remain in `mail_loops.pending_threads` until
+  actually observed and evaluated successfully. A cache or page miss is never evidence of deletion.
+  Unattributed unreadability sets `coverage_gap`; a nonempty clean whole-window walk must repair it.
+  An empty later listing cannot clear those unknowns. Older pages without complete classified evidence
+  are kept but refused for evaluation until a reader re-list supplies their missing evidence. If missing
+  history is outside the configured read window, tracking remains incomplete rather than inventing a
+  closure; the operator must restore evidence or explicitly adjust the read scope. No history cap is raised.
+  Partial/refused/unclassified/denied runs invalidate `complete_at` and persist a reread obligation; a refused full reconcile retains its full walk, and a managed deferred save publishes invalidated loop bookkeeping without advancing its Mail cursor;
+  `waiting` reports partial coverage and never "You are clean" for unresolved Apple coverage.
+  Owner changes reconcile obsolete open deterministic rows (including self-mail) only after safe
+  evaluation, without undoing manual done/drop/mute dispositions.
 
 ## Privacy and custody
 

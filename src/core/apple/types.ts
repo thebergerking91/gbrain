@@ -161,16 +161,22 @@ export interface AppleLoopMessage {
 }
 
 export interface AppleMailLoopsState {
-  /** Per-thread messages the detector reads (the reader window does not relist old messages of a thread). */
+  /** Bounded recent-thread diagnostic cache. Detection/recovery use complete evidence on durable pages, never this cache. */
   threads?: Record<string, AppleLoopMessage[]>;
   /** Digest of the owner addresses the stored loops were computed for. */
   digest?: string;
-  /** The whole mail window must be re-read and re-detected (owner set changed, or extraction was just consented); cleared only by a clean run. */
+  /** The whole mail window must be re-read after identity changes or coverage gaps; cleared only by clean recovery. */
   reread?: boolean;
   /** Finish time of the last run that detected loops on the whole mail listing with nothing partial; the only freshness stamp. */
   complete_at?: string;
-  /** Extraction consent as of the last complete run; turning it on re-candidates the window once. */
+  /** Legacy extraction marker, retained when reading old checkpoints; never a catch-up completion authority. */
   extract_seen?: boolean;
+  /** Known unreadable/failed threads, cleared only by successful observed recovery, never an empty listing. */
+  pending_threads?: string[];
+  /** Open deterministic rows require reconciliation under the new owner set. Manual dispositions are retained. */
+  identity_reconcile?: boolean;
+  /** Unattributed unreadability requires a nonempty complete window walk before claiming coverage again. */
+  coverage_gap?: boolean;
   loop_grace_holds?: Record<string, AppleLoopGraceHold>;
 }
 
@@ -192,6 +198,8 @@ export interface AppleSourceState {
     resume_from?: string;
     /** Stable message id at that timestamp, to paginate timestamp ties without repeating them. */
     resume_id?: string;
+    /** Stable enumeration scope/purpose. A suffix cannot stand in for a different full/identity walk. */
+    walk?: { key: string; since: string; purpose: 'full' | 'reread' | 'incremental'; seen: string[] };
   };
   /** ItemHoldsState (connectors/item-holds.ts); opaque here so types.ts stays dependency-free. */
   item_holds: unknown;

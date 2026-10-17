@@ -52,7 +52,7 @@ export function appleLoopsFreshness(
   nowMs: number = Date.now(),
 ): AppleLoopsFreshness {
   const loops = (state as { mail_loops?: AppleMailLoopsState } | null | undefined)?.mail_loops;
-  const at = loops?.digest === appleOwnerDigest(cfg.mailOwnerAddresses) && loops.reread !== true ? loops.complete_at : undefined;
+  const at = loops?.digest === appleOwnerDigest(cfg.mailOwnerAddresses) && loops.reread !== true && !loops.coverage_gap && !(loops.pending_threads?.length) ? loops.complete_at : undefined;
   const ms = typeof at === 'string' ? Date.parse(at) : NaN;
   if (!Number.isFinite(ms)) return { last_sync_at: null, stale: true };
   return { last_sync_at: new Date(ms).toISOString(), stale: nowMs - ms > APPLE_LOOPS_STALE_AFTER_MS };

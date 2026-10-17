@@ -383,7 +383,7 @@ function renderNoCounterparty(lines: string[], none: NoCounterpartyLoops | null,
 }
 
 function renderText(groups: CounterpartyGroup[], none: NoCounterpartyLoops | null, stale: boolean, noGoogleSources: boolean,
-  coverage: { completeness: 'complete' | 'partial'; held: HeldItemView[] }, nowMs: number,
+  coverage: { completeness: 'complete' | 'partial'; held: HeldItemView[]; appleIncomplete?: string[] }, nowMs: number,
   partialStaleSources: string[], appleUnavailable: string[] = [], withApple = false): string {
   const lines: string[] = [];
   const { held } = coverage;
@@ -398,7 +398,8 @@ function renderText(groups: CounterpartyGroup[], none: NoCounterpartyLoops | nul
     );
   }
   const partial = coverage.completeness === 'partial';
-  const what = held.length ? `${held.length} held item(s) could not be imported:` : 'the held-item state could not be read.';
+  const what = coverage.appleIncomplete?.length ? `Apple Mail coverage is unresolved for ${coverage.appleIncomplete.join(', ')}; retry a complete Mail sync (unreadable threads must actually recover).`
+    : held.length ? `${held.length} held item(s) could not be imported:` : 'the held-item state could not be read.';
   if (partial && groups.length === 0 && !none) {
     lines.push(`No open loops found, but coverage is partial: ${what}`, ...partialLines(held));
     return lines.join('\n');
@@ -541,7 +542,9 @@ const open_loops: Operation = {
     };
     const noGoogleSources = freshness.sources.length === 0 && appleUnavailable.length === 0;
     const partialStaleSources = freshness.stale ? [] : freshness.staleSources;
-    const coverage = await heldCoverage(ctx, freshness.sources, trusted, new Set(appleAvailable.map((x) => x.id)));
+    const held = await heldCoverage(ctx, freshness.sources, trusted, new Set(appleAvailable.map((x) => x.id)));
+    const appleIncomplete = appleAvailable.filter(x => x.last_sync_at === null).map(x => x.id);
+    const coverage = { ...held, ...(appleIncomplete.length ? { completeness: 'partial' as const, appleIncomplete } : {}) };
     const deepLinks = trusted ? await deepLinksFor(ctx, loops) : new Map<string, string>();
 
     const truncated = loops.length >= 500;

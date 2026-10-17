@@ -47,6 +47,7 @@ import {
   type AppleSyncDeps,
   type AppleSyncSummary,
 } from './sweep-shared.ts';
+import { beginMailWalk } from './mail-walk.ts';
 import { appleLoopsAvailability } from './loops-status.ts';
 import { prepareLoopsState, trackMailLoops, type AppleLoopsRun } from './loops.ts';
 import type { AppleCalendarEvent, AppleContact, AppleMailListing, AppleSourceState } from './types.ts';
@@ -313,10 +314,12 @@ export function mailReadSince(state: AppleSourceState, windowStart: Date, full: 
 export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   const { deps, state, summary } = ctx;
   const windowStart = new Date(deps.now() - deps.cfg.mailDays * DAY_MS);
-  // Loop tracking must see the whole window once when the owner set changed or extraction was just consented.
+  // Owner changes and unresolved coverage require a scope-bound whole-window walk.
   const trackLoops = ctx.loops !== undefined && appleLoopsAvailability(deps.cfg).available;
-  const rereadAll = trackLoops && prepareLoopsState(state, deps.cfg) && state.mail.resume_from === undefined;
-  const since = mailReadSince(state, windowStart, deps.opts.full === true || rereadAll);
+  const rereadAll = trackLoops && prepareLoopsState(state, deps.cfg);
+  const incrementalSince = mailReadSince(state, windowStart, false);
+  const walk = beginMailWalk(state, deps.cfg, windowStart, deps.opts.full === true, rereadAll, incrementalSince);
+  const since = new Date(Math.max(Date.parse(walk.since), Date.parse(state.mail.resume_from ?? '') - 1 || 0));
   const failedBefore = summary.failedFiles;
   const read = await deps.readers.mail({ since, mailboxes: deps.cfg.mailMailboxes, max: deps.cfg.mailMax,
     ...(state.mail.resume_from && state.mail.resume_id ? { after: { date: state.mail.resume_from, id: state.mail.resume_id } } : {}), ...signalOf(ctx) });
@@ -351,7 +354,8 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   }
 
   // A thread with an unreadable message still exists upstream: it is live for the sweep (never deleted).
-  const live = new Set<string>(listing.unavailableThreads ?? []);
+  const live = new Set<string>([...walk.seen, ...(listing.unavailableThreads ?? [])]);
+  for (const thread of groupMailThreads(messages)) live.add(thread.threadId);
   // Open-loop bookkeeping: threads with a page this run, and those whose page did not land (failed render/import, held).
   const rendered = new Set<string>();
   const notLanded = new Set<string>();
@@ -410,6 +414,30 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   }
   if (aborted(ctx)) return;
 
+  // The removal verdict needs a complete listing of the whole window: an incremental read, a capped read
+  // and an unreadable-message read are all partial views.
+  if (walk.purpose === 'full' && !truncated && readable && (listing.unavailableThreads?.length ?? 0) === 0 && summary.failedFiles === failedBefore && notLanded.size === 0) {
+    const gone: Array<{ key: string; path: string }> = [];
+    for (const [tid, path] of pathByThread) {
+      if (live.has(tid)) continue;
+      const firstDate = Date.parse(str(frontmatterByThread.get(tid)?.first_message_date) ?? '');
+      // Threads that began before the mail window are out of enumeration scope.
+      if (Number.isFinite(firstDate) && firstDate >= windowStart.getTime()) gone.push({ key: tid, path });
+    }
+    if (await reconcileRemovals(ctx, 'mail', gone, live.size)) {
+      for (const g of gone) delete state.mail.hashes[g.key];
+      for (const tid of Object.keys(state.mail.hashes)) {
+        if (!live.has(tid) && !pathByThread.has(tid)) delete state.mail.hashes[tid];
+      }
+    }
+  }
+
+  if (trackLoops && state.mail_loops) {
+    if (!readable) state.mail_loops.coverage_gap = true;
+    else if (walk.purpose !== 'incremental' && !truncated && live.size > 0 && summary.failedFiles === failedBefore
+      && (listing.unavailableThreads?.length ?? 0) === 0) delete state.mail_loops.coverage_gap;
+    if (state.mail_loops.coverage_gap) ctx.loops?.gaps.push('unresolved_coverage');
+  }
   if (trackLoops && ctx.loops) {
     const slugByThread = new Map(landedSlug);
     const missing = [...rendered].filter((id) => !slugByThread.has(id) && !notLanded.has(id));
@@ -425,40 +453,25 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
     await trackMailLoops({
       engine: deps.engine, sourceId: deps.sourceId, cfg: deps.cfg, state, log: deps.log, now: deps.now, ...signalOf(ctx),
       run: ctx.loops, messages, slugByThread, notLanded, unavailableThreads: new Set(listing.unavailableThreads ?? []),
-      listingClean: !truncated && readable && summary.failedFiles === failedBefore,
+      listingClean: !truncated && readable && (listing.unavailableThreads?.length ?? 0) === 0 && summary.failedFiles === failedBefore && notLanded.size === 0 && !summary.incomplete.some(g => g.startsWith('mail:')),
     });
-  }
-
-  // The removal verdict needs a complete listing of the whole window: an incremental read, a capped read
-  // and an unreadable-message read are all partial views.
-  if (deps.opts.full === true && !truncated && readable) {
-    const gone: Array<{ key: string; path: string }> = [];
-    for (const [tid, path] of pathByThread) {
-      if (live.has(tid)) continue;
-      const firstDate = Date.parse(str(frontmatterByThread.get(tid)?.first_message_date) ?? '');
-      // Threads that began before the mail window are out of enumeration scope.
-      if (Number.isFinite(firstDate) && firstDate >= windowStart.getTime()) gone.push({ key: tid, path });
-    }
-    if (await reconcileRemovals(ctx, 'mail', gone, messages.length)) {
-      for (const g of gone) delete state.mail.hashes[g.key];
-      for (const tid of Object.keys(state.mail.hashes)) {
-        if (!live.has(tid) && !pathByThread.has(tid)) delete state.mail.hashes[tid];
-      }
-    }
   }
 
   state.mail.since = windowStart.toISOString();
   const newestMs = messages.reduce((m, x) => Math.max(m, Date.parse(x.date) || 0), 0);
-  const unresolved = !readable || (listing.unavailableThreads?.length ?? 0) > 0 || summary.failedFiles !== failedBefore;
+  const unresolved = !readable || (listing.unavailableThreads?.length ?? 0) > 0 || summary.failedFiles !== failedBefore || notLanded.size > 0
+    || (!truncated && summary.incomplete.some(g => g.startsWith('mail:')));
   if (!unresolved && truncated && messages.length > 0) {
     // Advance by a stable (date,id) key, not timestamp alone: Mail.app can have
     // hundreds of messages at one timestamp and its native filter is date-only.
     const boundary = messages[messages.length - 1]!;
     state.mail.resume_from = boundary.date;
     state.mail.resume_id = boundary.id;
+    walk.seen = [...live].sort();
   } else if (!unresolved && !truncated) {
     delete state.mail.resume_from;
     delete state.mail.resume_id;
+    delete state.mail.walk;
     if (newestMs > 0) state.mail.newest = new Date(Math.max(newestMs, Date.parse(state.mail.newest ?? '') || 0)).toISOString();
   }
   // On any failed import or coverage gap, keep the previous boundary so the

@@ -353,3 +353,58 @@ describe('setup text', () => {
     expect(r.out).toContain('gbrain sync --source apple-local');
   });
 });
+
+
+// Final review F2: prior coverage checked only services on one source. These synthetic command tests
+// protect id precedence, ALL explicit privacy selectors, exact shell retry scope, and a scope-change race.
+// Credible mutations: OR account selection, omit scope comparison/flags or omit final revalidation.
+// No new production seam: injected probe and sync are the existing public command test interface.
+describe('Apple final review F2 — setup scope binding', () => {
+  async function source(id: string, extra: Record<string,unknown>={}) {
+    const raw={kind:'apple',a_account:'local',a_services:'mail',a_mail_mailboxes:'INBOX,Sent',a_mail_days:30,...extra};
+    await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,$3::text::jsonb)',[id,home,JSON.stringify(raw)]);
+  }
+  test('explicit --source wins over an earlier same-label source; omitted source with ambiguous account is refused', async()=>{
+    await source('apple-a');await source('apple-z');let selected='';
+    const r=await run(['setup','--json','--source','apple-z','--services','mail','--confirm-mail'],{readers:readersWith(),sync:async(_e,o)=>{selected=o.sourceId;return okSync();}});
+    expect(r.code).toBe(0);expect(selected).toBe('apple-z');
+    const ambiguous=await run(['setup','--json','--services','mail','--confirm-mail'],{readers:readersWith()});
+    expect(ambiguous.code).toBe(2);expect(ambiguous.json.error.code).toBe('ambiguous_source');
+  });
+  for(const [flag,value] of [['--mail-mailboxes','INBOX'],['--mail-days','1'],['--calendar-ids','only-calendar'],['--history-days','1'],['--future-days','1'],['--contacts-dir','contacts'],['--mail-owner-addresses','owner@example.com']] as const) {
+    test(`explicit ${flag} cannot silently sync a different existing scope, before confirmation or probes`,async()=>{
+      await source('apple-existing',{a_services:'calendar,contacts,mail'});const probed:AppleService[]=[];let synced=false;
+      const r=await run(['setup','--json','--source','apple-existing',flag,value],{readers:readersWith({},probed),sync:async()=>{synced=true;return okSync();}});
+      expect(r.code).toBe(2);expect(r.json).toMatchObject({status:'error',error:{code:'source_scope_mismatch'}});expect(probed).toEqual([]);expect(synced).toBe(false);
+    });
+  }
+  test('confirmation and permission-retry commands round-trip exact selectors, quoting and extraction flags',async()=>withEnv({GBRAIN_HOME:home},async()=>{
+    const args=['setup','--json','--source','apple-scoped','--account',"local example's",'--services','mail','--mail-mailboxes',"INBOX,Owner's Archive",'--mail-days','1','--mail-owner-addresses','owner@example.com','--consent-loops-extraction','--sync-budget-ms','1234','--no-sync'];
+    const gate=await run(args,{readers:readersWith()});expect(gate.json.status).toBe('awaiting_confirmation');
+    const split=(command:string)=>{
+      const p=Bun.spawnSync(['python3','-c','import shlex,json,sys; print(json.dumps(shlex.split(sys.argv[1])))',command]);
+      expect(p.exitCode).toBe(0);return JSON.parse(p.stdout.toString()) as string[];
+    };
+    const command=gate.json.next_action.command as string;
+    const retry=split(command);expect(retry.slice(0,2)).toEqual(['gbrain','apple']);
+    const denied=await run(retry.slice(2),{readers:readersWith({mail:{ok:false,code:'automation_denied',fix:'fixture denial'}})});
+    expect(denied.json.status).toBe('awaiting_permission');expect(split(denied.json.next_action.command)).toEqual(retry);
+    const done=await run(retry.slice(2),{readers:readersWith()});expect(done.code).toBe(0);
+    const [row]=await engine.executeRaw<{config:Record<string,unknown>}>('SELECT config FROM sources WHERE id=$1',['apple-scoped']);
+    expect(row!.config.a_mail_mailboxes).toBe("INBOX,Owner's Archive");expect(row!.config.a_mail_days).toBe(1);
+    expect(row!.config.a_mail_owner_addresses).toBe('owner@example.com');expect(row!.config.a_loops_extract_consent).toBe(true);
+  }));
+  test('source scope changed during probes refuses execution instead of syncing newly widened config',async()=>{
+    await source('apple-changing');let synced=false;
+    const r=readersWith();r.probe=async()=>{await engine.executeRaw("UPDATE sources SET config=config||'{\"a_mail_days\":365}'::jsonb WHERE id='apple-changing'");return {ok:true};};
+    const result=await run(['setup','--json','--source','apple-changing','--services','mail','--confirm-mail'],{readers:r,sync:async()=>{synced=true;return okSync();}});
+    expect(result.code).toBe(2);expect(result.json.error.code).toBe('source_scope_changed');expect(synced).toBe(false);
+  });
+});
+
+
+test('F2 setup never ignores an explicit extraction-revocation request and proceeds to sync with consent still on',async()=>{
+  const probed:AppleService[]=[];let synced=false;
+  const result=await run(['setup','--json','--services','mail','--confirm-mail','--revoke-loops-extraction'],{readers:readersWith({},probed),sync:async()=>{synced=true;return okSync();}});
+  expect(result.code).toBe(1);expect(result.json.error.code).toBe('invalid_value');expect(probed).toEqual([]);expect(synced).toBe(false);
+});

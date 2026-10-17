@@ -18,7 +18,7 @@ import { runAppleSync } from '../src/core/apple/apple-source.ts';
 import { readAppleState } from '../src/core/apple/state.ts';
 import { parseAppleSourceConfig, parseOwnerAddresses } from '../src/core/apple/source-config.ts';
 import { appleLoopsAvailability, appleLoopsFreshness, appleOwnerDigest } from '../src/core/apple/loops-status.ts';
-import { compactMailMessage, toLoopThread, appleExtractionPolicy } from '../src/core/apple/loops.ts';
+import { compactMailMessage, toLoopThread, appleExtractionPolicy, enqueueAppleLoopsExtraction } from '../src/core/apple/loops.ts';
 import { loopsOperations } from '../src/core/ops/loops.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import type { SyncOpts } from '../src/commands/sync.ts';
@@ -595,3 +595,279 @@ describe('apple loops — mail.js header classification', () => {
     expect('automated' in normalizeMessage({ id: 'x', date: '2026-10-10T08:00:00Z', automated: 'yes' })).toBe(false);
   });
 });
+
+
+// Independent final-review regressions: public sync/queue/waiting paths, disposable PGLite + synthetic
+// readers only. Prior tests used short touched threads; these exercise paging, quiet recovery and policy
+// changes. Each fails on a targeted behavioral mutation (report records the exact mutations), with no new
+// production-only test seam. IDs/addresses are placeholders; no Apple helper or network is used.
+function pagedReader(f: Fake, cap: number, observed: Array<Parameters<AppleReaders['mail']>[0]>): AppleReaders {
+  const r = readers(f);
+  r.mail = async opts => {
+    observed.push(opts);
+    let all = f.mail.filter(m => Date.parse(m.date) > opts.since.getTime())
+      .sort((a,b) => a.date.localeCompare(b.date) || (a.id < b.id ? -1 : 1));
+    if (opts.after) all = all.filter(m => m.date > opts.after!.date || (m.date === opts.after!.date && m.id > opts.after!.id));
+    return { messages: structuredClone(all.slice(0, cap)), truncated: all.length > cap, ...f.flags };
+  };
+  return r;
+}
+async function pagedSweep(dir: string, raw: RawCfg, r: AppleReaders, full = false) {
+  return runAppleSync(engine, SID, parseAppleSourceConfig(raw, dir), { sourceId: SID, noEmbed: true, noExtract: true, noSchemaPack: true, full },
+    { readers: r, now: () => clock.t, log: m => logs.push(m) });
+}
+async function updateRaw(raw: RawCfg): Promise<void> {
+  await engine.executeRaw('UPDATE sources SET config=$2::text::jsonb WHERE id=$1', [SID, JSON.stringify(raw)]);
+}
+
+describe('Apple final review — durable correctness', () => {
+  test('F1 full enumeration discards an incompatible suffix, resumes its own walk, and reconciles only the union', () => withHome(async () => {
+    const dir = newDir(), raw = await insertSource(dir, { a_mail_max: 2 });
+    const f = fake([inbound('a','a',100), inbound('b','b',90), inbound('c','c',80)]);
+    const observed: Array<Parameters<AppleReaders['mail']>[0]> = [], r = pagedReader(f, 2, observed);
+    await pagedSweep(dir, raw, r);
+    expect(readAppleState(dir).mail.resume_id).toBe('b');
+    const full = await pagedSweep(dir, raw, r, true);
+    expect(observed[1]!.after).toBeUndefined();
+    expect(full.deleted).toBe(0);
+    expect(full.status).toBe('partial');
+    expect((await waiting()).stale).toBe(true);
+    const end = await pagedSweep(dir, raw, r, true);
+    expect(end.deleted).toBe(0);
+    expect((await engine.executeRaw('SELECT slug FROM pages WHERE source_id=$1 AND deleted_at IS NULL',[SID]))).toHaveLength(3);
+    expect((await waiting()).stale).toBe(false);
+    expect(readAppleState(dir).mail.walk).toBeUndefined();
+  }));
+
+  test('F1 owner change between capped pages re-evaluates the prefix before declaring freshness', () => withHome(async () => {
+    const dir = newDir(), alias = 'alias-example@example.com';
+    const raw = await insertSource(dir, { a_mail_max: 1, a_mail_owner_addresses: OWNER+','+alias });
+    const f = fake([inbound('prefix','prefix',60,{from:alias}), inbound('suffix','suffix',50,{from:'noreply@example.com'})]);
+    const observed: Array<Parameters<AppleReaders['mail']>[0]> = [], r = pagedReader(f, 1, observed);
+    await pagedSweep(dir, raw, r);
+    const changed = {...raw, a_mail_owner_addresses: OWNER}; await updateRaw(changed);
+    await pagedSweep(dir, changed, r);
+    expect(observed[1]!.after).toBeUndefined();
+    expect((await open()).map(x=>x.thread_id)).toEqual(['prefix']);
+    expect((await waiting()).stale).toBe(true);
+    await pagedSweep(dir, changed, r);
+    expect((await waiting()).stale).toBe(false);
+    expect((await open()).map(x=>x.thread_id)).toEqual(['prefix']);
+  }));
+
+  test('F3 revoked current source blocks stale-snapshot enqueue and marker-free queued execution with zero model calls', () => withHome(async () => {
+    const dir = newDir(), raw = await insertSource(dir, {a_loops_extract_consent:true});
+    await engine.setConfig('loops.extraction_enabled','true');
+    await sweep(dir, fake([inbound('private','consent',60)]), raw);
+    const [job] = await jobs(); expect(job).toBeDefined();
+    const payload = {slug:String(job!.data.slug),sourceId:SID,threadId:'consent'};
+    await updateRaw({...raw,a_loops_extract_consent:false});
+    expect((await appleExtractionPolicy(engine,SID,parseAppleSourceConfig(raw,dir))).refusal).toBe('apple_consent_missing');
+    const result = await enqueueAppleLoopsExtraction({engine,sourceId:SID,cfg:parseAppleSourceConfig(raw,dir),run:{candidates:[{...payload,newestMs:BASE}],gaps:[],eligibility:{},withheld:{}},log:()=>{}});
+    expect(result?.skipped_reason).toBe('apple_consent_missing');
+    await engine.executeRaw("UPDATE pages SET frontmatter=frontmatter-'apple_thread_id'-'source_kind' WHERE source_id=$1 AND slug=$2",[SID,payload.slug]);
+    expect(await runLoopsExtract(engine,payload)).toMatchObject({status:'skipped',reason:'apple_consent_missing'});
+    expect(chatCalls).toBe(0);
+  }));
+
+  test('F4 complete durable evidence retains an inbound question across twelve owner acknowledgments and empty sweeps', () => withHome(async () => {
+    const dir = newDir(), raw = await insertSource(dir);
+    const f = fake([inbound('question','long',100)]);
+    await sweep(dir,f,raw);
+    f.mail.push(...Array.from({length:12},(_,i)=>outbound('ack-'+i,'long',99-i,{body:'Thanks!',to:['alice-example@example.com']})));
+    await sweep(dir,f,raw);
+    f.mail=[]; await sweep(dir,f,raw);
+    expect((await open()).map(x=>[x.thread_id,x.loop_type])).toEqual([['long','unanswered_inbound']]);
+    const [page] = await engine.executeRaw<{frontmatter: Record<string,unknown>}>("SELECT frontmatter FROM pages WHERE source_id=$1",[SID]);
+    expect(page!.frontmatter.apple_loop_messages).toHaveLength(13);
+    expect((await waiting()).stale).toBe(false);
+  }));
+
+  test('F4 long unanswered runs retain the original grace deadline; classification outside the cached tail cannot disappear', () => withHome(async () => {
+    const dir=newDir(),raw=await insertSource(dir),f=fake([inbound('oldest','nudges',23)]);
+    await sweep(dir,f,raw);
+    const due=readAppleState(dir).mail_loops!.loop_grace_holds!.nudges!.due_ms;
+    f.mail.push(...Array.from({length:15},(_,i)=>inbound('nudge-'+i,'nudges',22-i)));
+    await sweep(dir,f,raw);
+    expect(readAppleState(dir).mail_loops!.loop_grace_holds!.nudges!.due_ms).toBe(due);
+    delete f.mail[0]!.automated;
+    await sweep(dir,f,raw);
+    f.mail=[];clock.t=BASE+30*3_600_000;await sweep(dir,f,raw);
+    const answer=await waiting();expect(answer.stale).toBe(true);expect(answer.completeness).toBe('partial');
+    expect(readAppleState(dir).mail_loops!.pending_threads).toContain('nudges');
+    expect(readAppleState(dir).mail_loops!.loop_grace_holds!.nudges!.due_ms).toBe(due);
+  }));
+
+  test('F5 quiet outbound ask survives exactly 100 newer noise threads, cache eviction and empty incremental grace recovery', () => withHome(async () => {
+    const dir=newDir(),raw=await insertSource(dir),f=fake([outbound('quiet','quiet',70),inbound('noise0','noise0',1,{from:'noreply@example.com'})]);
+    f.sinceFilter=true;await sweep(dir,f,raw);
+    expect(readAppleState(dir).mail_loops!.loop_grace_holds!.quiet).toBeDefined();
+    f.mail.push(...Array.from({length:100},(_,i)=>inbound('noise-'+i,'noise-'+i,0.5,{from:'noreply@example.com'})));
+    await sweep(dir,f,raw);
+    expect(readAppleState(dir).mail_loops!.threads!.quiet).toBeUndefined();
+    f.mail=[];clock.t=BASE+3*3_600_000;await sweep(dir,f,raw);await sweep(dir,f,raw);
+    expect((await open()).map(x=>[x.thread_id,x.loop_type])).toEqual([['quiet','unanswered_outbound']]);
+    expect((await waiting()).text).not.toContain('You are clean');
+    expect((await waiting()).stale).toBe(false);
+  }));
+
+  test('F5 a missing recovery page is not upstream gone; the hold and incomplete coverage survive empty sweeps', () => withHome(async () => {
+    const dir=newDir(),raw=await insertSource(dir),f=fake([outbound('quiet','quiet',70)]);
+    await sweep(dir,f,raw);
+    await engine.executeRaw('UPDATE pages SET deleted_at=now() WHERE source_id=$1',[SID]);
+    f.mail=[];clock.t=BASE+4*3_600_000;await sweep(dir,f,raw);await sweep(dir,f,raw);
+    expect(readAppleState(dir).mail_loops!.loop_grace_holds!.quiet).toBeDefined();
+    expect(readAppleState(dir).mail_loops!.pending_threads).toContain('quiet');
+    expect((await waiting()).completeness).toBe('partial');
+    expect((await waiting()).text).not.toContain('You are clean');
+  }));
+
+  for (const [name, flags] of [['incomplete',{incomplete:true}],['unavailable-only',{unavailableThreads:['missing']}],['truncated',{truncated:true}]] as Array<[string,Omit<AppleMailListing,'messages'>]>) {
+    test(`F6 fresh then ${name} invalidates clean status; unavailable coverage requires actual recovery`, () => withHome(async () => {
+      const dir=newDir(),raw=await insertSource(dir),f=fake([]);await sweep(dir,f,raw);
+      expect((await waiting()).stale).toBe(false);
+      f.flags=flags;await sweep(dir,f,raw);
+      expect((await waiting()).stale).toBe(true);expect((await waiting()).completeness).toBe('partial');
+      expect((await waiting()).text).not.toContain('You are clean');
+      f.flags=undefined;await sweep(dir,f,raw);
+      if(name!=='truncated') {
+        expect((await waiting()).stale).toBe(true);
+        expect((await waiting()).completeness).toBe('partial');
+        f.mail=[inbound('recovered','missing',60)];await sweep(dir,f,raw);
+        expect((await waiting()).stale).toBe(false);
+      }
+    }));
+  }
+
+  test('F6 refused full reconcile and unclassified follow-up invalidate an earlier complete stamp durably', () => withHome(async () => {
+    const dir=newDir(),raw=await insertSource(dir),f=fake([inbound('first','first',60)]);await sweep(dir,f,raw);
+    f.mail=[];await sweep(dir,f,raw,{full:true});
+    expect(readAppleState(dir).mail.walk?.purpose).toBe('full');
+    await sweep(dir,f,raw); // A normal empty sweep cannot silently forget a refused full reconcile.
+    expect((await waiting()).completeness).toBe('partial');
+    expect((await waiting()).stale).toBe(true);expect((await waiting()).completeness).toBe('partial');
+    const m=inbound('first','first',60);delete m.bulk;f.mail=[m];await sweep(dir,f,raw);
+    f.mail=[];await sweep(dir,f,raw);
+    expect((await waiting()).stale).toBe(true);expect(readAppleState(dir).mail_loops!.pending_threads).toContain('first');
+    f.mail=[inbound('first','first',60)];await sweep(dir,f,raw);
+    expect((await waiting()).stale).toBe(false);
+  }));
+
+  test('F7 adding an owner alias removes obsolete self-mail obligations without undoing manual done/drop rows', () => withHome(async () => {
+    const dir=newDir(),alias='alias-example@example.com',raw=await insertSource(dir);
+    const f=fake([inbound('self','self',60,{from:alias}),inbound('manual','manual',60)]);await sweep(dir,f,raw);
+    await engine.executeRaw("UPDATE open_loops SET status='dropped',closed_by='user',closed_at=now() WHERE source_id=$1 AND thread_id='manual'",[SID]);
+    const changed={...raw,a_mail_owner_addresses:OWNER+','+alias};await updateRaw(changed);await sweep(dir,f,changed);
+    expect(await open()).toHaveLength(0);
+    expect((await loops()).find(x=>x.thread_id==='self')).toMatchObject({status:'done',closed_by:'apple_owner_changed'});
+    expect((await loops()).find(x=>x.thread_id==='manual')).toMatchObject({status:'dropped',closed_by:'user'});
+    expect((await waiting()).stale).toBe(false);
+    await updateRaw(raw);await sweep(dir,f,raw);
+    expect((await open()).map(x=>x.thread_id)).toEqual(['self']);
+  }));
+
+  for (const gate of ['global','provider','spend','queue'] as const) {
+    test(`F8 ${gate} deferral recovers a quiet eligible revision without new mail`, () => withHome(async () => {
+      configureGateway({chat_model:'anthropic:claude-sonnet-4-6',env:{ANTHROPIC_API_KEY:'sk-ant-test'}});
+      const dir=newDir(),raw=await insertSource(dir,{a_loops_extract_consent:true});
+      const f=fake([inbound('old','old',60),inbound('noise','noise',1,{from:'noreply@example.com'})]);f.sinceFilter=true;
+      await engine.setConfig('loops.extraction_enabled',gate==='global'?'false':'true');
+      if(gate==='provider') { __setChatTransportForTests(null); configureGateway({chat_model:'anthropic:claude-sonnet-4-6',env:{}}); }
+      if(gate==='spend') await engine.setConfig('loops.extraction_max_usd_per_day','0');
+      if(gate==='queue') {
+        const { LOOPS_EXTRACT_ENQUEUE_CEILING }=await import('../src/core/google/loops-extract.ts');
+        const {MinionQueue}=await import('../src/core/minions/queue.ts');const queue=new MinionQueue(engine);
+        for(let i=0;i<LOOPS_EXTRACT_ENQUEUE_CEILING;i++) await queue.add('loops_extract',{sourceId:SID},{idempotency_key:'noise-budget-'+i});
+      }
+      const first=await sweep(dir,f,raw);
+      expect((await jobs()).filter(j=>j.data.threadId==='old')).toHaveLength(0);
+      if(gate==='queue') expect(first.loops_enqueue?.deferred).toBe(1);
+      if(gate==='provider') __setChatTransportForTests(async()=>{chatCalls++;return {text:'{"commitments":[],"decisions_pending":[]}',blocks:[],stopReason:'end',usage,model:'anthropic:claude-sonnet-4-6',providerId:'anthropic'};});
+      await engine.setConfig('loops.extraction_enabled','true');
+      configureGateway({chat_model:'anthropic:claude-sonnet-4-6',env:{ANTHROPIC_API_KEY:'sk-ant-test'}});
+      await engine.setConfig('loops.extraction_max_usd_per_day','2');
+      if(gate==='queue') await engine.executeRaw("UPDATE minion_jobs SET status='completed' WHERE idempotency_key LIKE 'noise-budget-%'");
+      f.mail=[];await sweep(dir,f,raw);
+      expect((await jobs()).filter(j=>j.data.threadId==='old')).toHaveLength(1);
+      expect(chatCalls).toBe(0);
+    }));
+  }
+
+  test('F8 a queued revision skipped while globally disabled is recoverable after re-enablement, not consumed forever', () => withHome(async () => {
+    const dir=newDir(),raw=await insertSource(dir,{a_loops_extract_consent:true}),f=fake([inbound('old','old',60)]);
+    await engine.setConfig('loops.extraction_enabled','true');await sweep(dir,f,raw);
+    const [job]=await jobs();await engine.setConfig('loops.extraction_enabled','false');
+    const result=await runLoopsExtract(engine,{slug:String(job!.data.slug),sourceId:SID,threadId:'old'});
+    expect(result.reason).toBe('extraction_disabled');
+    await engine.executeRaw("UPDATE minion_jobs SET status='completed',result=$2::text::jsonb WHERE idempotency_key=$1",[job!.idempotency_key,JSON.stringify(result)]);
+    await engine.setConfig('loops.extraction_enabled','true');f.mail=[];await sweep(dir,f,raw);
+    expect(await jobs()).toHaveLength(2);expect(chatCalls).toBe(0);
+    await engine.executeRaw(`UPDATE minion_jobs SET status='completed', result='{"status":"extracted"}'::jsonb WHERE name='loops_extract' AND data->>'sourceId'=$1`,[SID]);
+    await sweep(dir,f,raw);expect(await jobs()).toHaveLength(2); // Only actual extraction settles a quiet revision.
+  }));
+
+  test('F9 current owner addresses and aliases reach the judge as trusted system context independently of non-Sent thread text', () => withHome(async () => {
+    const alias='owner-alias@example.com',dir=newDir(),raw=await insertSource(dir,{a_loops_extract_consent:true,a_mail_owner_addresses:OWNER+','+alias});
+    await engine.setConfig('loops.extraction_enabled','true');
+    await sweep(dir,fake([outbound('owner','identity',100,{from:alias,mailbox:'Archive',body:'Can you send it?'})]),raw);
+    const [job]=await jobs();let system='',user='';
+    __setChatTransportForTests(async opts=>{chatCalls++;system=opts.system??'';user=JSON.stringify(opts.messages);return {text:'{"commitments":[],"decisions_pending":[]}',blocks:[],stopReason:'end',usage,model:'anthropic:claude-sonnet-4-6',providerId:'anthropic'};});
+    try {
+      expect(await runLoopsExtract(engine,{slug:String(job!.data.slug),sourceId:SID,threadId:'identity'})).toMatchObject({status:'extracted'});
+      expect(system).toContain('Trusted Apple account owner addresses');expect(system).toContain(OWNER);expect(system).toContain(alias);
+      expect(user).toContain(alias);expect(chatCalls).toBe(1);
+    } finally {
+      __setChatTransportForTests(async()=>{chatCalls++;return {text:'{"commitments":[],"decisions_pending":[]}',blocks:[],stopReason:'end',usage,model:'anthropic:claude-sonnet-4-6',providerId:'anthropic'};});
+    }
+  }));
+});
+
+
+test('F3 source revoked inside the synthetic read blocks enqueue in the same actual sync', () => withHome(async () => {
+  const dir=newDir(),raw=await insertSource(dir,{a_loops_extract_consent:true});
+  await engine.setConfig('loops.extraction_enabled','true');
+  const r=readers(fake([inbound('revoke','revoke',60)]));const original=r.mail;
+  r.mail=async opts=>{const result=await original(opts);await updateRaw({...raw,a_loops_extract_consent:false});return result;};
+  const result=await pagedSweep(dir,raw,r);
+  expect(result.loops_enqueue?.skipped_reason).toBe('apple_consent_missing');
+  expect(await jobs()).toHaveLength(0);expect(chatCalls).toBe(0);
+}));
+
+test('F6 unattributed unreadability cannot authorize closure from a possibly partial reply slice', () => withHome(async () => {
+  const dir=newDir(),raw=await insertSource(dir),f=fake([inbound('ask','unknown-thread',60)]);await sweep(dir,f,raw);
+  f.mail=[outbound('reply','unknown-thread',40,{body:'Here is the answer.',to:['alice-example@example.com']})];f.flags={incomplete:true};
+  await sweep(dir,f,raw);
+  expect((await open()).map(x=>x.loop_type)).toEqual(['unanswered_inbound']);
+  expect((await waiting()).completeness).toBe('partial');
+  f.flags=undefined;f.mail=[];await sweep(dir,f,raw);
+  expect((await open()).map(x=>x.loop_type)).toEqual(['unanswered_inbound']);
+  expect((await waiting()).stale).toBe(true);
+  f.mail=[inbound('ask','unknown-thread',60),outbound('reply','unknown-thread',40,{body:'Here is the answer.',to:['alice-example@example.com']})];
+  await sweep(dir,f,raw);
+  expect(await open()).toHaveLength(0);expect((await waiting()).stale).toBe(false);
+}));
+
+
+test('F3 consent withdrawn during a truncated fake response prevents the second model attempt', () => withHome(async () => {
+  const dir=newDir(),raw=await insertSource(dir,{a_loops_extract_consent:true});
+  await engine.setConfig('loops.extraction_enabled','true');await sweep(dir,fake([inbound('retry','retry',60)]),raw);
+  const [job]=await jobs();
+  __setChatTransportForTests(async()=>{chatCalls++;await updateRaw({...raw,a_loops_extract_consent:false});return {text:'{',blocks:[],stopReason:'length',usage,model:'anthropic:claude-sonnet-4-6',providerId:'anthropic'};});
+  try {
+    expect(await runLoopsExtract(engine,{slug:String(job!.data.slug),sourceId:SID,threadId:'retry'})).toMatchObject({status:'skipped',reason:'apple_consent_missing'});
+    expect(chatCalls).toBe(1);
+  }finally{__setChatTransportForTests(async()=>{chatCalls++;return {text:'{"commitments":[],"decisions_pending":[]}',blocks:[],stopReason:'end',usage,model:'anthropic:claude-sonnet-4-6',providerId:'anthropic'};});}
+}));
+
+
+test('F3 actual queue handler retains explicit Apple origin when mutable page and source kind markers are changed', () => withHome(async () => {
+  const dir=newDir(),raw=await insertSource(dir,{a_loops_extract_consent:true});
+  await engine.setConfig('loops.extraction_enabled','true');await sweep(dir,fake([inbound('origin','origin',60)]),raw);
+  const [job]=await jobs();expect(job!.data.sourceKind).toBe('apple');
+  await engine.executeRaw("UPDATE pages SET frontmatter=frontmatter-'apple_thread_id'-'source_kind' WHERE source_id=$1",[SID]);
+  await updateRaw({...raw,kind:'google',a_loops_extract_consent:false});
+  const {makeLoopsExtractHandler}=await import('../src/core/minions/handlers/loops-extract.ts');
+  const handler=makeLoopsExtractHandler(engine);
+  expect(await handler({data:job!.data} as Parameters<typeof handler>[0])).toMatchObject({status:'skipped',reason:'apple_source_unavailable'});
+  expect(chatCalls).toBe(0);
+}));

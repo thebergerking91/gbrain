@@ -195,6 +195,7 @@ async function runAppleSyncInner(
         if (summary.failedFiles === failedBefore && summary.incomplete.length === incompleteBefore && !opts.signal?.aborted) cleanServices++;
       } catch (e) {
         if (managed) rethrowConnectorWriteError(e);
+        if (service === 'mail' && state.mail_loops) { delete state.mail_loops.complete_at; state.mail_loops.reread = true; state.mail_loops.coverage_gap = true; }
         serviceErrors.push(`${service}: ${e instanceof Error ? e.message : String(e)}`);
         summary.status = 'partial';
         if (e instanceof AppleReaderError) {
@@ -210,7 +211,10 @@ async function runAppleSyncInner(
     }
 
     summary.pagesAffected = [...new Set(summary.pagesAffected)];
-    if (opts.signal?.aborted) summary.status = 'partial';
+    if (opts.signal?.aborted) {
+      summary.status = 'partial';
+      if (state.mail_loops) { delete state.mail_loops.complete_at; state.mail_loops.reread = true; }
+    }
     if (opts.full && summary.status === 'synced') state.last_full_at = new Date(deps.now()).toISOString();
 
     // Throws connector_holds_exhausted before any save, so the cursor stays.
@@ -222,7 +226,12 @@ async function runAppleSyncInner(
       if (!opts.signal?.aborted) {
         await managed.saveState(state, cleanServices > 0, new Date(deps.now()).toISOString());
         // saveState defers while writes are pending; the recorded denials and holds must still land (publishHolds' `extra`).
-        if (managed.deferred) await managed.publishHolds(emptyAppleState() as unknown as Record<string, unknown>, state.item_holds, { last_probe: state.last_probe });
+        if (managed.deferred) {
+          // A pending publication cannot leave the previous complete Mail answer authoritative.
+          if (state.mail_loops) { delete state.mail_loops.complete_at; state.mail_loops.reread = true; }
+          await managed.publishHolds(emptyAppleState() as unknown as Record<string, unknown>, state.item_holds,
+            { last_probe: state.last_probe, ...(state.mail_loops ? { mail_loops: state.mail_loops } : {}) });
+        }
       }
     } else {
       writeAppleState(cfg.dir, state);

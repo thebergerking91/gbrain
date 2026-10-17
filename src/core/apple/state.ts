@@ -51,6 +51,9 @@ function loopsState(v: unknown): AppleMailLoopsState | undefined {
     ...(v.reread === true ? { reread: true } : {}),
     ...(typeof v.complete_at === 'string' ? { complete_at: v.complete_at } : {}),
     ...(typeof v.extract_seen === 'boolean' ? { extract_seen: v.extract_seen } : {}),
+    ...(Array.isArray(v.pending_threads) ? { pending_threads: v.pending_threads.filter((x): x is string => typeof x === 'string') } : {}),
+    ...(v.identity_reconcile === true ? { identity_reconcile: true } : {}),
+    ...(v.coverage_gap === true ? { coverage_gap: true } : {}),
     ...(Object.keys(holds).length > 0 ? { loop_grace_holds: holds } : {}),
   };
 }
@@ -74,6 +77,10 @@ export function normalizeAppleState(parsed: unknown): AppleSourceState {
       ...(typeof mail.newest === 'string' ? { newest: mail.newest } : {}),
       ...(typeof mail.resume_from === 'string' ? { resume_from: mail.resume_from } : {}),
       ...(typeof mail.resume_id === 'string' ? { resume_id: mail.resume_id } : {}),
+      ...(isRecord(mail.walk) && typeof mail.walk.key === 'string' && typeof mail.walk.since === 'string'
+        && ['full', 'reread', 'incremental'].includes(String(mail.walk.purpose)) && Array.isArray(mail.walk.seen)
+        ? { walk: { key: mail.walk.key, since: mail.walk.since, purpose: mail.walk.purpose as 'full' | 'reread' | 'incremental',
+          seen: mail.walk.seen.filter((x): x is string => typeof x === 'string') } } : {}),
     },
     item_holds: isRecord(parsed.item_holds) ? parsed.item_holds : undefined,
     ...(loopsState(parsed.mail_loops) ? { mail_loops: loopsState(parsed.mail_loops)! } : {}),
