@@ -84,7 +84,7 @@ link it here rather than raising the cap.
 | [Agent Bootstrap (continued)](key-files/agent-bootstrap-continued.md) | Remaining cross-file entries |
 | [Google connector + open-loop engine](key-files/google-and-loops.md) | Cross-file contract |
 | [Google And Loops (continued)](key-files/google-and-loops-continued.md) | Remaining cross-file entries |
-| [Apple connector](key-files/apple-source.md) | `src/core/apple/*`, `gbrain apple` |
+| [Apple connector](key-files/apple-source.md) | Apple CLI |
 | [Open loops](key-files/open-loops-engine.md) | detect, extract, store |
 | [Always-loaded core memory](key-files/core-memory.md) | Core tier, write-path guard and lock order, delivery lanes, pressure notice |
 | [Workspace push and backup coverage](key-files/workspace-push-and-backup.md) | Workspace push, hook push backstops, backup verdicts |
