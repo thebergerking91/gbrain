@@ -54,12 +54,12 @@ async function cli(fn: () => Promise<void>): Promise<{ out: string; err: string;
 const row = async (id: string) => (await engine.executeRaw<{ config: Record<string, unknown>; local_path: string }>('SELECT config, local_path FROM sources WHERE id=$1', [id]))[0];
 
 describe('sources add --kind apple (legacy path)', () => {
-  test('writes the a_* config, creates a private managed dir, defaults all three services', async () => {
+  test('writes the a_* config, creates a private managed dir, defaults to calendar and contacts only (never Mail)', async () => {
     const dir = join(home, 'clone');
     const r = await cli(() => runAddApple(engine, ['apple-local', '--kind', 'apple', '--dir', dir]));
     expect(r.exit).toBeNull();
     const src = (await row('apple-local'))!;
-    expect(src.config).toMatchObject({ kind: 'apple', a_account: 'local', a_services: 'calendar,contacts,mail', a_history_days: 90, a_managed: false, federated: true });
+    expect(src.config).toMatchObject({ kind: 'apple', a_account: 'local', a_services: 'calendar,contacts', a_history_days: 90, a_managed: false, federated: true });
     expect(src.local_path).toBe(dir);
     expect(existsSync(dir)).toBe(true);
     expect(statSync(dir).mode & 0o077).toBe(0);
@@ -67,7 +67,7 @@ describe('sources add --kind apple (legacy path)', () => {
   });
 
   test('tuning flags land as config keys; non-default only', async () => {
-    await cli(() => runAddApple(engine, ['apple-t', '--kind', 'apple', '--dir', join(home, 't'), '--services', 'mail,calendar', '--account', 'work laptop',
+    await cli(() => runAddApple(engine, ['apple-t', '--kind', 'apple', '--dir', join(home, 't'), '--services', 'mail,calendar', '--confirm-mail', '--account', 'work laptop',
       '--history-days', '30', '--future-days', '14', '--calendar-ids', 'cal-a, cal-b', '--contacts-dir', 'contacts', '--mail-mailboxes', 'INBOX,Archive', '--mail-days', '7']));
     const { config } = (await row('apple-t'))!;
     expect(config).toMatchObject({ a_account: 'work laptop', a_services: 'calendar,mail', a_history_days: 30, a_future_days: 14, a_calendar_ids: 'cal-a,cal-b',
@@ -132,7 +132,7 @@ describe('sources add --kind apple (connected parser)', () => {
   const parse = (...args: string[]) => parseSourceLifecycleArgs(['add', 'apple-x', '--kind', 'apple', ...args], randomUUID());
 
   test('builds typed apple options with the same defaults and validation', () => {
-    const parsed = parse('--services', 'mail', '--dir', join(home, 'p'), '--mail-days', '5');
+    const parsed = parse('--services', 'mail', '--confirm-mail', '--dir', join(home, 'p'), '--mail-days', '5');
     const opts = (parsed.params as { options: { apple: Record<string, unknown> } }).options.apple;
     expect(opts).toMatchObject({ services: ['mail'], mailDays: 5 });
     expect(opts.dir).toBe(join(home, 'p'));
@@ -150,7 +150,7 @@ describe('sources add --kind apple (connected parser)', () => {
 
 describe('sources set-services', () => {
   async function seed(services = 'calendar,contacts,mail') {
-    await cli(() => runAddApple(engine, ['apple-s', '--kind', 'apple', '--dir', join(home, 's'), '--services', services]));
+    await cli(() => runAddApple(engine, ['apple-s', '--kind', 'apple', '--dir', join(home, 's'), '--services', services, '--confirm-mail']));
   }
   const managedProxy = () => new Proxy(engine, { get(target, prop, recv) {
     if (prop !== 'executeRaw') return Reflect.get(target, prop, recv);
@@ -167,7 +167,7 @@ describe('sources set-services', () => {
     expect(removed.out).toContain('stay');
     expect((await row('apple-s'))!.config.a_services).toBe('calendar,contacts');
     expect((await engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM pages WHERE source_id='apple-s'`))[0]!.n).toBe(1);
-    await cli(() => runSources(engine, ['set-services', 'apple-s', '--add', 'mail']));
+    await cli(() => runSources(engine, ['set-services', 'apple-s', '--add', 'mail', '--confirm-mail']));
     expect((await row('apple-s'))!.config.a_services).toBe('calendar,contacts,mail');
   });
 
@@ -177,8 +177,8 @@ describe('sources set-services', () => {
     expect((await cli(() => runSources(engine, ['set-services', 'apple-s', '--add', 'notes']))).exit).toBe(2);
     expect((await cli(() => runSources(engine, ['set-services', 'apple-s']))).exit).toBe(2);
     expect((await cli(() => runSources(engine, ['set-services', 'apple-s', '--add', 'mail', '--remove', 'mail']))).exit).toBe(2);
-    expect((await cli(() => runSources(engine, ['set-services', 'default', '--add', 'mail']))).exit).toBe(2);
-    expect((await cli(() => runSources(engine, ['set-services', 'nope', '--add', 'mail']))).exit).toBe(4);
+    expect((await cli(() => runSources(engine, ['set-services', 'default', '--add', 'mail', '--confirm-mail']))).exit).toBe(2);
+    expect((await cli(() => runSources(engine, ['set-services', 'nope', '--add', 'mail', '--confirm-mail']))).exit).toBe(4);
     expect((await row('apple-s'))!.config.a_services).toBe('mail');
   });
 
@@ -280,5 +280,62 @@ describe('sync dispatch reaches runAppleSync', () => {
       await withEnv({ GBRAIN_HOME: home }, () => performSync(engine, { sourceId: 'apple-sync2', noEmbed: true, noExtract: true, noSchemaPack: true }));
       expect(contactsReads).toBe(0);
     } finally { spy.mockRestore(); }
+  });
+});
+
+describe('Mail consent on sources add / set-services (#7)', () => {
+  const parse = (...args: string[]) => parseSourceLifecycleArgs(['add', 'apple-x', '--kind', 'apple', ...args], randomUUID());
+  const optsOf = (p: ReturnType<typeof parse>) => (p.params as { options: { apple: { services: string[] } } }).options.apple;
+
+  test('the default services of `sources add --kind apple` exclude Mail (managed parser and flag builder)', () => {
+    expect(optsOf(parse('--dir', join(home, 'd'))).services).toEqual(['calendar', 'contacts']);
+    expect(buildAppleAddOptions({ dir: join(home, 'd') }).services).toEqual(['calendar', 'contacts']);
+  });
+
+  test('mail in --services without --confirm-mail is a coded mail_confirmation_required error and nothing is registered', async () => {
+    expect(() => parse('--services', 'calendar,mail', '--dir', join(home, 'm'))).toThrow(/explicit confirmation/);
+    let code = '';
+    try { buildAppleAddOptions({ services: 'mail', dir: join(home, 'm') }); } catch (e) { code = (e as AppleAddFlagError).code; }
+    expect(code).toBe('mail_confirmation_required');
+    const r = await cli(() => runAddApple(engine, ['apple-m', '--kind', 'apple', '--dir', join(home, 'm'), '--services', 'calendar,mail']));
+    expect(r.exit).toBe(2);
+    expect(r.err).toContain('mail_confirmation_required');
+    expect(r.err).toContain('--confirm-mail');
+    expect(await row('apple-m')).toBeFalsy();
+  });
+
+  test('--confirm-mail alone (no explicit mail in --services) does not add Mail; with both it does', async () => {
+    expect(optsOf(parse('--confirm-mail', '--dir', join(home, 'c'))).services).toEqual(['calendar', 'contacts']);
+    expect(optsOf(parse('--services', 'contacts,mail', '--confirm-mail', '--dir', join(home, 'c'))).services).toEqual(['contacts', 'mail']);
+    expect(() => parseSourceLifecycleArgs(['add', 'g', '--kind', 'google', '--account', 'a@example.com', '--confirm-mail'], randomUUID())).toThrow(/requires --kind apple/);
+  });
+
+  test('set-services --add mail needs --confirm-mail; --yes alone is not consent for Mail; removing and adding other services are unaffected', async () => {
+    await cli(() => runAddApple(engine, ['apple-s', '--kind', 'apple', '--dir', join(home, 's')]));
+    expect((await row('apple-s'))!.config.a_services).toBe('calendar,contacts');
+    const refused = await cli(() => runSources(engine, ['set-services', 'apple-s', '--add', 'mail']));
+    expect(refused.exit).toBe(2);
+    expect(refused.err).toContain('mail_confirmation_required');
+    expect((await cli(() => runSources(engine, ['set-services', 'apple-s', '--add', 'mail', '--yes']))).exit).toBe(2);
+    expect((await row('apple-s'))!.config.a_services).toBe('calendar,contacts');
+    const ok = await cli(() => runSources(engine, ['set-services', 'apple-s', '--add', 'mail', '--confirm-mail']));
+    expect(ok.exit).toBeNull();
+    expect((await row('apple-s'))!.config.a_services).toBe('calendar,contacts,mail');
+    expect((await cli(() => runSources(engine, ['set-services', 'apple-s', '--remove', 'calendar']))).exit).toBeNull();
+  });
+
+  test('apple setup builds its add options without tripping the consent gate (setup has its own gate before any probe)', () => {
+    expect(buildAppleAddOptions({ services: 'calendar,contacts,mail', confirmMail: true, dir: join(home, 'x') }).services).toEqual(['calendar', 'contacts', 'mail']);
+  });
+});
+
+describe('mail_max config', () => {
+  test('a_mail_max defaults to 500, is capped at 5000, and is not part of the checkpoint identity', () => {
+    expect(parseAppleSourceConfig({ kind: 'apple' }, '/d').mailMax).toBe(500);
+    expect(parseAppleSourceConfig({ kind: 'apple', a_mail_max: 40 }, '/d').mailMax).toBe(40);
+    expect(parseAppleSourceConfig({ kind: 'apple', a_mail_max: 999999 }, '/d').mailMax).toBe(5000);
+    const base = { kind: 'apple', a_account: 'alice-example', a_services: 'calendar' };
+    const id = (raw: Record<string, unknown>) => connectorIdentity('apple', { ...base, ...raw }, '/brain/apple').digest;
+    expect(id({ a_mail_max: 10 })).toBe(id({}));
   });
 });

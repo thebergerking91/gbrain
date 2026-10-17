@@ -11,7 +11,10 @@ export type AppleReaderErrorCode =
   | 'helper_timeout'
   | 'malformed_output'
   | 'automation_denied'
-  | 'mail_not_running_or_unconfigured';
+  | 'mail_not_running_or_unconfigured'
+  | 'permission_not_determined'
+  | 'selection_not_found'
+  | 'macos_too_old';
 
 export const APPLE_READER_ERROR_CODES: readonly AppleReaderErrorCode[] = [
   'unsupported_platform',
@@ -21,6 +24,9 @@ export const APPLE_READER_ERROR_CODES: readonly AppleReaderErrorCode[] = [
   'malformed_output',
   'automation_denied',
   'mail_not_running_or_unconfigured',
+  'permission_not_determined',
+  'selection_not_found',
+  'macos_too_old',
 ];
 
 export class AppleReaderError extends Error {
@@ -63,6 +69,14 @@ export function fixFor(code: AppleReaderErrorCode, service: AppleReaderService):
       const pane = service === 'calendar' ? 'Calendars (or Full Calendar Access)' : 'Contacts';
       return `Open System Settings > Privacy & Security > ${pane} and enable the app that runs gbrain (Terminal, iTerm, or the launcher/daemon host app), then retry. If the app is not listed, run the sync once from that app in an interactive session so macOS can prompt. If you previously denied it, reset with: tccutil reset ${service === 'calendar' ? 'Calendar' : 'AddressBook'} (all apps).`;
     }
+    case 'permission_not_determined':
+      return `macOS has not asked for ${SERVICE_LABEL[service]} access yet (not a denial). Run \`gbrain apple setup\` from an interactive session on the Mac (or \`gbrain sync --source <id>\` once) so macOS can show its permission prompt, then click Allow.`;
+    case 'selection_not_found':
+      return service === 'mail'
+        ? 'A configured mailbox name matched no mailbox in Mail.app, so the listing would be incomplete and nothing was read. Fix a_mail_mailboxes (names as shown in Mail.app, or INBOX/Sent), then retry.'
+        : 'A configured calendar id (a_calendar_ids) matched no calendar on this Mac, so the listing would be incomplete and nothing was read. Remove or correct that id, then retry.';
+    case 'macos_too_old':
+      return 'The Calendar and Contacts helpers need macOS 14 (Sonoma) or newer with Xcode Command Line Tools 15 or newer. Update macOS and the tools (xcode-select --install, or Software Update), then retry.';
     case 'automation_denied':
       return 'Open System Settings > Privacy & Security > Automation, find the app that runs gbrain (Terminal, iTerm, or the launcher/daemon host app) and enable its "Mail" switch, then retry. If it is not listed, run the sync once from that app in an interactive session so macOS can prompt.';
     case 'mail_not_running_or_unconfigured':
@@ -72,7 +86,7 @@ export function fixFor(code: AppleReaderErrorCode, service: AppleReaderService):
     case 'malformed_output':
       return `The ${SERVICE_LABEL[service]} helper returned output gbrain could not parse. Retry once; if it persists, run the helper by hand and report the (redacted) output.`;
     case 'helper_failed':
-      return `The ${SERVICE_LABEL[service]} helper failed. Check the message above; ensure Xcode Command Line Tools are installed (xcode-select --install) for Calendar and Contacts.`;
+      return `The ${SERVICE_LABEL[service]} helper failed. Check the message above; ensure Xcode Command Line Tools 15+ are installed (xcode-select --install) on macOS 14+ for Calendar and Contacts.`;
   }
 }
 

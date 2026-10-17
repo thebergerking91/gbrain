@@ -21,6 +21,8 @@ import {
 export const DEFAULT_HELPER_TIMEOUT_MS = 120_000;
 export const MAX_HELPER_STDOUT_BYTES = 64 * 1024 * 1024;
 export const MAX_STDERR_BYTES = 2048;
+/** Larger window kept only to recognize known compile failures (the message stays at MAX_STDERR_BYTES). */
+const STDERR_SCAN_BYTES = 32 * 1024;
 
 const ENV_ALLOWLIST = ['PATH', 'HOME', 'TMPDIR', 'LANG'] as const;
 
@@ -77,6 +79,8 @@ function killTree(child: ReturnType<typeof spawn>): void {
 interface RawResult {
   stdout: Buffer;
   stderr: string;
+  /** Up to STDERR_SCAN_BYTES of stderr, for pattern matching only (never shown). */
+  stderrScan: string;
   exitCode: number | null;
   signalName: NodeJS.Signals | null;
   spawnError?: Error;
@@ -90,7 +94,7 @@ function execute(opts: RunHelperOptions): Promise<RawResult> {
   const cap = opts.maxStdoutBytes ?? MAX_HELPER_STDOUT_BYTES;
   return new Promise<RawResult>((resolve) => {
     const res: RawResult = {
-      stdout: Buffer.alloc(0), stderr: '', exitCode: null, signalName: null,
+      stdout: Buffer.alloc(0), stderr: '', stderrScan: '', exitCode: null, signalName: null,
       timedOut: false, aborted: false, capped: false,
     };
     if (opts.signal?.aborted) {
@@ -124,7 +128,8 @@ function execute(opts: RunHelperOptions): Promise<RawResult> {
       if (timer) clearTimeout(timer);
       opts.signal?.removeEventListener('abort', onAbort);
       res.stdout = Buffer.concat(chunks, total);
-      res.stderr = truncate(stderrBuf.toString('utf8'), MAX_STDERR_BYTES);
+      res.stderrScan = stderrBuf.toString('utf8');
+      res.stderr = truncate(res.stderrScan, MAX_STDERR_BYTES);
       resolve(res);
     };
     const onAbort = () => {
@@ -149,9 +154,8 @@ function execute(opts: RunHelperOptions): Promise<RawResult> {
       chunks.push(d);
     });
     child.stderr?.on('data', (d: Buffer) => {
-      // Keep only the first MAX_STDERR_BYTES+1 bytes: enough to know it was truncated.
-      if (stderrBuf.length <= MAX_STDERR_BYTES) {
-        stderrBuf = Buffer.concat([stderrBuf, d]).subarray(0, MAX_STDERR_BYTES + 1);
+      if (stderrBuf.length < STDERR_SCAN_BYTES) {
+        stderrBuf = Buffer.concat([stderrBuf, d]).subarray(0, STDERR_SCAN_BYTES);
       }
     });
     child.on('error', (e) => {
@@ -176,11 +180,25 @@ function parseDocument(stdout: Buffer): { ok: true; doc: unknown } | { ok: false
   }
 }
 
+/** The helper's parsed success document: `items` plus any sibling fields (e.g. mail's `truncated`). */
+export interface HelperDocument {
+  items: unknown[];
+  doc: Record<string, unknown>;
+}
+
+/** `swiftc` on an SDK older than the helpers' deployment target prints "is only available in macOS 14". */
+const MACOS_TOO_OLD_RE = /is only available in macOS \d+/i;
+
 /**
  * Run a helper and return the parsed document's `items` array.
  * Throws AppleReaderError for every failure mode.
  */
 export async function runHelper(opts: RunHelperOptions): Promise<unknown[]> {
+  return (await runHelperDocument(opts)).items;
+}
+
+/** Like runHelper, but also returns the whole success document. */
+export async function runHelperDocument(opts: RunHelperOptions): Promise<HelperDocument> {
   const { service } = opts;
   assertDarwin(service, opts.platform);
 
@@ -213,12 +231,15 @@ export async function runHelper(opts: RunHelperOptions): Promise<unknown[]> {
       const msg = typeof e.message === 'string' && e.message ? oneLine(e.message) : `Apple ${service} helper reported an error`;
       throw new AppleReaderError(code, service, truncate(msg, 500), fixFor(code, service));
     }
-    if (r.exitCode === 0 && Array.isArray(doc.items)) return doc.items;
+    if (r.exitCode === 0 && Array.isArray(doc.items)) return { items: doc.items, doc: doc as Record<string, unknown> };
     if (r.exitCode === 0) {
       throw readerError('malformed_output', service, `Apple ${service} helper output has no "items" array.`);
     }
   }
 
+  if (MACOS_TOO_OLD_RE.test(r.stderrScan)) {
+    throw readerError('macos_too_old', service, `Apple ${service} helper could not be compiled: the installed macOS SDK / Command Line Tools are too old.${stderrNote}`);
+  }
   if (r.exitCode !== 0) {
     const how = r.signalName ? `killed by ${r.signalName}` : `exited with code ${r.exitCode}`;
     throw readerError('helper_failed', service, `Apple ${service} helper ${how} without a valid error document.${stderrNote}`);

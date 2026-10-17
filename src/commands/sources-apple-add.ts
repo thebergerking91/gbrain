@@ -16,8 +16,9 @@ const VALUED: Record<string, keyof AppleAddRaw | 'name'> = {
   '--calendar-ids': 'calendarIds', '--contacts-dir': 'contactsDir', '--mail-mailboxes': 'mailMailboxes', '--mail-days': 'mailDays',
   '--dir': 'dir', '--name': 'name',
 };
+const BOOLEAN_APPLE: Record<string, 'confirmMail'> = { '--confirm-mail': 'confirmMail' };
 
-const USAGE = 'Usage: gbrain sources add <id> --kind apple [--services calendar,contacts,mail] [--account <label>] [--history-days <n>] [--future-days <n>]\n'
+const USAGE = 'Usage: gbrain sources add <id> --kind apple [--services calendar,contacts[,mail --confirm-mail]] [--account <label>] [--history-days <n>] [--future-days <n>]\n'
   + '       [--calendar-ids <a,b>] [--contacts-dir <dir>] [--mail-mailboxes INBOX,Sent] [--mail-days <n>] [--dir <path>] [--name <display>] [--federated|--no-federated]\n'
   + '       (macOS only; permissions: gbrain apple setup)';
 
@@ -36,6 +37,7 @@ export async function runAddApple(engine: BrainEngine, args: string[]): Promise<
     if (a === '--kind') { i++; continue; }
     if (a === '--federated') { federated = true; continue; }
     if (a === '--no-federated') { federated = false; continue; }
+    if (BOOLEAN_APPLE[a]) { raw.confirmMail = true; continue; }
     const key = VALUED[a];
     if (key) {
       const value = args[++i];

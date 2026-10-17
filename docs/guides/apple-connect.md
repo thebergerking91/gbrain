@@ -6,7 +6,15 @@ does for Google accounts, but with no cloud account in the middle: it reads the
 data already on your Mac.
 
 It is **read-only** toward Apple, holds **no credentials**, and works **only on
-macOS**. Each of the three services is opt-in per service.
+macOS 14 (Sonoma) or newer with Xcode Command Line Tools 15 or newer**
+(`xcode-select --install`). On an older macOS or toolchain the Calendar and
+Contacts helpers fail to compile; gbrain reports that as `macos_too_old` with
+the fix instead of a compiler error. Each of the three services is opt-in per
+service, and **Mail is never on by default**.
+
+> The helpers have not been run against real Calendar, Contacts or Mail data by
+> the people who wrote them: they compile and are tested against fakes. Treat the
+> first sync on a real Mac as the first real test, and read the pages it writes.
 
 ## The fast path (one command)
 
@@ -18,7 +26,12 @@ gbrain apple setup
 
 1. confirms **Mail** with you (it is the most sensitive service; see
    [Mail confirmation](#mail-confirmation)),
-2. probes each selected service for the macOS permission it needs,
+2. probes each selected service for the macOS permission it needs. A service
+   macOS has **not asked about yet** (`permission_not_determined`, not a denial)
+   gets its prompt: when you run setup in a terminal (or pass `--yes`) gbrain
+   asks macOS once and re-probes, so click **Allow** when the dialog appears. With
+   no terminal attached, setup prints a message that a prompt will appear on the
+   Mac's screen and exits 2,
 3. if one is denied, prints the exact System Settings pane to fix and stops
    (exit 2) so you can grant it and re-run,
 4. registers the source (once), and
@@ -48,11 +61,16 @@ gbrain sync --source apple-local
 
 ## Choosing services (opt-out)
 
-`--services` takes any subset of `calendar,contacts,mail` (default: all three).
+`--services` takes any subset of `calendar,contacts,mail`. `gbrain apple setup`
+without `--services` selects all three and then asks you to confirm Mail;
+`gbrain sources add --kind apple` without `--services` enables **calendar and
+contacts only**. Including Mail needs `mail` in `--services` **and**
+`--confirm-mail` (error `mail_confirmation_required` otherwise).
 An unknown or empty value is an error (`unknown_service` / `empty_services`);
 it is never widened to "everything", because Mail and Contacts are private data.
 
-Change them later with `gbrain sources set-services <source> --add|--remove <service>`.
+Change them later with `gbrain sources set-services <source> --add|--remove <service>`
+(`--add mail` also needs `--confirm-mail`).
 **Removing a service never deletes pages**: the ones already imported stay, they
 are simply no longer updated. A disabled service is not read at all (its helper
 never runs and its permission is never requested). On a managed brain the
@@ -62,7 +80,8 @@ change starts a fresh sync cursor for the source and asks for `--yes` first.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--services` | `calendar,contacts,mail` | which services to sync |
+| `--services` | `calendar,contacts` (`sources add`); all three after confirmation (`apple setup`) | which services to sync |
+| `--confirm-mail` | off | consent to read Mail; required when `mail` is in `--services` |
 | `--account <label>` | `local` | a free label for this Mac's account; **not a credential** |
 | `--history-days <n>` | 90 (max 3650) | calendar events this far back |
 | `--future-days <n>` | 60 (max 3650) | calendar events this far ahead |
@@ -70,6 +89,7 @@ change starts a fresh sync cursor for the source and asks for `--yes` first.
 | `--contacts-dir <dir>` | `people` | where contact pages go (relative, lower-case segments) |
 | `--mail-mailboxes <a,b>` | `INBOX,Sent` | which mailboxes |
 | `--mail-days <n>` | 30 (max 365) | mail this far back |
+| `a_mail_max` (config key) | 500 (max 5000) | messages read per run; a larger backlog is read over several runs |
 | `--dir <path>` | `~/.gbrain/clones/<id>-apple` | the managed directory |
 
 Registering on a non-macOS host prints a warning but works (so a CI or
@@ -90,11 +110,16 @@ behavior and have not been verified against a live prompt on every macOS version
 | Mail | System Settings > Privacy & Security > **Automation** | the "Mail" switch under the app that runs gbrain |
 
 If the app is not listed, run the command once from that app in an interactive
-session so macOS can prompt. If you previously denied it, `tccutil reset
+session so macOS can prompt. **Unattended runs (autopilot, a daemon, cron) cannot
+show those prompts**: grant each service by running `gbrain apple setup` or
+`gbrain sync --source <id>` once from a terminal on the Mac, then unattended
+syncs work. A denial recorded by a sync is stored with the source's state, so
+`gbrain doctor` (`apple_permissions`) and `gbrain apple status --no-probe` show it. If you previously denied it, `tccutil reset
 Calendar` / `tccutil reset AddressBook` (all apps) clears the decision; for Mail,
 remove the app from the Automation list and retry. Mail also needs Mail.app to
-have at least one account configured and finished loading; gbrain never launches
-Mail itself (`mail_not_running_or_unconfigured`).
+be **running** with at least one account configured and finished loading; gbrain
+never launches Mail itself, on a probe or on a sync (it checks `running()` first
+and reports `mail_not_running_or_unconfigured`).
 
 `gbrain doctor` has an `apple_permissions` check: zero helper runs, it reads the
 last probe each sync recorded and warns when an enabled service was denied.
@@ -120,9 +145,25 @@ configured mailboxes), and that attachments are never downloaded. Opting Mail ou
   no-reply/notification sender) renders nothing, as in the google connector.
 
 An incremental sync never deletes: a vanished event, contact or thread keeps its
-page. `gbrain sync --source <id> --full` reconciles upstream deletions (and
-refuses more than 200 removals unless `GBRAIN_ALLOW_MASS_RECONCILE=1`).
-An identical re-run adds and modifies nothing.
+page. `gbrain sync --source <id> --full` reconciles upstream deletions. It
+refuses (the run is `partial`, nothing is deleted) when the reader's listing is
+empty but pages exist for that service, when more than 200 removals are due, or
+when the listing is known to be short (a mail run cut off at `a_mail_max`, a
+message Mail could not read), unless `GBRAIN_ALLOW_MASS_RECONCILE=1` for the
+first two. A configured calendar id or mailbox that matches nothing is an error
+(`selection_not_found`), not an empty listing. An identical re-run adds and
+modifies nothing.
+
+Mail reads are incremental: after the first run only messages since two days
+before the newest one already seen are read (`--full` re-reads the whole
+`--mail-days` window), capped per run by `a_mail_max`.
+
+Calendar notes: birthday calendars are skipped, and subscription calendars
+(holidays, sports) are read only when selected with `--calendar-ids`. A recurring
+event's pages are keyed on its series id plus the occurrence start, so
+**rescheduling a series creates new occurrence pages**; the old ones stay until
+`gbrain sync --source <id> --full` removes them. Multi-day timed events show the
+end date as well as the time.
 
 ## Privacy and custody
 
@@ -157,6 +198,10 @@ An identical re-run adds and modifies nothing.
 | `automation_denied` | Mail scripting denied | Automation pane, enable Mail for the app |
 | `mail_not_running_or_unconfigured` | Mail.app has no account / is not ready | open Mail, add an account, retry |
 | `helper_timeout` | a helper ran over its 120 s limit | retry; narrow the window or mailboxes |
-| `helper_failed` | the helper crashed | install Xcode Command Line Tools (`xcode-select --install`) |
+| `permission_not_determined` | macOS has not asked yet (not a denial) | run `gbrain apple setup` interactively and click Allow |
+| `selection_not_found` | a configured calendar id or mailbox matches nothing | fix `--calendar-ids` / `--mail-mailboxes` |
+| `macos_too_old` | the helper needs macOS 14+ / Command Line Tools 15+ | update macOS and the tools (`xcode-select --install`) |
+| `helper_failed` | the helper crashed | install Xcode Command Line Tools 15+ (`xcode-select --install`) |
+| `mail_confirmation_required` | `sources add` / `set-services` included Mail without `--confirm-mail` | confirm with the user, then add `--confirm-mail` |
 | `malformed_output` | the helper printed something unparseable | retry once, then report the redacted output |
 | `unknown_service` / `empty_services` | bad `--services` | pick from calendar, contacts, mail |

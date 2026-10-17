@@ -26,6 +26,7 @@ describe('parseAppleSourceConfig — defaults', () => {
       contactsDir: DEFAULT_CONTACTS_DIR,
       mailMailboxes: ['INBOX', 'Sent'],
       mailDays: 30,
+      mailMax: 500,
       dir: DIR,
     });
   });

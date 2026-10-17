@@ -4,7 +4,7 @@
  *
  * Keys (all prefixed `a_`): a_account, a_services, a_history_days,
  * a_future_days, a_calendar_ids, a_contacts_dir, a_mail_mailboxes,
- * a_mail_days, a_dir.
+ * a_mail_days, a_mail_max (config only: per-run message cap, default 500), a_dir.
  *
  * Deliberate difference from the Google parser: an `a_services` value that is
  * present but names no known service parses to an EMPTY list (nothing is
@@ -27,6 +27,8 @@ export const APPLE_FUTURE_DAYS_MAX = 3650;
 export const APPLE_DEFAULT_MAIL_MAILBOXES: readonly string[] = ['INBOX', 'Sent'];
 export const APPLE_DEFAULT_MAIL_DAYS = 30;
 export const APPLE_MAIL_DAYS_MAX = 365;
+export const APPLE_DEFAULT_MAIL_MAX = 500;
+export const APPLE_MAIL_MAX_MAX = 5000;
 
 /** A csv string (or a string array) split into trimmed, non-empty, de-duplicated tokens. */
 function csv(raw: unknown): string[] | null {
@@ -77,6 +79,7 @@ export function parseAppleSourceConfig(
   const future = positiveInt(config.a_future_days);
   const mailDays = positiveInt(config.a_mail_days);
   const mailboxes = csv(config.a_mail_mailboxes);
+  const mailMax = positiveInt(config.a_mail_max);
   return {
     account: accountRaw || APPLE_DEFAULT_ACCOUNT,
     services: parseAppleServices(config.a_services),
@@ -86,6 +89,7 @@ export function parseAppleSourceConfig(
     contactsDir: parseContactsDir(config.a_contacts_dir) ?? DEFAULT_CONTACTS_DIR,
     mailMailboxes: mailboxes && mailboxes.length > 0 ? mailboxes : [...APPLE_DEFAULT_MAIL_MAILBOXES],
     mailDays: mailDays !== null ? Math.min(APPLE_MAIL_DAYS_MAX, mailDays) : APPLE_DEFAULT_MAIL_DAYS,
+    mailMax: mailMax !== null ? Math.min(APPLE_MAIL_MAX_MAX, mailMax) : APPLE_DEFAULT_MAIL_MAX,
     dir: typeof config.a_dir === 'string' && config.a_dir.length > 0 ? config.a_dir : fallbackDir,
   };
 }

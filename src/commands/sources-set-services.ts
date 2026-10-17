@@ -14,11 +14,12 @@ import { exitCliError, usageError } from '../cli/cli-error.ts';
 import { opError } from '../core/ops/contract.ts';
 import { parseSourceConfig } from '../core/sources-load.ts';
 import { parseAppleSourceConfig } from '../core/apple/source-config.ts';
+import { mailConfirmationRequired } from './sources-apple-flags.ts';
 import { ALL_APPLE_SERVICES, type AppleService } from '../core/apple/types.ts';
 import { readManagedMode } from '../core/persistence/managed-mode.ts';
 import { connectorIdentity } from '../core/persistence/connector-identity.ts';
 
-const USAGE = `Usage: gbrain sources set-services <source> (--add <service> | --remove <service>) [--yes]. Services: ${ALL_APPLE_SERVICES.join(', ')}`;
+const USAGE = `Usage: gbrain sources set-services <source> (--add <service> | --remove <service>) [--yes] [--confirm-mail]. Services: ${ALL_APPLE_SERVICES.join(', ')}`;
 
 function serviceFlag(args: string[], flag: '--add' | '--remove'): AppleService | undefined {
   const index = args.indexOf(flag);
@@ -57,6 +58,13 @@ export async function runSetServices(engine: BrainEngine, args: string[]): Promi
     exitCliError(usageError(`Removing ${remove} would leave "${id}" with no service.`,
       `A source with no service syncs nothing. Archive it instead: gbrain sources archive ${id}`), 'sources');
   }
+  // Mail is the most sensitive service: turning it on needs the same explicit consent as `apple setup` / `sources add`.
+  if (add === 'mail' && !apple.services.includes('mail') && !args.includes('--confirm-mail')) {
+    const e = mailConfirmationRequired('set-services');
+    console.error(`Error: ${e.message} (${e.code})`);
+    console.error(e.suggestion);
+    process.exit(2);
+  }
   if (services.join(',') === apple.services.join(',')) {
     console.log(`Source "${id}" already ${add ? 'syncs' : 'omits'} ${add ?? remove}. Services: ${apple.services.join(', ')}.`);
     return;
@@ -64,7 +72,7 @@ export async function runSetServices(engine: BrainEngine, args: string[]): Promi
   const before = connectorIdentity('apple', config, src!.local_path).digest;
   const after = connectorIdentity('apple', { ...config, a_services: services.join(',') }, src!.local_path).digest;
   if (before !== after && !args.includes('--yes') && await readManagedMode(engine)) {
-    const command = ['gbrain', 'sources', 'set-services', id!, add ? '--add' : '--remove', (add ?? remove)!, '--yes'];
+    const command = ['gbrain', 'sources', 'set-services', id!, add ? '--add' : '--remove', (add ?? remove)!, ...(add === 'mail' ? ['--confirm-mail'] : []), '--yes'];
     exitCliError(opError('confirmation_required', `Changing the services of "${id}" makes its next sync start a fresh cursor.`,
       `On this managed brain the source's sync cursor is keyed by its configuration, so the change re-reads the remaining services from the start (${services.join(', ')}); pages already imported stay and nothing is deleted. With the user's agreement, run ${command.join(' ')}.`, {
         fix: { argv: command, consent: [], actor: 'agent', why: 'Applies the service change after the user agrees to the re-read.', requires_exclusive: false,

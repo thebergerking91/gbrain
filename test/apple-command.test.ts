@@ -47,12 +47,12 @@ describe('help and parsing', () => {
     expect(r.code).toBe(0);
     for (const word of ['setup', 'status', 'services', '--confirm-mail', '--no-sync', 'Exit codes']) expect(r.out).toContain(word);
   });
-  test('unknown subcommand and unknown flag are coded errors with exit 2', async () => {
+  test('unknown subcommand is exit 2; a flag parse error is exit 1 (failed, not waiting on the user)', async () => {
     const a = await run(['bogus', '--json']);
     expect(a.code).toBe(2);
     expect(a.json).toMatchObject({ ok: false, status: 'error', error: { code: 'unknown_subcommand' } });
     const b = await run(['setup', '--wat', '--json']);
-    expect(b.code).toBe(2);
+    expect(b.code).toBe(1);
     expect(b.json.error.code).toBe('invalid_value');
   });
 });
@@ -254,5 +254,88 @@ describe('spawned CLI', () => {
     const r = await runCli(['apple', 'wat', '--json'], { home });
     expect(r.exitCode).toBe(2);
     expect(JSON.parse(r.stdout).error.code).toBe('unknown_subcommand');
+  });
+});
+
+describe('setup: permission_not_determined (a fresh Mac)', () => {
+  // A reader whose service reports "not asked yet" until requestAccess runs, then is granted.
+  function freshMac(opts: { grant?: boolean } = {}) {
+    const calls: string[] = [];
+    const asked = new Set<AppleService>();
+    const readers: AppleReaders = {
+      async calendar() { throw new Error('no read'); }, async contacts() { throw new Error('no read'); }, async mail() { throw new Error('no read'); },
+      async probe(service) {
+        calls.push(`probe:${service}`);
+        if (asked.has(service) && opts.grant !== false) return { ok: true as const };
+        if (asked.has(service)) return { ok: false as const, code: 'permission_denied' as const, fix: 'denied after prompt' };
+        return { ok: false as const, code: 'permission_not_determined' as const, fix: 'macOS has not asked yet' };
+      },
+      async requestAccess(service) { calls.push(`request:${service}`); asked.add(service); return { ok: true as const }; },
+    };
+    return { readers, calls };
+  }
+
+  test('interactive: not_determined -> requestAccess -> re-probe -> granted, then registers and syncs', async () => {
+    const { readers, calls } = freshMac();
+    const r = await run(['setup', '--json', '--services', 'calendar,contacts'], { readers, interactive: true, sync: okSync as never });
+    expect(r.code).toBe(0);
+    expect(r.json).toMatchObject({ ok: true, status: 'ok', registered: true });
+    expect(calls).toEqual(['probe:calendar', 'request:calendar', 'probe:calendar', 'probe:contacts', 'request:contacts', 'probe:contacts']);
+  });
+
+  test('--yes also requests access without a terminal', async () => {
+    const { readers, calls } = freshMac();
+    const r = await run(['setup', '--json', '--yes', '--services', 'calendar'], { readers, interactive: false, sync: okSync as never });
+    expect(r.code).toBe(0);
+    expect(calls).toContain('request:calendar');
+  });
+
+  test('non-interactive without --yes: never requests; prints a [SHOW USER] saying a prompt will appear on the Mac, exit 2, nothing registered', async () => {
+    const { readers, calls } = freshMac();
+    const r = await run(['setup', '--services', 'calendar,contacts'], { readers, interactive: false });
+    expect(r.code).toBe(2);
+    expect(calls.some((c) => c.startsWith('request:'))).toBe(false);
+    expect(r.out).toContain('[SHOW USER]');
+    expect(r.out).toContain("prompt will appear on this Mac's screen");
+    expect(r.out).not.toContain('permission_denied');
+    expect((await engine.executeRaw('SELECT id FROM sources WHERE id LIKE $1', ['apple%'])).length).toBe(0);
+    const j = await run(['setup', '--json', '--services', 'calendar'], { readers: freshMac().readers, interactive: false });
+    expect(j.json).toMatchObject({ status: 'awaiting_permission' });
+    expect(j.json.denied[0]).toMatchObject({ service: 'calendar', code: 'permission_not_determined' });
+  });
+
+  test('interactive but the user clicks Deny: the re-probe says permission_denied and setup waits with the pane', async () => {
+    const { readers } = freshMac({ grant: false });
+    const r = await run(['setup', '--json', '--services', 'contacts'], { readers, interactive: true });
+    expect(r.code).toBe(2);
+    expect(r.json.denied[0]).toMatchObject({ service: 'contacts', code: 'permission_denied' });
+    expect(r.json.denied[0].pane).toContain('Contacts');
+  });
+
+  test('a reader without requestAccess does not crash: it waits like the non-interactive case', async () => {
+    const readers: AppleReaders = { ...readersWith({ calendar: { ok: false, code: 'permission_not_determined', fix: 'ask' } }) };
+    const r = await run(['setup', '--json', '--services', 'calendar'], { readers, interactive: true });
+    expect(r.code).toBe(2);
+  });
+});
+
+describe('setup: duplicate source detection', () => {
+  test('re-running with the default account (no --account) reuses the source registered with a_account "local"', async () => {
+    // A source registered through `sources add` under a different id but the default account label.
+    await engine.executeRaw(`INSERT INTO sources (id, name, local_path, config) VALUES ('my-mac', 'my-mac', $1, $2::text::jsonb)`,
+      [join(home, 'x'), JSON.stringify({ kind: 'apple', a_account: 'local', a_services: 'calendar,contacts', a_dir: join(home, 'x') })]);
+    const r = await run(['setup', '--json', '--services', 'calendar,contacts', '--no-sync'], { readers: readersWith() });
+    expect(r.code).toBe(0);
+    expect(r.json).toMatchObject({ registered: false, already_registered: true, source_id: 'my-mac' });
+    expect((await engine.executeRaw('SELECT id FROM sources WHERE config->>\'kind\'=\'apple\'')).length).toBe(1);
+  });
+});
+
+describe('setup text', () => {
+  test('does not promise autopilot will keep it synced; says unattended runs cannot show prompts and to run sync once interactively', async () => {
+    const r = await run(['setup', '--yes', '--services', 'calendar', '--no-sync'], { readers: readersWith() });
+    expect(r.out).not.toContain('Autopilot keeps it synced');
+    expect(r.out).toContain('cannot show macOS permission prompts');
+    expect(r.out).toContain('gbrain sync --source apple-local');
   });
 });

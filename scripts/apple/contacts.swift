@@ -1,7 +1,8 @@
 // gbrain Apple connector: read-only Contacts helper (Contacts framework).
 //
 // Usage (run by src/core/apple/readers/contacts.ts, never from user input):
-//   swift contacts.swift -- --probe
+//   swift contacts.swift -- --probe            (never prompts; reports permission_not_determined before the first ask)
+//   swift contacts.swift -- --request-access   (shows the macOS prompt if not yet asked; reads no contact)
 //   swift contacts.swift --
 //
 // Protocol: prints exactly ONE JSON document on stdout.
@@ -28,8 +29,10 @@ var args = Array(CommandLine.arguments.dropFirst())
 if let first = args.first, first.hasSuffix(".swift") { args.removeFirst() }
 args.removeAll { $0 == "--" }
 var probeOnly = false
+var requestOnly = false
 for a in args {
     if a == "--probe" { probeOnly = true }
+    else if a == "--request-access" { requestOnly = true }
     else { fail("helper_failed", "unknown argument: \(a)", exitCode: 2) }
 }
 
@@ -43,7 +46,7 @@ switch CNContactStore.authorizationStatus(for: .contacts) {
 case .authorized:
     break
 case .notDetermined:
-    if probeOnly { denied("not yet requested") }
+    if probeOnly { fail("permission_not_determined", "Contacts access has not been requested yet (macOS has not asked).") }
     final class Box: @unchecked Sendable { var granted = false; var message: String? = nil }
     let box = Box()
     let sem = DispatchSemaphore(value: 0)
@@ -63,7 +66,7 @@ default:
     break
 }
 
-if probeOnly { emit(["items": [Any](), "status": "authorized"], code: 0) }
+if probeOnly || requestOnly { emit(["items": [Any](), "status": "authorized"], code: 0) }
 
 // ---- group membership: contact id -> [group names] ----
 var groupsByContact: [String: [String]] = [:]

@@ -16,10 +16,11 @@ import type { SyncOpts } from '../src/commands/sync.ts';
 import { runAppleSync } from '../src/core/apple/apple-source.ts';
 import { appleStateFile, readAppleState } from '../src/core/apple/state.ts';
 import { parseAppleSourceConfig } from '../src/core/apple/source-config.ts';
-import { AppleReaderError } from '../src/core/apple/types.ts';
+import { AppleReaderError } from '../src/core/apple/readers/errors.ts';
 import type {
   AppleCalendarEvent,
   AppleContact,
+  AppleMailListing,
   AppleMailMessage,
   AppleReaders,
   AppleService,
@@ -55,7 +56,11 @@ interface FakeApple {
   fail: Partial<Record<AppleService, Error>>;
   calls: Record<AppleService, number>;
   lastCalendar?: { from: Date; to: Date; calendarIds: string[] };
-  lastMail?: { since: Date; mailboxes: string[] };
+  lastMail?: { since: Date; mailboxes: string[]; max?: number };
+  /** Extra listing flags the fake mail reader returns (truncated / unavailableThreads / incomplete). */
+  mailFlags?: Omit<AppleMailListing, 'messages'>;
+  /** When set, the fake mail reader honours `since` the way the helper does (only newer messages). */
+  mailFilterSince?: boolean;
 }
 
 function freshFake(): FakeApple {
@@ -83,8 +88,9 @@ function readersOf(f: FakeApple): AppleReaders {
     async mail(opts) {
       f.calls.mail++;
       if (f.fail.mail) throw f.fail.mail;
-      f.lastMail = { since: opts.since, mailboxes: opts.mailboxes };
-      return structuredClone(f.mail);
+      f.lastMail = { since: opts.since, mailboxes: opts.mailboxes, max: opts.max };
+      const all = f.mailFilterSince ? f.mail.filter((m) => Date.parse(m.date) > opts.since.getTime()) : f.mail;
+      return f.mailFlags ? { messages: structuredClone(all), ...f.mailFlags } : structuredClone(all);
     },
     async probe() { return { ok: true as const }; },
   };
@@ -365,16 +371,18 @@ describe('apple sweep — upstream removal needs --full', () => {
     const first = await sweep(dir, f, {}, { a_services: 'contacts' });
     expect(first.added).toBe(205);
 
-    f.contacts = [];
+    // One contact survives, so this is a mass delete (205 -> 1), not an empty listing.
+    const survivor = f.contacts[204]!;
+    f.contacts = [survivor];
     const guarded = await withEnv({ GBRAIN_ALLOW_MASS_RECONCILE: undefined }, () => sweep(dir, f, { full: true }, { a_services: 'contacts' }));
     expect(guarded.status).toBe('partial');
     expect(guarded.deleted).toBe(0);
     expect(await slugs('people/')).toHaveLength(205);
-    expect(logs.some((l) => l.includes('mass-delete guard refused 205'))).toBe(true);
+    expect(logs.some((l) => l.includes('mass-delete guard refused 204'))).toBe(true);
 
     const allowed = await withEnv({ GBRAIN_ALLOW_MASS_RECONCILE: '1' }, () => sweep(dir, f, { full: true }, { a_services: 'contacts' }));
-    expect(allowed.deleted).toBe(205);
-    expect(await slugs('people/')).toHaveLength(0);
+    expect(allowed.deleted).toBe(204);
+    expect(await slugs('people/')).toHaveLength(1);
   }), 120_000);
 
   test('exactly 200 removals are allowed without the override', () => withHome(async () => {
@@ -386,12 +394,13 @@ describe('apple sweep — upstream removal needs --full', () => {
       id: `edge-${i}`, givenName: 'Edge', familyName: `Number${String(i).padStart(3, '0')}`,
       emails: [`e${i}-example@example.com`], phones: [], groups: [],
     }));
+    f.contacts.push({ id: 'edge-keep', givenName: 'Keeper', familyName: 'Example', emails: ['keeper-example@example.com'], phones: [], groups: [] });
     await sweep(dir, f, {}, { a_services: 'contacts' });
-    f.contacts = [];
+    f.contacts = [f.contacts[200]!];
     const r = await withEnv({ GBRAIN_ALLOW_MASS_RECONCILE: undefined }, () => sweep(dir, f, { full: true }, { a_services: 'contacts' }));
     expect(r.status).toBe('synced');
     expect(r.deleted).toBe(200);
-    expect(await slugs('people/')).toHaveLength(0);
+    expect(await slugs('people/')).toHaveLength(1);
   }), 120_000);
 });
 
@@ -609,5 +618,203 @@ describe('apple sweep — rendered pages are free of absolute home paths and rea
     for (const rel of walkFiles(dir)) {
       expect(readFileSync(join(dir, rel), 'utf-8')).not.toContain(dir);
     }
+  }));
+});
+
+
+// ── Review fixes: --full safety (#4), mail prior (#5), mail incremental / cap (#8), partial runs (#3) ───────────
+
+describe('apple sweep — --full never reads a short listing as deletion (#4)', () => {
+  test('an EMPTY listing with owned pages is refused (partial, nothing deleted, coded), unless GBRAIN_ALLOW_MASS_RECONCILE=1', () => withHome(async () => {
+    const dir = newDir('empty');
+    await insertSource(dir);
+    const f = freshFake();
+    await sweep(dir, f);
+    const before = { cal: (await slugs('calendar/')).length, people: (await slugs('people/')).length, mail: (await slugs('emails/')).length };
+    expect(before.cal).toBeGreaterThan(0);
+    f.events = []; f.contacts = []; f.mail = [];
+    const guarded = await withEnv({ GBRAIN_ALLOW_MASS_RECONCILE: undefined }, () => sweep(dir, f, { full: true }));
+    expect(guarded.status).toBe('partial');
+    expect(guarded.deleted).toBe(0);
+    expect((await slugs('calendar/')).length).toBe(before.cal);
+    expect((await slugs('people/')).length).toBe(before.people);
+    expect((await slugs('emails/')).length).toBe(before.mail);
+    expect(logs.some((l) => l.includes('empty-listing guard refused'))).toBe(true);
+
+    const allowed = await withEnv({ GBRAIN_ALLOW_MASS_RECONCILE: '1' }, () => sweep(dir, f, { full: true }));
+    expect(allowed.deleted).toBeGreaterThan(0);
+    expect(await slugs('people/')).toHaveLength(0);
+  }));
+
+  test('an empty listing with NO owned pages is fine (a brand-new empty Mac)', () => withHome(async () => {
+    const dir = newDir('empty-new');
+    await insertSource(dir);
+    const f = freshFake();
+    f.events = []; f.contacts = []; f.mail = [];
+    const r = await withEnv({ GBRAIN_ALLOW_MASS_RECONCILE: undefined }, () => sweep(dir, f, { full: true }));
+    expect(r.status).not.toBe('partial');
+  }));
+
+  test('a mail listing flagged truncated or unreadable deletes nothing on --full and keeps the run partial', () => withHome(async () => {
+    const dir = newDir('mail-short');
+    await insertSource(dir);
+    const f = freshFake();
+    await sweep(dir, f);
+    const threads = await slugs('emails/');
+    expect(threads).toHaveLength(2);
+    // thr-002 vanishes from the listing, but the reader says it was cut short.
+    f.mail = f.mail.filter((m) => m.threadId !== 'thr-002');
+    f.mailFlags = { truncated: true };
+    const a = await sweep(dir, f, { full: true });
+    expect(a.status).toBe('partial');
+    expect(a.deleted).toBe(0);
+    expect(await slugs('emails/')).toHaveLength(2);
+    f.mailFlags = { incomplete: true };
+    const b = await sweep(dir, f, { full: true });
+    expect(b.deleted).toBe(0);
+    expect(await slugs('emails/')).toHaveLength(2);
+  }));
+
+  test('a thread the reader flags unavailable (a message it could not read) is not swept as deleted', () => withHome(async () => {
+    const dir = newDir('mail-unavail');
+    await insertSource(dir);
+    const f = freshFake();
+    await sweep(dir, f);
+    const gone = f.mail.filter((m) => m.threadId === 'thr-002');
+    expect(gone.length).toBeGreaterThan(0);
+    f.mail = f.mail.filter((m) => m.threadId !== 'thr-002');
+    f.mailFlags = { unavailableThreads: ['thr-002'] };
+    const r = await sweep(dir, f, { full: true });
+    expect(r.deleted).toBe(0);
+    expect(await slugs('emails/')).toHaveLength(2);
+    // Without the flag, the same listing is a real deletion.
+    f.mailFlags = undefined;
+    const real = await sweep(dir, f, { full: true });
+    expect(real.deleted).toBe(1);
+  }));
+});
+
+describe('apple sweep — mail pages the prior cannot be parsed for are not overwritten (#5)', () => {
+  test('a stored thread page that lists a message the reader no longer returns and cannot be split back is left unchanged and counted as an item failure', () => withHome(async () => {
+    const dir = newDir('prior-null');
+    await insertSource(dir);
+    const f = freshFake();
+    await sweep(dir, f);
+    const q = `SELECT slug, compiled_truth FROM pages WHERE source_id=$1 AND frontmatter->>'apple_thread_id'='thr-001'`;
+    const [before] = await engine.executeRaw<{ slug: string; compiled_truth: string }>(q, [SID]);
+    expect(before!.compiled_truth).toContain('Please review the plan');
+    // Corrupt the stored body so it no longer splits into one block per message id (a hand edit).
+    await engine.executeRaw(`UPDATE pages SET compiled_truth = $2 WHERE source_id=$1 AND frontmatter->>'apple_thread_id'='thr-001'`, [SID, 'Hand-edited: Please review the plan (kept).']);
+    // m-001 ages out of the read window and a new reply arrives.
+    f.mail = f.mail.filter((m) => m.id !== 'm-001');
+    f.mail.push({ ...f.mail[0]!, id: 'm-006', threadId: 'thr-001', mailbox: 'INBOX', from: 'alice-example@example.com', date: '2026-10-16T08:00:00-07:00', body: 'Great, thanks.' });
+    const r = await sweep(dir, f);
+    expect(r.failedFiles).toBe(1);
+    expect(r.status).toBe('partial');
+    const [after] = await engine.executeRaw<{ compiled_truth: string; frontmatter: Record<string, unknown> }>(
+      `SELECT compiled_truth, frontmatter FROM pages WHERE source_id=$1 AND frontmatter->>'apple_thread_id'='thr-001'`, [SID]);
+    expect(after!.compiled_truth).toBe('Hand-edited: Please review the plan (kept).');
+    expect(after!.compiled_truth).not.toContain('Great, thanks.');
+    expect(after!.frontmatter.apple_message_ids).toEqual(['m-001', 'm-002']);
+    expect(logs.some((l) => l.includes('cannot be carried forward'))).toBe(true);
+  }));
+});
+
+describe('apple sweep — mail reads incrementally and respects the per-run cap (#8)', () => {
+  const DAY = 86_400_000;
+
+  test('first run reads the whole window with a_mail_max; later runs read from a 2-day overlap before the newest message; --full reads the whole window', () => withHome(async () => {
+    const dir = newDir('mail-inc');
+    await insertSource(dir);
+    const f = freshFake();
+    await sweep(dir, f, {}, { a_mail_max: 7 });
+    expect(f.lastMail!.since.getTime()).toBe(NOW - 30 * DAY);
+    expect(f.lastMail!.max).toBe(7);
+    const newest = Math.max(...f.mail.map((m) => Date.parse(m.date)));
+    expect(readAppleState(dir).mail.newest).toBe(new Date(newest).toISOString());
+    await sweep(dir, f);
+    expect(f.lastMail!.since.getTime()).toBe(newest - 2 * DAY);
+    expect(f.lastMail!.max).toBe(500); // default cap
+    await sweep(dir, f, { full: true });
+    expect(f.lastMail!.since.getTime()).toBe(NOW - 30 * DAY);
+  }));
+
+  test('the incremental read never reaches back past the mail window', () => withHome(async () => {
+    const dir = newDir('mail-floor');
+    await insertSource(dir);
+    const f = freshFake();
+    await sweep(dir, f);
+    const cfg = parseAppleSourceConfig({ kind: 'apple', a_account: 'alice-example', a_dir: dir }, dir);
+    const later = NOW + 100 * DAY;
+    await runAppleSync(engine, SID, cfg, { sourceId: SID, noEmbed: true, noExtract: true }, { readers: readersOf(f), now: () => later, log: () => {} });
+    expect(f.lastMail!.since.getTime()).toBe(later - 30 * DAY);
+  }));
+
+  test('a truncated read is partial, does not advance the newest cursor, and the next run resumes from the newest message returned', () => withHome(async () => {
+    const dir = newDir('mail-trunc');
+    await insertSource(dir);
+    const f = freshFake();
+    const all = structuredClone(f.mail);
+    // The reader hands back only the OLDEST messages and says it was cut short.
+    const oldest = [...all].sort((a, b) => Date.parse(a.date) - Date.parse(b.date)).slice(0, 2);
+    f.mail = oldest;
+    f.mailFlags = { truncated: true };
+    const first = await sweep(dir, f);
+    expect(first.status).toBe('partial');
+    expect(logs.some((l) => l.includes('mail listing truncated'))).toBe(true);
+    const st = readAppleState(dir);
+    expect(st.mail.newest).toBeUndefined();
+    const newestReturned = Math.max(...oldest.map((m) => Date.parse(m.date)));
+    expect(Date.parse(st.mail.resume_from!)).toBe(newestReturned - 1000);
+
+    // Next run: not truncated any more; reads from resume_from, then settles and clears it.
+    f.mail = all;
+    f.mailFlags = undefined;
+    const second = await sweep(dir, f);
+    expect(f.lastMail!.since.getTime()).toBe(newestReturned - 1000);
+    expect(second.status).not.toBe('partial');
+    const st2 = readAppleState(dir);
+    expect(st2.mail.resume_from).toBeUndefined();
+    expect(st2.mail.newest).toBeDefined();
+  }));
+
+  test('a bare-array reader (older shape) still works and counts as complete', () => withHome(async () => {
+    const dir = newDir('mail-array');
+    await insertSource(dir);
+    const f = freshFake();
+    const r = await sweep(dir, f);
+    expect(r.status).toBe('first_sync');
+    expect(await slugs('emails/')).toHaveLength(2);
+  }));
+
+  test('mailReadSince: a --full run and a first run read the window start; resume_from wins over newest', async () => {
+    const { mailReadSince } = await import('../src/core/apple/sweep.ts');
+    const { emptyAppleState } = await import('../src/core/apple/state.ts');
+    const start = new Date(NOW - 30 * DAY);
+    const st = emptyAppleState();
+    expect(mailReadSince(st, start, false).getTime()).toBe(start.getTime());
+    st.mail.newest = new Date(NOW - 1 * DAY).toISOString();
+    expect(mailReadSince(st, start, false).getTime()).toBe(NOW - 3 * DAY);
+    expect(mailReadSince(st, start, true).getTime()).toBe(start.getTime());
+    st.mail.resume_from = new Date(NOW - 10 * DAY).toISOString();
+    expect(mailReadSince(st, start, false).getTime()).toBe(NOW - 10 * DAY);
+  });
+});
+
+describe('apple sweep — recurring ids and render details', () => {
+  test('a rescheduled series gets new occurrence pages; --full removes the old ones (documented behavior)', () => withHome(async () => {
+    const dir = newDir('resched');
+    await insertSource(dir);
+    const f = freshFake();
+    f.contacts = []; f.mail = [];
+    f.events = [{ id: 'series-ext-1#1792000000', calendarId: 'cal-1', calendarTitle: 'Work', title: 'Standup', start: '2026-10-20T09:00:00-07:00', end: '2026-10-20T09:15:00-07:00', allDay: false, attendees: [], recurring: true }];
+    await sweep(dir, f, {}, { a_services: 'calendar' });
+    f.events = [{ ...f.events[0]!, id: 'series-ext-1#1792003600', start: '2026-10-20T10:00:00-07:00', end: '2026-10-20T10:15:00-07:00' }];
+    const inc = await sweep(dir, f, {}, { a_services: 'calendar' });
+    expect(inc.deleted).toBe(0);
+    expect(await slugs('calendar/')).toHaveLength(2);
+    const full = await sweep(dir, f, { full: true }, { a_services: 'calendar' });
+    expect(full.deleted).toBe(1);
+    expect(await slugs('calendar/')).toHaveLength(1);
   }));
 });

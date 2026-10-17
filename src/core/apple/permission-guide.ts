@@ -10,9 +10,9 @@ import { fixFor, type AppleReaderErrorCode } from './readers/errors.ts';
 import type { AppleService } from './types.ts';
 
 /** Codes that wait on the user (a grant or an account), as opposed to a broken helper. */
-export const USER_ACTION_CODES: readonly AppleReaderErrorCode[] = ['permission_denied', 'automation_denied', 'mail_not_running_or_unconfigured'];
+export const USER_ACTION_CODES: readonly AppleReaderErrorCode[] = ['permission_denied', 'permission_not_determined', 'automation_denied', 'mail_not_running_or_unconfigured'];
 /** Codes doctor reports as a permission problem. */
-export const PERMISSION_CODES: readonly AppleReaderErrorCode[] = ['permission_denied', 'automation_denied'];
+export const PERMISSION_CODES: readonly AppleReaderErrorCode[] = ['permission_denied', 'permission_not_determined', 'automation_denied'];
 
 export const APPLE_HOST_APP = 'the app that runs gbrain (Terminal, iTerm, or the launcher/daemon host app)';
 
@@ -29,7 +29,7 @@ export interface PermissionGuide {
 
 export function permissionGuide(service: AppleService, code: AppleReaderErrorCode, fix?: string): PermissionGuide {
   let pane: string | null = null;
-  if (code === 'permission_denied' || code === 'automation_denied') {
+  if (code === 'permission_denied' || code === 'permission_not_determined' || code === 'automation_denied') {
     pane = service === 'calendar' ? 'System Settings > Privacy & Security > Calendars (or Full Calendar Access)'
       : service === 'contacts' ? 'System Settings > Privacy & Security > Contacts'
         : 'System Settings > Privacy & Security > Automation (enable the "Mail" switch under the app that runs gbrain)';
