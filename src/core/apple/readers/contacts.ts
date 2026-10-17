@@ -3,8 +3,9 @@ import { fileURLToPath } from 'node:url';
 import type { AppleContact } from '../types.ts';
 import { readerError } from './errors.ts';
 import { runHelper } from './run-helper.ts';
-import { str, strArray, SWIFT_BIN, type HelperOverrides } from './calendar.ts';
+import { REQUEST_ACCESS_TIMEOUT_MS, str, strArray, SWIFT_BIN, withScriptArgs, type HelperOverrides } from './calendar.ts';
 
+/** Source-tree path of the helper (tests / `swiftc -typecheck`). Runtime uses the embedded text. */
 export const CONTACTS_SCRIPT = fileURLToPath(new URL('../../../../scripts/apple/contacts.swift', import.meta.url));
 
 export function normalizeContact(raw: unknown): AppleContact {
@@ -22,10 +23,18 @@ export function normalizeContact(raw: unknown): AppleContact {
 }
 
 export async function readContacts(opts: { signal?: AbortSignal }, o: HelperOverrides = {}): Promise<AppleContact[]> {
-  const items = await runHelper({ service: 'contacts', command: o.command ?? SWIFT_BIN, args: o.scriptArgs ?? [CONTACTS_SCRIPT, '--'], signal: opts.signal, timeoutMs: o.timeoutMs, maxStdoutBytes: o.maxStdoutBytes, platform: o.platform, env: o.env });
+  const items = await withScriptArgs('contacts.swift', o, [], (scriptArgs) =>
+    runHelper({ service: 'contacts', command: o.command ?? SWIFT_BIN, args: scriptArgs, signal: opts.signal, timeoutMs: o.timeoutMs, maxStdoutBytes: o.maxStdoutBytes, platform: o.platform, env: o.env }));
   return items.map(normalizeContact);
 }
 
 export async function probeContacts(o: HelperOverrides = {}): Promise<void> {
-  await runHelper({ service: 'contacts', command: o.command ?? SWIFT_BIN, args: [...(o.scriptArgs ?? [CONTACTS_SCRIPT, '--']), '--probe'], timeoutMs: o.timeoutMs ?? 60_000, platform: o.platform, env: o.env });
+  await withScriptArgs('contacts.swift', o, [], (scriptArgs) =>
+    runHelper({ service: 'contacts', command: o.command ?? SWIFT_BIN, args: [...scriptArgs, '--probe'], timeoutMs: o.timeoutMs ?? 60_000, platform: o.platform, env: o.env }));
+}
+
+/** Ask macOS for Contacts access (shows the permission prompt) without reading any contact. */
+export async function requestContactsAccess(o: HelperOverrides = {}): Promise<void> {
+  await withScriptArgs('contacts.swift', o, [], (scriptArgs) =>
+    runHelper({ service: 'contacts', command: o.command ?? SWIFT_BIN, args: [...scriptArgs, '--request-access'], timeoutMs: o.timeoutMs ?? REQUEST_ACCESS_TIMEOUT_MS, platform: o.platform, env: o.env }));
 }

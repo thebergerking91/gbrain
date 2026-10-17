@@ -159,6 +159,8 @@ export async function recordConnectorSyncAttempt(engine: Pick<BrainEngine, 'exec
  * v181 (fix wave 4): records an attempt for every connector source the
  * pre-upgrade freshness loop dispatched (active, non-null local_path and not
  * `syncEnabled=false`), so the new gate idles no source autopilot synced.
+ * Google and GitHub only on purpose: no Apple source existed before v181, so there is nothing to seed, and
+ * editing this body would change the pinned migration hash.
  */
 export async function seedConnectorDispatchAttempts(engine: Pick<BrainEngine, 'executeRaw'>): Promise<number> {
   const rows = await engine.executeRaw<{ id: string; config: unknown }>(
@@ -169,7 +171,7 @@ export async function seedConnectorDispatchAttempts(engine: Pick<BrainEngine, 'e
     // parseSourceConfig, as the dispatch loops read it (string-wrapped configs included). The syncEnabled test is
     // isSyncDisabledConfig's (sync-policy.ts), inlined so the schema-migration closure stays small.
     const config = parseSourceConfig(row.config);
-    if (config.kind !== 'google' && config.kind !== 'github' && config.kind !== 'apple') continue;
+    if (config.kind !== 'google' && config.kind !== 'github') continue;
     if (config.syncEnabled === false) continue;
     await recordConnectorSyncAttempt(engine, row.id, at);
     seeded++;

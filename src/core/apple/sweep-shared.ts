@@ -4,10 +4,13 @@
  *
  * This is a deliberate local copy of src/core/google/sweep-shared.ts
  * (importRendered / deletePageByRelPath / writePrivateTemp), parameterized on
- * AppleSyncDeps. The Google originals are typed on GoogleSyncDeps and cannot be
- * reused without editing google files; behavior is kept identical (0600
- * private temp write, temp → import → rename so a failed import never
- * destroys the previously-good page, containment guard on every path).
+ * AppleSyncDeps. Left as a copy on purpose: the Google originals are typed on
+ * GoogleSyncDeps/GoogleSyncSummary (Google-only fields) and are on the hot path
+ * of a shipping connector, so generalizing them would touch Google code for no
+ * Google benefit. Behavior is kept identical (0600 private temp write, temp →
+ * import → rename so a failed import never destroys the previously-good page,
+ * containment guard on every path). A follow-up can extract a shared core once
+ * both connectors have settled.
  */
 import { closeSync, existsSync, fchmodSync, lstatSync, openSync, renameSync, rmSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -32,12 +35,18 @@ export interface AppleSyncSummary {
   failedFiles: number;
   /** Per-service counts, no content: itemsSeen[service] = items the reader returned. */
   itemsSeen: Record<string, number>;
+  /**
+   * Coded reasons a sweep could not finish its job (mass-delete or empty-listing refusal, mail
+   * truncation). Any entry keeps the run `partial` and its freshness unstamped; the cursor state is
+   * still saved because every cursor here is hash-keyed and advances only on success.
+   */
+  incomplete: string[];
 }
 
 export function newAppleSummary(): AppleSyncSummary {
   return {
     status: 'synced', added: 0, modified: 0, deleted: 0, chunksCreated: 0, embedded: 0,
-    pagesAffected: [], failedFiles: 0, itemsSeen: {},
+    pagesAffected: [], failedFiles: 0, itemsSeen: {}, incomplete: [],
   };
 }
 

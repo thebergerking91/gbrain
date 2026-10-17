@@ -19,11 +19,15 @@ import type { AppleAddOptions } from '../core/apple/source-add-config.ts';
 
 /** Flags that configure an apple source and are meaningless on any other kind. */
 export const APPLE_ONLY_FLAGS = ['calendar-ids', 'mail-mailboxes', 'mail-days'] as const;
+/** Boolean flag: explicit consent to read Mail (the most sensitive service). */
+export const APPLE_CONFIRM_MAIL_FLAG = 'confirm-mail';
+/** Services a bare `sources add --kind apple` enables: Mail is never in the default. */
+export const APPLE_DEFAULT_ADD_SERVICES: readonly AppleService[] = ['calendar', 'contacts'];
 /** Flags google and apple share (each kind validates them its own way). */
 export const APPLE_SHARED_FLAGS = ['account', 'services', 'history-days', 'future-days', 'contacts-dir'] as const;
 
 export class AppleAddFlagError extends Error {
-  constructor(public code: 'unknown_service' | 'empty_services' | 'invalid_value', message: string, public suggestion: string) {
+  constructor(public code: 'unknown_service' | 'empty_services' | 'invalid_value' | 'mail_confirmation_required', message: string, public suggestion: string) {
     super(message);
     this.name = 'AppleAddFlagError';
   }
@@ -38,6 +42,8 @@ export interface AppleAddRaw {
   contactsDir?: string;
   mailMailboxes?: string;
   mailDays?: string | number;
+  /** `--confirm-mail` (or setup's own confirmation): required for any source that includes Mail. */
+  confirmMail?: boolean;
   dir: string;
 }
 
@@ -63,7 +69,7 @@ export function parseAppleServicesFlag(raw: string): AppleService[] {
   const parts = raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
   if (parts.length === 0) {
     throw new AppleAddFlagError('empty_services', '--services needs at least one service.',
-      `Pass --services as a comma-separated subset of ${ALL_APPLE_SERVICES.join(',')}, or omit it to sync all three.`);
+      `Pass --services as a comma-separated subset of ${ALL_APPLE_SERVICES.join(',')}, or omit it for the default (calendar,contacts; Mail needs explicit consent).`);
   }
   const bad = parts.filter((p) => !(ALL_APPLE_SERVICES as readonly string[]).includes(p));
   if (bad.length > 0) {
@@ -76,7 +82,8 @@ export function parseAppleServicesFlag(raw: string): AppleService[] {
 
 /** Validate raw flag values into the typed `AddSourceOpts.apple` payload. */
 export function buildAppleAddOptions(raw: AppleAddRaw): AppleAddOptions {
-  const services = raw.services === undefined ? [...ALL_APPLE_SERVICES] : parseAppleServicesFlag(raw.services);
+  const services = raw.services === undefined ? [...APPLE_DEFAULT_ADD_SERVICES] : parseAppleServicesFlag(raw.services);
+  if (services.includes('mail') && raw.confirmMail !== true) throw mailConfirmationRequired('--services');
   const account = raw.account === undefined ? undefined : raw.account.trim().replace(/\s+/g, ' ');
   if (account !== undefined && (account.length === 0 || account.length > 64 || CONTROL_RE.test(account))) {
     throw new AppleAddFlagError('invalid_value', '--account must be a short label (1-64 printable characters).',
@@ -112,6 +119,20 @@ export function buildAppleAddOptions(raw: AppleAddRaw): AppleAddOptions {
     opts.mailMailboxes = boxes;
   }
   return opts;
+}
+
+/**
+ * Mail is the most sensitive service. Including it takes BOTH an explicit `mail` in the services list and
+ * `--confirm-mail`, so no default, typo or copy-paste turns it on by accident.
+ */
+export function mailConfirmationRequired(via: '--services' | 'set-services'): AppleAddFlagError {
+  return new AppleAddFlagError('mail_confirmation_required',
+    'Mail needs an explicit confirmation: it is the most sensitive Apple service.',
+    `gbrain will read the subject, sender, recipients, date and plain-text body of recent messages from Mail.app and store them as pages in your brain (attachments are never downloaded). `
+    + (via === '--services'
+      ? 'If the user agrees, add --confirm-mail to the same command (and keep mail in --services).'
+      : 'If the user agrees, re-run with --confirm-mail.')
+    + ' Without Mail: --services calendar,contacts.');
 }
 
 /** A warning (never a refusal): registering on a non-macOS host works, syncing will not. */

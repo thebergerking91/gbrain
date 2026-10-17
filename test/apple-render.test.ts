@@ -285,3 +285,29 @@ function stripFences(lines: string[]): string[] {
   }
   return out;
 }
+
+describe('render details (review fixes)', () => {
+  test('yamlStr escapes DEL, C1 controls (incl. NEL) and line/paragraph separators so frontmatter stays one line per value', () => {
+    const hostile = 'a\u007fb\u0085c\u009fd\u2028e\u2029f';
+    const p = renderCalendarEventPage({ ...events[0]!, title: 'Plain title', location: hostile }, 'local')!;
+    const fm = p.markdown.split('---')[1]!;
+    for (const ch of ['\u007f', '\u0085', '\u009f', '\u2028', '\u2029']) expect(fm).not.toContain(ch);
+    expect(fm).toContain('\\u007f');
+    expect(fm).toContain('\\u0085');
+    const parsed = parseMarkdown(p.markdown, 'x.md');
+    expect(parsed.frontmatter.location).toBe(hostile);
+  });
+
+  test('a multi-day timed event renders the end DATE as well as the time; a same-day one keeps the short form', () => {
+    const base = { ...events[0]!, allDay: false };
+    const multi = renderCalendarEventPage({ ...base, start: '2026-10-20T22:00:00-07:00', end: '2026-10-21T06:00:00-07:00' }, 'local')!;
+    expect(multi.markdown).toContain('2026-10-20 22:00 → 2026-10-21 06:00');
+    const same = renderCalendarEventPage({ ...base, start: '2026-10-20T09:00:00-07:00', end: '2026-10-20T10:00:00-07:00' }, 'local')!;
+    expect(same.markdown).toContain('2026-10-20 09:00 → 10:00');
+  });
+
+  test('mailPriorFromPage returns null for a page whose body no longer splits into one block per id (the sweep then refuses to overwrite)', () => {
+    const fm = { apple_message_ids: ['m-1', 'm-2'], first_message_date: '2026-10-14T09:00:00-07:00' };
+    expect(mailPriorFromPage('emails/x.md', fm, 'Hand-edited body', 'Quarterly plan')).toBeNull();
+  });
+});

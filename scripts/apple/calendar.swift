@@ -1,14 +1,18 @@
 // gbrain Apple connector: read-only Calendar helper (EventKit).
 //
 // Usage (run by src/core/apple/readers/calendar.ts, never from user input):
-//   swift calendar.swift -- --probe
+//   swift calendar.swift -- --probe            (never prompts; reports permission_not_determined before the first ask)
+//   swift calendar.swift -- --request-access   (shows the macOS prompt if not yet asked; reads no event)
 //   swift calendar.swift -- --from <ISO8601> --to <ISO8601> [--calendar-ids id1,id2]
 //
 // Protocol: prints exactly ONE JSON document on stdout.
 //   success: {"items":[AppleCalendarEvent...]}  exit 0
 //   failure: {"error":{"code":"...","message":"..."}}  exit non-zero
 // Read-only: only requestFullAccessToEvents + events(matching:) are used; nothing is
-// created, modified, or deleted. All-day events are emitted as date-only strings
+// created, modified, or deleted. Requires macOS 14+ (Xcode Command Line Tools 15+): an older SDK
+// fails to compile with "is only available in macOS 14", which gbrain maps to macos_too_old.
+// Birthday calendars are skipped; subscription calendars (holidays, sports) are read only when
+// listed in --calendar-ids. All-day events are emitted as date-only strings
 // (YYYY-MM-DD, local calendar day, inclusive end). Timed events carry their own UTC offset.
 import Foundation
 import EventKit
@@ -30,6 +34,7 @@ if let first = args.first, first.hasSuffix(".swift") { args.removeFirst() }
 args.removeAll { $0 == "--" }
 
 var probeOnly = false
+var requestOnly = false
 var fromArg: String? = nil
 var toArg: String? = nil
 var calendarIds: [String] = []
@@ -39,6 +44,9 @@ while i < args.count {
     switch a {
     case "--probe":
         probeOnly = true
+        i += 1
+    case "--request-access":
+        requestOnly = true
         i += 1
     case "--from", "--to", "--calendar-ids":
         guard i + 1 < args.count else { fail("helper_failed", "missing value for \(a)", exitCode: 2) }
@@ -63,7 +71,7 @@ func parseISO(_ s: String) -> Date? {
 
 var fromDate: Date? = nil
 var toDate: Date? = nil
-if !probeOnly {
+if !probeOnly && !requestOnly {
     guard let f = fromArg, let t = toArg else { fail("helper_failed", "--from and --to are required", exitCode: 2) }
     guard let fd = parseISO(f), let td = parseISO(t) else { fail("helper_failed", "--from/--to must be ISO8601", exitCode: 2) }
     guard fd < td else { fail("helper_failed", "--from must be before --to", exitCode: 2) }
@@ -83,7 +91,7 @@ func checkStatusNoPrompt() {
     case .fullAccess:
         return
     case .notDetermined:
-        denied("not yet requested")
+        fail("permission_not_determined", "Calendar access has not been requested yet (macOS has not asked).")
     case .denied:
         denied("denied")
     case .restricted:
@@ -121,12 +129,16 @@ if #available(macOS 14.0, *) {
 }
 sem.wait()
 if !box.granted { denied(box.message ?? "request refused") }
+if requestOnly { emit(["items": [Any](), "status": "authorized"], code: 0) }
 
 // ---- read ----
-let allCalendars = store.calendars(for: .event)
+// Birthday calendars are derived from Contacts and are not meetings: never listed.
+let allCalendars = store.calendars(for: .event).filter { $0.type != .birthday }
 let selected: [EKCalendar] = calendarIds.isEmpty ? allCalendars : allCalendars.filter { calendarIds.contains($0.calendarIdentifier) }
-if selected.isEmpty && !allCalendars.isEmpty && !calendarIds.isEmpty {
-    emit(["items": [Any]()], code: 0)
+// A configured id that matches nothing is an ERROR, not an empty listing: an empty listing would
+// read as "everything was deleted" to a --full sweep.
+if !calendarIds.isEmpty && selected.isEmpty {
+    fail("selection_not_found", "None of the configured calendar ids matches a calendar on this Mac.")
 }
 
 func isoString(_ d: Date, tz: TimeZone?) -> String {
@@ -177,7 +189,10 @@ while cursor < finalEnd {
     let end = min(cursor.addingTimeInterval(slice), finalEnd)
     let pred = store.predicateForEvents(withStart: cursor, end: end, calendars: selected.isEmpty ? nil : selected)
     for ev in store.events(matching: pred) {
-        let base = ev.eventIdentifier ?? ev.calendarItemIdentifier
+        // calendarItemExternalIdentifier is shared by every occurrence of a series and survives more
+        // edits than eventIdentifier; fall back to eventIdentifier, then the local item id.
+        let ext: String? = ev.calendarItemExternalIdentifier
+        let base = (ext?.isEmpty == false ? ext : nil) ?? ev.eventIdentifier ?? ev.calendarItemIdentifier
         let recurring = ev.hasRecurrenceRules || (ev.recurrenceRules?.isEmpty == false)
         let key = recurring ? "\(base)#\(Int(ev.startDate.timeIntervalSince1970))" : base
         events[key] = ev

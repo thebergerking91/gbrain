@@ -11,6 +11,7 @@ import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { readManagedConnectorState } from '../src/core/persistence/connector-state.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { createConnectorFixture, options, sourceCheckpoint } from './helpers/connector-fixture.ts';
+import { AppleReaderError } from '../src/core/apple/readers/errors.ts';
 import type { AppleContact, AppleReaders } from '../src/core/apple/types.ts';
 
 const { engines, env, source, setup, teardown } = createConnectorFixture();
@@ -90,5 +91,51 @@ test('managed apple sweep: a re-pointed account label is refused (connector_acco
     expect(refused?.code).toBe('connector_account_changed');
     const pages = await engine.executeRaw<{ slug: string }>("SELECT slug FROM pages WHERE source_id=$1 AND deleted_at IS NULL ORDER BY slug", [f.id]);
     expect(pages.map((p) => p.slug)).not.toContain('people/zed-example');
+  }
+}), 180_000);
+
+test('managed apple sweep: a permanently denied service has its denial saved (last_probe) and does not stall the other services', async () => withEnv(env, async () => {
+  for (const engine of engines) {
+    const config = { kind: 'apple', a_account: 'alice-example', a_services: 'calendar,contacts' };
+    const f = await source(engine, config);
+    const cfg = parseAppleSourceConfig({ ...config, a_dir: f.dir }, f.dir);
+    const state = { contacts: [person('c-1', 'Alice')] };
+    const denied = new AppleReaderError('permission_denied', 'calendar', 'Calendar access denied', 'Enable it in System Settings');
+    const rd: AppleReaders = { ...readers(state), async calendar() { throw denied; } };
+    const run = (extra = {}) => runAppleSync(engine, f.id, cfg, { ...options, sourceId: f.id, ...extra }, { readers: rd, log: () => {} });
+    const cursor = async () => {
+      await disposePersistenceConsumer(engine);
+      const [cp] = await sourceCheckpoint(engine, f.id) as { completed_keys: { state?: { contacts?: { hashes: Record<string, string> }; last_probe?: Record<string, { ok: boolean; code?: string }> } }[] }[];
+      return cp?.completed_keys[0]?.state;
+    };
+
+    const first = await run();
+    expect(first.status).toBe('partial');
+    expect(first.added).toBe(1);
+    let saved = await cursor();
+    // The recorded denial reaches the managed checkpoint (doctor apple_permissions and `apple status --no-probe` read it).
+    expect(saved?.last_probe?.calendar).toMatchObject({ ok: false, code: 'permission_denied' });
+    // The service that succeeded saved its cursor in the same run.
+    expect(Object.keys(saved?.contacts?.hashes ?? {})).toHaveLength(1);
+
+    // A second run with a new contact still advances the cursor for contacts although calendar stays denied.
+    state.contacts = [person('c-1', 'Alice'), person('c-2', 'Bob')];
+    const second = await run();
+    expect(second.status).toBe('partial');
+    expect(second.added).toBe(1);
+    saved = await cursor();
+    expect(Object.keys(saved?.contacts?.hashes ?? {})).toHaveLength(2);
+    expect(saved?.last_probe?.calendar?.code).toBe('permission_denied');
+    expect(saved?.last_probe?.contacts?.ok).toBe(true);
+
+    // last_sync_at advanced on the strength of the clean contacts sweep.
+    const [row] = await engine.executeRaw<{ last_sync_at: string | null }>('SELECT last_sync_at FROM sources WHERE id=$1', [f.id]);
+    expect(row?.last_sync_at).not.toBeNull();
+
+    // The recorded denial is what the doctor check and `apple status --no-probe` read back.
+    const { appleServicePermissionsCheck } = await import('../src/commands/doctor/checks/apple-permissions.ts');
+    const check = await appleServicePermissionsCheck(engine, [f.id]);
+    expect(check.status).toBe('warn');
+    expect(check.details).toMatchObject({ count: 1 });
   }
 }), 180_000);

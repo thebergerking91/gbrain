@@ -171,6 +171,8 @@ async function runAppleSyncInner(
     };
     const enabled = new Set<AppleService>(cfg.services);
     const serviceErrors: string[] = [];
+    // Services whose sweep finished with no reader error, item failure or refusal: they alone move freshness.
+    let cleanServices = 0;
     state.last_probe ??= {};
 
     // contacts → calendar → mail. A service not in cfg.services is not read,
@@ -178,9 +180,12 @@ async function runAppleSyncInner(
     for (const service of (['contacts', 'calendar', 'mail'] as const).filter((s) => ALL_APPLE_SERVICES.includes(s) && enabled.has(s))) {
       if (opts.signal?.aborted) break;
       const stop = startHeartbeat(progress, `${service} sweep`);
+      const failedBefore = summary.failedFiles;
+      const incompleteBefore = summary.incomplete.length;
       try {
         await sweeps[service](ctx);
         state.last_probe[service] = { ok: true, at: new Date(deps.now()).toISOString() };
+        if (summary.failedFiles === failedBefore && summary.incomplete.length === incompleteBefore && !opts.signal?.aborted) cleanServices++;
       } catch (e) {
         if (managed) rethrowConnectorWriteError(e);
         serviceErrors.push(`${service}: ${e instanceof Error ? e.message : String(e)}`);
@@ -203,18 +208,24 @@ async function runAppleSyncInner(
 
     // Throws connector_holds_exhausted before any save, so the cursor stays.
     state.item_holds = holds.finish();
+    // Every cursor here is a content hash set only after its item landed, so a partial run's state is safe to
+    // save: a denied or failing service leaves its own hashes untouched and cannot stall the services that
+    // succeeded. Freshness moves when at least one service synced cleanly.
     if (managed) {
-      if (summary.status !== 'partial') await managed.saveState(state, true, new Date(deps.now()).toISOString());
-      // A partial run keeps the cursor its last save committed and publishes only the changed holds.
-      else if (!opts.signal?.aborted) await managed.publishHolds(emptyAppleState() as unknown as Record<string, unknown>, state.item_holds);
+      if (!opts.signal?.aborted) {
+        await managed.saveState(state, cleanServices > 0, new Date(deps.now()).toISOString());
+        // saveState defers while writes are pending; the recorded denials and holds must still land (publishHolds' `extra`).
+        if (managed.deferred) await managed.publishHolds(emptyAppleState() as unknown as Record<string, unknown>, state.item_holds, { last_probe: state.last_probe });
+      }
     } else {
       writeAppleState(cfg.dir, state);
     }
     await holds.complete();
     if (!opts.signal?.aborted) await runExtractAndEmbed(deps, summary);
 
-    // last_sync_at feeds the staleness gate: only a run in which every enabled service succeeded refreshes it.
-    if (summary.status !== 'partial' && !managed && enabled.size > 0) {
+    // last_sync_at feeds the staleness gate: it moves when at least one enabled service synced cleanly, so a
+    // permanently denied service does not freeze the others' freshness.
+    if (cleanServices > 0 && !managed && !opts.signal?.aborted) {
       try {
         await engine.executeRaw(
           `UPDATE sources SET last_sync_at = now(), newest_content_at = $1::timestamptz WHERE id = $2`,

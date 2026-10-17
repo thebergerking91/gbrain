@@ -44,7 +44,12 @@ export function normalizeAppleState(parsed: unknown): AppleSourceState {
     version: 1,
     calendar: { ...(window ? { window } : {}), hashes: hashMap(cal.hashes) },
     contacts: { hashes: hashMap(con.hashes) },
-    mail: { ...(typeof mail.since === 'string' ? { since: mail.since } : {}), hashes: hashMap(mail.hashes) },
+    mail: {
+      ...(typeof mail.since === 'string' ? { since: mail.since } : {}),
+      hashes: hashMap(mail.hashes),
+      ...(typeof mail.newest === 'string' ? { newest: mail.newest } : {}),
+      ...(typeof mail.resume_from === 'string' ? { resume_from: mail.resume_from } : {}),
+    },
     item_holds: isRecord(parsed.item_holds) ? parsed.item_holds : undefined,
     ...(typeof parsed.last_full_at === 'string' ? { last_full_at: parsed.last_full_at } : {}),
     ...(isRecord(parsed.last_probe) ? { last_probe: parsed.last_probe as AppleSourceState['last_probe'] } : {}),

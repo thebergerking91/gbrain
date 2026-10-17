@@ -55,6 +55,8 @@ export const CONNECTOR_LEAF_RULES: { google: Record<string, LeafClass | ElidedLe
   apple: {
     account: 'identity', services: 'identity', historyDays: 'identity', futureDays: 'identity', calendarIds: 'identity', mailMailboxes: 'identity',
     mailDays: 'identity', dir: 'identity', contactsDir: 'identity',
+    // A per-run read cap, not a scope: changing it must not re-key the checkpoint.
+    mailMax: 'excluded',
   },
   github: {
     scope: 'identity', repos: 'identity', dir: 'identity',

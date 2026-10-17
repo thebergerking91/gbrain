@@ -270,3 +270,152 @@ describe.skipIf(process.platform !== 'darwin')('helper scripts compile (darwin o
     expect(r.status).toBe(0);
   });
 });
+
+// ── #2 embedded scripts, #1 not-determined, #9 old macOS, #4/#8 mail listing ───────────────────────────────
+
+describe('embedded helper scripts (compiled-binary safe)', () => {
+  test('the embedded text equals the bytes of scripts/apple/*, the single source of truth', async () => {
+    const { CALENDAR_SWIFT_TEXT, CONTACTS_SWIFT_TEXT, MAIL_JS_TEXT } = await import('../src/core/apple/readers/embedded-scripts.ts');
+    const { readFileSync } = await import('node:fs');
+    expect(CALENDAR_SWIFT_TEXT).toBe(readFileSync(CALENDAR_SCRIPT, 'utf8'));
+    expect(CONTACTS_SWIFT_TEXT).toBe(readFileSync(CONTACTS_SCRIPT, 'utf8'));
+    expect(MAIL_JS_TEXT).toBe(readFileSync(MAIL_SCRIPT, 'utf8'));
+    expect(CALENDAR_SWIFT_TEXT.length).toBeGreaterThan(1000);
+  });
+
+  test('a bundle inlines the scripts (no import.meta.url file path is needed at run time)', async () => {
+    const out = await Bun.build({ entrypoints: [join(import.meta.dir, '..', 'src/core/apple/readers/embedded-scripts.ts')], target: 'bun' });
+    expect(out.success).toBe(true);
+    const text = await out.outputs[0]!.text();
+    expect(text).toContain('requestFullAccessToEvents');
+    expect(text).toContain('enumerateContacts');
+    expect(text).toContain("Application('Mail')");
+  });
+
+  test('withHelperScript writes a private 0700 dir with a 0600 file, unique per run, and removes it afterwards (also on throw)', async () => {
+    const { withHelperScript, HELPER_SCRIPT_TEXT } = await import('../src/core/apple/readers/embedded-scripts.ts');
+    const { readFileSync, statSync, existsSync } = await import('node:fs');
+    const { dirname } = await import('node:path');
+    const seen: string[] = [];
+    await withHelperScript('mail.js', async (p) => {
+      seen.push(p);
+      expect(statSync(p).mode & 0o777).toBe(0o600);
+      expect(statSync(dirname(p)).mode & 0o777).toBe(0o700);
+      expect(readFileSync(p, 'utf8')).toBe(HELPER_SCRIPT_TEXT['mail.js']);
+    });
+    await withHelperScript('mail.js', async (p) => { seen.push(p); });
+    await withHelperScript('contacts.swift', async () => { throw new Error('boom'); }).catch(() => {});
+    expect(new Set(seen).size).toBe(2);
+    for (const p of seen) expect(existsSync(dirname(p))).toBe(false);
+  });
+
+  test('a reader with no scriptArgs override runs the interpreter on a temp copy of the embedded script, then removes it', async () => {
+    // A fake interpreter: prints its first argument (the script path it was handed) as the contact id.
+    const interp = join(dir, 'fake-interp.sh');
+    writeFileSync(interp, '#!/bin/sh\nprintf \'{"items":[{"id":"%s"}]}\' "$1"\n', { mode: 0o755 });
+    const [c] = await createAppleReaders({ command: interp, platform: 'darwin' }).contacts({});
+    const { existsSync } = await import('node:fs');
+    expect(c!.id.endsWith('/contacts.swift')).toBe(true);
+    expect(c!.id).not.toBe(CONTACTS_SCRIPT); // not the source-tree (or /$bunfs) path
+    expect(existsSync(c!.id)).toBe(false); // removed after the run
+  });
+});
+
+describe('permission_not_determined, selection_not_found, macos_too_old', () => {
+  test('are codes with their own fix text, distinct from permission_denied', () => {
+    const nd = fixFor('permission_not_determined', 'calendar');
+    expect(nd).toContain('not a denial');
+    expect(nd).not.toBe(fixFor('permission_denied', 'calendar'));
+    expect(fixFor('selection_not_found', 'mail')).toContain('mailbox');
+    expect(fixFor('selection_not_found', 'calendar')).toContain('calendar id');
+    expect(fixFor('macos_too_old', 'calendar')).toContain('macOS 14');
+    expect(fixFor('macos_too_old', 'calendar')).toContain('Command Line Tools 15');
+  });
+
+  test('a helper error document with permission_not_determined keeps its code through probe', async () => {
+    const script = join(dir, 'nd.js');
+    writeFileSync(script, "process.stdout.write(JSON.stringify({error:{code:'permission_not_determined',message:'not asked'}}));process.exit(1)");
+    const p = await createAppleReaders({ command: process.execPath, scriptArgs: [script], platform: 'darwin' }).probe('contacts');
+    expect(p.ok).toBe(false);
+    if (!p.ok) expect(p.code).toBe('permission_not_determined');
+  });
+
+  test('swiftc availability errors on stderr map to macos_too_old with a fix, not a cryptic compile error', async () => {
+    const script = join(dir, 'old.js');
+    writeFileSync(script, "process.stderr.write('error: x.swift:3: error: \\'requestFullAccessToEvents\\' is only available in macOS 14.0 or newer\\n');process.exit(1)");
+    const p = await createAppleReaders({ command: process.execPath, scriptArgs: [script], platform: 'darwin' }).probe('calendar');
+    expect(p.ok).toBe(false);
+    if (!p.ok) {
+      expect(p.code).toBe('macos_too_old');
+      expect(p.fix).toContain('macOS 14');
+    }
+  });
+
+  test('the availability text is found even when it is past the 2 KB shown in messages', async () => {
+    const script = join(dir, 'old-late.js');
+    writeFileSync(script, "process.stderr.write('x'.repeat(5000)+' is only available in macOS 14.0');process.exit(1)");
+    const e = await fails(runHelper({ service: 'calendar', command: process.execPath, args: [script], platform: 'darwin' }));
+    expect(e.code).toBe('macos_too_old');
+    expect(e.message.length).toBeLessThan(MAX_STDERR_BYTES + 400);
+  });
+
+  test('requestAccess maps a helper failure to a code and success to ok', async () => {
+    const okScript = join(dir, 'ra-ok.js');
+    writeFileSync(okScript, "process.stdout.write(JSON.stringify({items:[]}))");
+    const ok = await createAppleReaders({ command: process.execPath, scriptArgs: [okScript], platform: 'darwin' }).requestAccess!('calendar');
+    expect(ok).toEqual({ ok: true });
+    const badScript = join(dir, 'ra-bad.js');
+    writeFileSync(badScript, "process.stdout.write(JSON.stringify({error:{code:'permission_denied',message:'no'}}));process.exit(1)");
+    const bad = await createAppleReaders({ command: process.execPath, scriptArgs: [badScript], platform: 'darwin' }).requestAccess!('contacts');
+    expect(bad.ok).toBe(false);
+  });
+});
+
+describe('mail listing document', () => {
+  test('truncated / unavailable / incomplete flow through; a bare array stays "complete"', async () => {
+    const script = join(dir, 'mail-doc.js');
+    writeFileSync(script, `process.stdout.write(JSON.stringify({items:[{id:'m1',date:'2026-01-02T10:00:00Z'}],truncated:true,unavailable:['t-bad'],incomplete:true,args:process.argv.slice(2)}))`);
+    const r = createAppleReaders({ command: process.execPath, scriptArgs: [script], platform: 'darwin' });
+    const listing = await r.mail({ since: new Date(0), mailboxes: ['INBOX'], max: 7 });
+    expect(Array.isArray(listing)).toBe(false);
+    if (!Array.isArray(listing)) {
+      expect(listing.messages.map((m) => m.id)).toEqual(['m1']);
+      expect(listing.truncated).toBe(true);
+      expect(listing.unavailableThreads).toEqual(['t-bad']);
+      expect(listing.incomplete).toBe(true);
+    }
+  });
+
+  test('--max is passed to the helper', async () => {
+    const script = join(dir, 'mail-args.js');
+    writeFileSync(script, `process.stdout.write(JSON.stringify({items:[{id:'m1',date:'2026-01-02T10:00:00Z',subject:process.argv.slice(2).join(' ')}]}))`);
+    const r = createAppleReaders({ command: process.execPath, scriptArgs: [script], platform: 'darwin' });
+    const listing = await r.mail({ since: new Date(0), mailboxes: ['INBOX'], max: 7 });
+    const messages = Array.isArray(listing) ? listing : listing.messages;
+    expect(messages[0]!.subject).toContain('--max 7');
+  });
+});
+
+describe('helper scripts: source-level guards (static; the scripts are not run here)', () => {
+  const { readFileSync } = require('node:fs') as typeof import('node:fs');
+  test('mail.js never launches Mail: running() gates probe and sync, and NSWorkspace is gone', () => {
+    const js = readFileSync(MAIL_SCRIPT, 'utf8');
+    expect(js).toContain('Mail.running()');
+    expect(js).not.toContain('NSWorkspace');
+    const run = js.slice(js.indexOf('function run(argv)'));
+    expect(run.indexOf('Mail.running()')).toBeGreaterThan(0);
+    expect(run.indexOf('Mail.running()')).toBeLessThan(run.indexOf('Mail.accounts()'));
+    expect(run.indexOf('args.probe')).toBeGreaterThan(run.indexOf('Mail.running()')); // the check precedes the probe branch
+    expect(js).not.toContain('byId');
+  });
+  test('swift helpers separate not-determined from denied and honour --request-access', () => {
+    for (const f of [CALENDAR_SCRIPT, CONTACTS_SCRIPT]) {
+      const swift = readFileSync(f, 'utf8');
+      expect(swift).toContain('permission_not_determined');
+      expect(swift).toContain('--request-access');
+    }
+    expect(readFileSync(CALENDAR_SCRIPT, 'utf8')).toContain('selection_not_found');
+    expect(readFileSync(CALENDAR_SCRIPT, 'utf8')).toContain('.birthday');
+    expect(readFileSync(CALENDAR_SCRIPT, 'utf8')).toContain('calendarItemExternalIdentifier');
+  });
+});

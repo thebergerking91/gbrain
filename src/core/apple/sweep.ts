@@ -13,9 +13,11 @@
  *   4. on `--full` only, removes the pages of items inside the window that the
  *      complete listing no longer names. An incremental sweep never deletes
  *      anything upstream stopped listing (a staged rename of one item's own
- *      page excepted). More than 200 removals at once needs
- *      GBRAIN_ALLOW_MASS_RECONCILE=1; a refusal removes nothing and marks the
- *      run partial.
+ *      page excepted). More than 200 removals at once, or ANY removal when the
+ *      listing came back EMPTY, needs GBRAIN_ALLOW_MASS_RECONCILE=1; a refusal
+ *      removes nothing and marks the run partial. A listing the reader flags
+ *      as cut short or unreadable (mail truncation, unreadable messages) never
+ *      deletes either.
  *
  * Ownership is keyed on the marker frontmatter field (`apple_event_id`,
  * `apple_contact_id`, `apple_thread_id`), never on the path alone: a
@@ -45,7 +47,7 @@ import {
   type AppleSyncDeps,
   type AppleSyncSummary,
 } from './sweep-shared.ts';
-import type { AppleCalendarEvent, AppleContact, AppleMailMessage, AppleSourceState } from './types.ts';
+import type { AppleCalendarEvent, AppleContact, AppleMailListing, AppleSourceState } from './types.ts';
 
 const DAY_MS = 86_400_000;
 
@@ -117,11 +119,20 @@ async function safeRender<T>(ctx: AppleSweepCtx, holdKey: string, render: () => 
  * caller). Returns whether the removal ran; a refusal aborts the whole
  * cleanup and marks the run partial.
  */
-async function reconcileRemovals(ctx: AppleSweepCtx, service: string, gone: Array<{ key: string; path: string }>): Promise<boolean> {
+async function reconcileRemovals(ctx: AppleSweepCtx, service: string, gone: Array<{ key: string; path: string }>, listedCount: number): Promise<boolean> {
   if (gone.length === 0) return true;
+  // An empty listing with pages still owned reads as "everything was deleted", which is also what a
+  // reader that silently saw nothing looks like. Refuse unless the operator opts in.
+  if (listedCount === 0 && !massReconcileAllowed()) {
+    ctx.deps.log(`[apple] empty-listing guard refused ${gone.length} ${service} deletes for source ${ctx.deps.sourceId}: the reader listed nothing (set GBRAIN_ALLOW_MASS_RECONCILE=1 if that is really so)`);
+    ctx.summary.status = 'partial';
+    ctx.summary.incomplete.push(`${service}:empty_listing_refused`);
+    return false;
+  }
   if (gone.length > APPLE_MASS_RECONCILE_LIMIT && !massReconcileAllowed()) {
     ctx.deps.log(`[apple] mass-delete guard refused ${gone.length} ${service} deletes for source ${ctx.deps.sourceId} (set GBRAIN_ALLOW_MASS_RECONCILE=1 to allow)`);
     ctx.summary.status = 'partial';
+    ctx.summary.incomplete.push(`${service}:mass_delete_refused`);
     return false;
   }
   for (const g of gone) await deletePageByRelPath(ctx.deps, g.path, ctx.summary);
@@ -192,7 +203,7 @@ export async function sweepCalendar(ctx: AppleSweepCtx): Promise<void> {
       // Only events starting inside the listed window can be judged gone.
       if (Number.isFinite(start) && start >= from.getTime() && start < to.getTime()) gone.push({ key, path });
     }
-    if (await reconcileRemovals(ctx, 'calendar', gone)) {
+    if (await reconcileRemovals(ctx, 'calendar', gone, listed.length)) {
       for (const g of gone) delete state.calendar.hashes[g.key];
       for (const key of Object.keys(state.calendar.hashes)) {
         if (!live.has(key) && !pathByKey.has(key)) delete state.calendar.hashes[key];
@@ -268,7 +279,7 @@ export async function sweepContacts(ctx: AppleSweepCtx): Promise<void> {
   if (deps.opts.full) {
     const gone: Array<{ key: string; path: string }> = [];
     for (const [id, path] of pathById) if (!live.has(id)) gone.push({ key: id, path });
-    if (await reconcileRemovals(ctx, 'contacts', gone)) {
+    if (await reconcileRemovals(ctx, 'contacts', gone, listed.length)) {
       for (const g of gone) delete state.contacts.hashes[g.key];
       for (const id of Object.keys(state.contacts.hashes)) {
         if (!live.has(id) && !pathById.has(id)) delete state.contacts.hashes[id];
@@ -279,11 +290,43 @@ export async function sweepContacts(ctx: AppleSweepCtx): Promise<void> {
 
 // ── Mail ─────────────────────────────────────────────────────────────────────
 
+/** Re-read this much before the newest message of the last complete run (late-arriving / re-dated mail). */
+export const APPLE_MAIL_OVERLAP_MS = 2 * DAY_MS;
+
+/**
+ * Where this run starts reading. `--full` always reads the whole configured window (its removals are
+ * judged against that listing); an incremental run reads from a 2-day overlap before the newest
+ * message it has seen, or from where a capped run stopped, never earlier than the window.
+ */
+export function mailReadSince(state: AppleSourceState, windowStart: Date, full: boolean): Date {
+  if (full) return windowStart;
+  const resume = Date.parse(state.mail.resume_from ?? '');
+  const newest = Date.parse(state.mail.newest ?? '');
+  const from = Number.isFinite(resume) ? resume : Number.isFinite(newest) ? newest - APPLE_MAIL_OVERLAP_MS : windowStart.getTime();
+  return new Date(Math.max(windowStart.getTime(), from));
+}
+
 export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   const { deps, state, summary } = ctx;
-  const since = new Date(deps.now() - deps.cfg.mailDays * DAY_MS);
-  const messages: AppleMailMessage[] = await deps.readers.mail({ since, mailboxes: deps.cfg.mailMailboxes, ...signalOf(ctx) });
+  const windowStart = new Date(deps.now() - deps.cfg.mailDays * DAY_MS);
+  const since = mailReadSince(state, windowStart, deps.opts.full === true);
+  const failedBefore = summary.failedFiles;
+  const read = await deps.readers.mail({ since, mailboxes: deps.cfg.mailMailboxes, max: deps.cfg.mailMax, ...signalOf(ctx) });
+  const listing: AppleMailListing = Array.isArray(read) ? { messages: read } : read;
+  const messages = listing.messages;
+  const truncated = listing.truncated === true;
+  const readable = listing.incomplete !== true;
   summary.itemsSeen.mail = messages.length;
+  if (truncated) {
+    summary.status = 'partial';
+    summary.incomplete.push('mail:truncated');
+    deps.log(`[apple] mail listing truncated at ${deps.cfg.mailMax} messages (a_mail_max); the rest is read on the next run`);
+  }
+  if (!readable) {
+    summary.status = 'partial';
+    summary.incomplete.push('mail:unreadable_messages');
+    deps.log('[apple] some mail messages could not be read; nothing is removed this run');
+  }
 
   const pathByThread = new Map<string, string>();
   const frontmatterByThread = new Map<string, Record<string, unknown>>();
@@ -294,7 +337,8 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
     frontmatterByThread.set(id, o.frontmatter);
   }
 
-  const live = new Set<string>();
+  // A thread with an unreadable message still exists upstream: it is live for the sweep (never deleted).
+  const live = new Set<string>(listing.unavailableThreads ?? []);
   for (const thread of groupMailThreads(messages)) {
     if (aborted(ctx)) return;
     const holdKey = `mail:${thread.threadId}`;
@@ -306,9 +350,10 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
     const existing = pathByThread.get(thread.threadId);
     if (state.mail.hashes[thread.threadId] === renderedHash(page.relPath, page.markdown) && existing === page.relPath) continue;
     if (existing) {
-      // The window no longer lists the oldest messages of a long thread: carry them forward from the page.
+      // The read window no longer lists the oldest messages of a long thread: carry them forward from the page.
+      const stored = frontmatterByThread.get(thread.threadId) ?? {};
       let prior;
-      try { prior = await loadMailPrior(ctx, existing, frontmatterByThread.get(thread.threadId) ?? {}); } catch (e) {
+      try { prior = await loadMailPrior(ctx, existing, stored); } catch (e) {
         if (ctx.holds.shouldAttempt(holdKey, null)) await failItem(ctx, holdKey, e, null, null);
         continue;
       }
@@ -316,6 +361,18 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
         const carried = await safeRender(ctx, holdKey, () => renderMailThreadPage(thread, deps.cfg.account, prior));
         if (!carried.ok) continue;
         if (carried.value) page = carried.value;
+      } else {
+        // The stored page names messages this listing no longer returns and its body cannot be split back
+        // into per-message blocks: rewriting it from the listing would silently drop them. Keep the page.
+        const listed = new Set(thread.messages.map((m) => m.id));
+        const storedIds = Array.isArray(stored.apple_message_ids) ? stored.apple_message_ids.filter((x): x is string => typeof x === 'string') : [];
+        const dropped = storedIds.filter((id) => !listed.has(id));
+        if (dropped.length > 0) {
+          if (ctx.holds.shouldAttempt(holdKey, null)) {
+            await failItem(ctx, holdKey, new Error(`stored mail page ${existing} holds ${dropped.length} message(s) the reader no longer lists and cannot be carried forward; page left unchanged`), null, null);
+          }
+          continue;
+        }
       }
     }
     const final = page;
@@ -331,22 +388,34 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   }
   if (aborted(ctx)) return;
 
-  if (deps.opts.full) {
+  // The removal verdict needs a complete listing of the whole window: an incremental read, a capped read
+  // and an unreadable-message read are all partial views.
+  if (deps.opts.full === true && !truncated && readable) {
     const gone: Array<{ key: string; path: string }> = [];
     for (const [tid, path] of pathByThread) {
       if (live.has(tid)) continue;
       const firstDate = Date.parse(str(frontmatterByThread.get(tid)?.first_message_date) ?? '');
       // Threads that began before the mail window are out of enumeration scope.
-      if (Number.isFinite(firstDate) && firstDate >= since.getTime()) gone.push({ key: tid, path });
+      if (Number.isFinite(firstDate) && firstDate >= windowStart.getTime()) gone.push({ key: tid, path });
     }
-    if (await reconcileRemovals(ctx, 'mail', gone)) {
+    if (await reconcileRemovals(ctx, 'mail', gone, messages.length)) {
       for (const g of gone) delete state.mail.hashes[g.key];
       for (const tid of Object.keys(state.mail.hashes)) {
         if (!live.has(tid) && !pathByThread.has(tid)) delete state.mail.hashes[tid];
       }
     }
   }
-  state.mail.since = since.toISOString();
+
+  state.mail.since = windowStart.toISOString();
+  const newestMs = messages.reduce((m, x) => Math.max(m, Date.parse(x.date) || 0), 0);
+  if (truncated) {
+    // The cap keeps the oldest messages first: resume just before the newest one returned.
+    if (newestMs > 0) state.mail.resume_from = new Date(newestMs - 1000).toISOString();
+  } else if (summary.failedFiles === failedBefore && readable) {
+    // Only a clean, complete read advances the incremental cursor; a failed item is re-read next run.
+    delete state.mail.resume_from;
+    if (newestMs > 0) state.mail.newest = new Date(Math.max(newestMs, Date.parse(state.mail.newest ?? '') || 0)).toISOString();
+  }
 }
 
 /**

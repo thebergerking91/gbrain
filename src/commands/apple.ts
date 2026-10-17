@@ -23,6 +23,7 @@ import { ALL_APPLE_SERVICES } from '../core/apple/types.ts';
 import { parseAppleSourceConfig } from '../core/apple/source-config.ts';
 import { parseSourceConfig } from '../core/sources-load.ts';
 import { permissionGuide, guideLines, USER_ACTION_CODES, type PermissionGuide } from '../core/apple/permission-guide.ts';
+import { APPLE_DEFAULT_ACCOUNT } from '../core/apple/source-config.ts';
 import { AppleAddFlagError, appleAddPlatformWarning, buildAppleAddOptions, parseAppleServicesFlag } from './sources-apple-flags.ts';
 import { emitEnvelope, errorEnvelope, showUserBlock, type AppleOut } from './apple-output.ts';
 
@@ -38,6 +39,11 @@ export interface AppleCommandDeps {
   /** First-sync runner (tests); defaults to performSync. */
   sync?: (engine: BrainEngine, opts: { sourceId: string; signal: AbortSignal }) => Promise<AppleSyncResultLike>;
   now?: () => number;
+  /**
+   * Whether a person is at this terminal. Default: stdin and stdout are TTYs. Setup only asks macOS to show a
+   * permission prompt when interactive or when --yes was passed; otherwise it tells the user a prompt is coming.
+   */
+  interactive?: boolean;
 }
 
 interface Flags {
@@ -50,6 +56,8 @@ interface Flags {
   yes: boolean;
   confirmMail: boolean;
   budgetMs: number;
+  /** The `sources add` tuning flags, by flag name (`--history-days` ...). */
+  extra: Record<string, string>;
   positionals: string[];
 }
 
@@ -76,7 +84,7 @@ Exit codes: 0 done, 1 failed, 2 waiting on you (a permission, or a Mail confirma
 Read-only toward Apple. No credentials. Docs: docs/guides/apple-connect.md`;
 
 function parseFlags(args: string[]): Flags | { error: string } {
-  const f: Flags = { json: false, noSync: false, noProbe: false, yes: false, confirmMail: false, budgetMs: 90_000, positionals: [] };
+  const f: Flags = { json: false, noSync: false, noProbe: false, yes: false, confirmMail: false, budgetMs: 90_000, extra: {}, positionals: [] };
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     const eq = a.startsWith('--') ? a.indexOf('=') : -1;
@@ -97,7 +105,7 @@ function parseFlags(args: string[]): Flags | { error: string } {
       else if (key === '--account') f.account = value;
       else if (key === '--source') f.source = value;
       else if (key === '--sync-budget-ms') f.budgetMs = Number(value) > 0 ? Number(value) : 90_000;
-      else (f as unknown as Record<string, unknown>)[key] = value;
+      else f.extra[key] = value;
       continue;
     }
     if (a.startsWith('-')) return { error: `Unknown option ${a}.` };
@@ -174,9 +182,11 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
     const sourceId = f.source ?? deriveAppleSourceId(f.account ?? 'local');
     addOpts = buildAppleAddOptions({
       services: services.join(','), account: f.account,
-      historyDays: (f as unknown as Record<string, string>)['--history-days'], futureDays: (f as unknown as Record<string, string>)['--future-days'],
-      calendarIds: (f as unknown as Record<string, string>)['--calendar-ids'], contactsDir: (f as unknown as Record<string, string>)['--contacts-dir'],
-      mailMailboxes: (f as unknown as Record<string, string>)['--mail-mailboxes'], mailDays: (f as unknown as Record<string, string>)['--mail-days'],
+      historyDays: f.extra['--history-days'], futureDays: f.extra['--future-days'],
+      calendarIds: f.extra['--calendar-ids'], contactsDir: f.extra['--contacts-dir'],
+      mailMailboxes: f.extra['--mail-mailboxes'], mailDays: f.extra['--mail-days'],
+      // setup has its own Mail gate just below (--confirm-mail / --yes), which runs before any probe.
+      confirmMail: true,
       dir: defaultCloneDir(`${sourceId}-apple`),
     });
   } catch (error) {
@@ -199,14 +209,23 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
 
   // Probe every selected service (the only Apple access setup makes before the sync).
   const readers = await defaultReaders(deps);
+  const interactive = deps.interactive ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
   const probes: Array<{ service: AppleService; ok: boolean; code?: string; fix?: string }> = [];
   const denied: PermissionGuide[] = [];
+  const pending: PermissionGuide[] = [];
   const broken: Array<{ service: AppleService; code: string; fix: string }> = [];
   for (const service of services) {
-    const result = await readers.probe(service);
+    let result = await readers.probe(service);
+    // Not yet asked (permission_not_determined) is not a denial: macOS has not shown its prompt. A probe never
+    // prompts, so ask once by running the reader's request (no item is read) and probe again.
+    if (!result.ok && result.code === 'permission_not_determined' && readers.requestAccess && (interactive || f.yes)) {
+      await readers.requestAccess(service);
+      result = await readers.probe(service);
+    }
     if (result.ok) { probes.push({ service, ok: true }); continue; }
     probes.push({ service, ok: false, code: result.code, fix: result.fix });
-    if (USER_ACTION_CODES.includes(result.code)) denied.push(permissionGuide(service, result.code, result.fix));
+    if (result.code === 'permission_not_determined') pending.push(permissionGuide(service, result.code, result.fix));
+    else if (USER_ACTION_CODES.includes(result.code)) denied.push(permissionGuide(service, result.code, result.fix));
     else broken.push({ service, code: result.code, fix: result.fix });
   }
   if (broken.length > 0) {
@@ -214,10 +233,19 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
     return fail(errorEnvelope('probe_failed', `The ${first.service} probe failed (${first.code}).`,
       broken.map((b) => `${b.service}: ${b.code}`).join('; '), first.fix, { command: setupCommand(f, services, services.includes('mail') ? ['--confirm-mail'] : []) }));
   }
-  if (denied.length > 0) {
+  if (denied.length > 0 || pending.length > 0) {
     const command = setupCommand(f, services, services.includes('mail') ? ['--confirm-mail'] : []);
-    const message = ['gbrain needs your permission to read these Apple services. Grant it, then I will re-run setup:', '', ...denied.flatMap((g) => [...guideLines(g), ''])].join('\n').trimEnd();
-    emitEnvelope(out, { ok: false, status: 'awaiting_permission', services, source_id: sourceId, probes, denied: denied.map((g) => ({ service: g.service, code: g.code, pane: g.pane, app: g.app, fix: g.fix })), next: { command, user_message: message } },
+    const promptNote = pending.length === 0 ? [] : [
+      `macOS has not asked for ${pending.map((g) => g.service).join(', ')} access yet. ${interactive || f.yes
+        ? 'The permission prompt did not get an answer.'
+        : `A permission prompt will appear on this Mac's screen when setup runs from a terminal on it (add --yes to ask right now).`} `
+        + 'Click Allow on the prompt; if no prompt appears, enable the app that runs gbrain in System Settings > Privacy & Security.',
+      '',
+    ];
+    const message = ['gbrain needs your permission to read these Apple services. Grant it, then I will re-run setup:', '', ...promptNote,
+      ...denied.flatMap((g) => [...guideLines(g), ''])].join('\n').trimEnd();
+    const needed = [...pending, ...denied];
+    emitEnvelope(out, { ok: false, status: 'awaiting_permission', services, source_id: sourceId, probes, denied: needed.map((g) => ({ service: g.service, code: g.code, pane: g.pane, app: g.app, fix: g.fix })), next: { command, user_message: message } },
       [showUserBlock(message, command), '', `Then re-run: ${command}`]);
     return 2;
   }
@@ -230,7 +258,7 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
   }
   try {
     const { engine } = handle;
-    const existing = (await listAppleSources(engine)).find((s) => s.cfg.account === addOpts.account || s.id === sourceId);
+    const existing = (await listAppleSources(engine)).find((s) => s.cfg.account === (addOpts.account ?? APPLE_DEFAULT_ACCOUNT) || s.id === sourceId);
     let registeredId = sourceId;
     let registered = false;
     if (existing) {
@@ -272,7 +300,7 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
     }, [
       `${registered ? 'Registered' : 'Already registered'} source "${registeredId}" (${effective.join(', ')}); permissions OK for ${services.join(', ')}.`,
       humanSync, ...(warning ? [warning] : []),
-      `Autopilot keeps it synced after the first sync. Next: ${next}`,
+      `Unattended runs (autopilot, a daemon) cannot show macOS permission prompts: if a service was never granted, run \`gbrain sync --source ${registeredId}\` once from a terminal on this Mac so macOS can ask. Next: ${next}`,
     ]);
     return 0;
   } finally {
@@ -401,7 +429,7 @@ export async function runApple(args: string[], deps: AppleCommandDeps = {}): Pro
   if ('error' in parsed) {
     const e = errorEnvelope('invalid_value', parsed.error, 'The arguments could not be parsed.', 'Run `gbrain apple --help` for the options.');
     emitEnvelope(out, e.envelope, e.human);
-    return 2;
+    return 1;
   }
   if (sub === 'setup') return runSetup(parsed, deps, out);
   if (sub === 'status') return runStatus(parsed, deps, out);

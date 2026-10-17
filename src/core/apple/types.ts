@@ -4,9 +4,10 @@
  *
  * Contract shared with src/core/apple/readers/* (READERS builder).
  */
+// No runtime import here: this file is in the PGLite snapshot/migration import closure (via source-config.ts),
+// so it stays free of the reader code. `AppleReaderError` lives in ./readers/errors.ts.
 import type { AppleReaderErrorCode } from './readers/errors.ts';
 
-export { AppleReaderError } from './readers/errors.ts';
 export type { AppleReaderErrorCode } from './readers/errors.ts';
 
 export type AppleService = 'calendar' | 'contacts' | 'mail';
@@ -22,6 +23,8 @@ export interface AppleSourceConfig {
   contactsDir: string;
   mailMailboxes: string[];
   mailDays: number;
+  /** Per-run cap on messages read (a_mail_max). */
+  mailMax: number;
   dir: string;
 }
 
@@ -70,6 +73,20 @@ export interface AppleMailMessage {
   read: boolean;
 }
 
+/**
+ * What a mail reader may return instead of a bare array when it knows the
+ * listing is not the whole story. A bare `AppleMailMessage[]` means "complete".
+ */
+export interface AppleMailListing {
+  messages: AppleMailMessage[];
+  /** More messages matched than the per-run cap; the OLDEST cap-many are returned, resume from the newest. */
+  truncated?: boolean;
+  /** Threads with a message that could not be read: present in the account, so never to be swept as deleted. */
+  unavailableThreads?: string[];
+  /** A message could not even be attributed to a thread: nothing may be swept as deleted this run. */
+  incomplete?: boolean;
+}
+
 export interface AppleReaders {
   calendar(opts: {
     from: Date;
@@ -81,11 +98,19 @@ export interface AppleReaders {
   mail(opts: {
     since: Date;
     mailboxes: string[];
+    /** Per-run message cap (a_mail_max). */
+    max?: number;
     signal?: AbortSignal;
-  }): Promise<AppleMailMessage[]>;
+  }): Promise<AppleMailMessage[] | AppleMailListing>;
   probe(
     service: AppleService,
   ): Promise<{ ok: true } | { ok: false; code: AppleReaderErrorCode; fix: string }>;
+  /**
+   * Show the macOS permission prompt for a service that has not been asked yet
+   * (probe reports `permission_not_determined`) without reading any item.
+   * Optional so a read-only fake needs no stub; setup skips the request when absent.
+   */
+  requestAccess?(service: AppleService): Promise<{ ok: true } | { ok: false; code: AppleReaderErrorCode; fix: string }>;
 }
 
 /** Cursor / state file persisted next to the managed clone. */
@@ -96,7 +121,15 @@ export interface AppleSourceState {
     hashes: Record<string, string>;
   };
   contacts: { hashes: Record<string, string> };
-  mail: { since?: string; hashes: Record<string, string> };
+  mail: {
+    /** Start of the mail window the last sweep covered. */
+    since?: string;
+    hashes: Record<string, string>;
+    /** Newest message date read by the last complete run; the next run re-reads a 2-day overlap before it. */
+    newest?: string;
+    /** Newest message date of a run cut short by a_mail_max; the next run resumes from here. */
+    resume_from?: string;
+  };
   /** ItemHoldsState (connectors/item-holds.ts); opaque here so types.ts stays dependency-free. */
   item_holds: unknown;
   last_probe?: Record<string, { ok: boolean; at: string; code?: string }>;

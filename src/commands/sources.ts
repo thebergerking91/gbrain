@@ -147,7 +147,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
         '       github kind: [--token-env <env>] [--scope auto|repos] ' +
         '[--repos owner/name,...] [--dir <path>] ' +
         '[--app-id <n> --app-pem <path>] [--app-install <n>]\n' +
-        '       apple kind (macOS): [--services calendar,contacts,mail] [--account <label>] [--calendar-ids <a,b>] [--mail-mailboxes INBOX,Sent] [--mail-days <n>]   (permissions: gbrain apple setup)\n' +
+        '       apple kind (macOS): [--services calendar,contacts[,mail --confirm-mail]] [--account <label>] [--calendar-ids <a,b>] [--mail-mailboxes INBOX,Sent] [--mail-days <n>]   (permissions: gbrain apple setup)\n' +
         '       google kind: --account <email> [--services gmail,calendar,contacts] ' +
         '[--history-days <n>] [--future-days <n>] [--loops-exclude-labels <a,b>] [--contacts-dir <dir>] [--calendar-id <id>] [--dir <path>]   (connect first: gbrain google connect)\n' +
         '                    [--access vault|command|env] [--token-command "<cmd>"] [--token-env <VAR>]   (non-vault Google access: gog/gcloud/gateway)',
@@ -2002,7 +2002,7 @@ Subcommands:
                                     "default" to clear (NULL falls through
                                     to the global search.mode bundle).
   set-calendar <id> <calendar-id> [--yes]  Point a Google source at another calendar (ids: gbrain google calendars).
-  set-services <id> --add|--remove <svc> [--yes]  Opt an Apple source in/out of calendar, contacts or mail (pages stay).
+  set-services <id> --add|--remove <svc> [--yes] [--confirm-mail]  Opt an Apple source in/out of calendar, contacts or mail (pages stay).
   set-trust <id> <tier>|--clear     Trust default for this source's sync and import (operator_curated or lower).
   set-path <id> <path> [--force]    Repair a source's local_path pointer
                                     (DB column only, never touches disk).

@@ -34,7 +34,13 @@ export const APPLE_TEXT_CAP = 20_000;
 
 // ── Small helpers ────────────────────────────────────────────────────────────
 
-const yamlStr = (v: string): string => JSON.stringify(v);
+/**
+ * A double-quoted YAML scalar. JSON.stringify escapes C0 controls but leaves DEL, the C1 controls
+ * (U+0080-U+009F, which includes NEL) and the Unicode line separators raw; YAML would read those
+ * as line breaks / controls, so they are written as \uXXXX escapes (valid in YAML double quotes).
+ */
+const yamlStr = (v: string): string =>
+  JSON.stringify(v).replace(/[\u007f-\u009f\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
 
 function yamlList(v: readonly string[]): string {
   if (v.length === 0) return '[]';
@@ -149,7 +155,7 @@ export function renderCalendarEventPage(ev: AppleCalendarEvent, account: string)
   ];
   const when = ev.allDay
     ? `${ev.start.slice(0, 10)}${ev.end && ev.end.slice(0, 10) !== ev.start.slice(0, 10) ? ` → ${ev.end.slice(0, 10)}` : ''} (all day)`
-    : `${isoMinute(ev.start)} → ${ev.end.slice(11, 16) || ev.end.slice(0, 10)}`;
+    : `${isoMinute(ev.start)} → ${ev.end.slice(0, 10) === ev.start.slice(0, 10) ? ev.end.slice(11, 16) || ev.end.slice(0, 10) : isoMinute(ev.end)}`;
   const body: string[] = [
     '',
     `# ${inline(title)}`,
