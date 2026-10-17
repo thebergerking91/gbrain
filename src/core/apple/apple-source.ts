@@ -33,7 +33,7 @@ import { AppleReaderError } from './readers/errors.ts';
 import { parseAppleSourceConfig } from './source-config.ts';
 import { emptyAppleState, normalizeAppleState, readAppleState, writeAppleState } from './state.ts';
 import { appleLoopsAvailability } from './loops-status.ts';
-import { enqueueAppleLoopsExtraction, newAppleLoopsRun } from './loops.ts';
+import { enqueueAppleLoopsExtraction, newAppleLoopsRun, prepareLoopsState } from './loops.ts';
 import { sweepCalendar, sweepContacts, sweepMail, type AppleSweepCtx } from './sweep.ts';
 import {
   newAppleSummary,
@@ -170,6 +170,27 @@ async function runAppleSyncInner(
   try {
     // Mail loop tracking runs only with explicit owner addresses; otherwise Mail syncs exactly as before.
     const loopsAvail = appleLoopsAvailability(cfg);
+    if (loopsAvail.available && managed) {
+      prepareLoopsState(state, cfg);
+      // Commit conservative observation bookkeeping while the coordinator lease is still valid,
+      // BEFORE an abortable reader can discover gaps (or crash). publishHolds retains the last
+      // committed ingestion cursor and uses the normal journal/CAS/authority path, fresh=false.
+      // Keep the working state unchanged: a successful observation can still prove complete,
+      // including an empty listing. An interrupted observation must instead recover a whole window.
+      // Detach nested caches/holds too: later detection must not mutate the session's checkpointBefore.
+      const observation = structuredClone(state.mail_loops ?? {});
+      observation.reread = true;
+      observation.coverage_gap = true;
+      delete observation.complete_at;
+      const committed = await managed.publishHolds(emptyAppleState() as unknown as Record<string, unknown>, state.item_holds,
+        { mail_loops: observation });
+      if (!committed) {
+        opts.signal?.throwIfAborted();
+        throw new OperationError('storage_error', 'Mail observation invalidation could not be confirmed; no reader was started.',
+          `Inspect the canonical writer before retrying: gbrain sources writer status --source ${deps.sourceId} --json`);
+      }
+    }
+
     const ctx: AppleSweepCtx = { deps, state, activePack, summary, countedSlugs, holds, ...(loopsAvail.available ? { loops: newAppleLoopsRun() } : {}) };
     const sweeps: Record<AppleService, (c: AppleSweepCtx) => Promise<void>> = {
       contacts: sweepContacts,

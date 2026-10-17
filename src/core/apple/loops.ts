@@ -102,18 +102,21 @@ export interface TrackInput {
 }
 
 async function detectOne(input: TrackInput, thread: GmailThreadData, slug: string, owners: Set<string>): Promise<void> {
-  if (input.state.mail_loops?.identity_reconcile) {
-    // These are our invalidations, never a manual done/drop/mute disposition.
-    await input.engine.executeRaw(`UPDATE open_loops SET status='open', closed_at=NULL, closed_by=NULL
-      WHERE source_id=$1 AND thread_id=$2 AND detector='deterministic_thread' AND closed_by='apple_owner_changed'`, [input.sourceId, thread.threadId]);
-  }
-  const verdict = await applyThreadLoopVerdict(input.engine, input.sourceId, thread, owners, slug, new Date(input.now()), NO_EXCLUSION);
-  if (input.state.mail_loops?.identity_reconcile) {
-    const valid = new Set(verdict.open.map(s => s.loopType));
-    if (verdict.held) valid.add(verdict.held.spec.loopType);
-    const obsolete = (['unanswered_inbound', 'unanswered_outbound'] as const).filter(t => !valid.has(t));
-    if (obsolete.length) await closeThreadLoops(input.engine, input.sourceId, thread.threadId, 'apple_owner_changed', obsolete);
-  }
+  const verdict = await applyThreadLoopVerdict(input.engine, input.sourceId, thread, owners, slug, new Date(input.now()), NO_EXCLUSION, async next => {
+    if (input.state.mail_loops?.identity_reconcile) {
+      const valid = new Set(next.open.map(s => s.loopType));
+      if (next.held) valid.add(next.held.spec.loopType);
+      const obsolete = (['unanswered_inbound', 'unanswered_outbound'] as const).filter(t => !valid.has(t));
+      // Retire old-identity opens BEFORE the shared turn-flip closure can mislabel them as replies.
+      if (obsolete.length) await closeThreadLoops(input.engine, input.sourceId, thread.threadId, 'apple_owner_changed', obsolete);
+    }
+    // Only an actual current open verdict may restore our own identity invalidation. This also
+    // handles a returning direction still inside grace when identity_reconcile was cleared.
+    // Manual done/drop/mute and genuine reply closures are never eligible.
+    for (const spec of next.open) await input.engine.executeRaw(`UPDATE open_loops SET status='open', closed_at=NULL, closed_by=NULL
+      WHERE source_id=$1 AND thread_id=$2 AND detector='deterministic_thread' AND closed_by='apple_owner_changed' AND loop_type=$3`,
+    [input.sourceId, thread.threadId, spec.loopType]);
+  });
   recordGraceVerdict(input.state.mail_loops!, thread, verdict, slug, owners, input.log, NO_EXCLUSION);
   if (verdict.withheld) input.run.withheld[verdict.withheld.reason] = (input.run.withheld[verdict.withheld.reason] ?? 0) + 1;
 }

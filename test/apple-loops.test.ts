@@ -871,3 +871,82 @@ test('F3 actual queue handler retains explicit Apple origin when mutable page an
   expect(await handler({data:job!.data} as Parameters<typeof handler>[0])).toMatchObject({status:'skipped',reason:'apple_source_unavailable'});
   expect(chatCalls).toBe(0);
 }));
+
+
+// Exact review reproduction: a question changes direction, not just self-mail eligibility.
+test("F7 boundary direction roundtrip restores the same derived row with unchanged activity", () => withHome(async () => {
+  const dir = newDir(), owner = "me@example.com", alias = "alias@example.com";
+  const raw = await insertSource(dir, { a_services: "mail", a_mail_owner_addresses: owner });
+  const f = fake([inbound("ask", "alias-turn", 100, { from: alias, to: [owner, "bob@example.com"], body: "Can you review?" })]);
+  const rows = () => engine.executeRaw<{ id: number; loop_type: string; status: string; closed_by: string | null; last_activity_at: string }>(
+    "SELECT id,loop_type,status,closed_by,last_activity_at::text FROM open_loops WHERE source_id=$1 ORDER BY loop_type", [SID]);
+  await sweep(dir, f, raw);
+  const [original] = await rows();
+  expect(original).toMatchObject({ loop_type: "unanswered_inbound", status: "open" });
+  const changed = { ...raw, a_mail_owner_addresses: owner + "," + alias };
+  for (let cycle = 0; cycle < 2; cycle++) {
+    await updateRaw(changed); await sweep(dir, f, changed);
+    expect(await rows()).toEqual([
+      expect.objectContaining({ id: original!.id, status: "done" }),
+      expect.objectContaining({ loop_type: "unanswered_outbound", status: "open", closed_by: null }),
+    ]);
+    await updateRaw(raw); await sweep(dir, f, raw);
+    expect(await rows()).toEqual([
+      original!,
+      expect.objectContaining({ loop_type: "unanswered_outbound", status: "done", closed_by: "apple_owner_changed" }),
+    ]);
+    const answer = await waiting();
+    expect(answer.stale).toBe(false); expect(answer.completeness).toBe("complete");
+    expect(answer.text).not.toContain("You are clean");
+  }
+}));
+
+for (const disposition of ["done", "drop", "mute", "reply"] as const) {
+  test(`F7 boundary owner roundtrip preserves ${disposition} disposition`, () => withHome(async () => {
+    const dir = newDir(), owner = "me@example.com", alias = "alias@example.com";
+    const raw = await insertSource(dir, { a_services: "mail", a_mail_owner_addresses: owner });
+    const f = fake([inbound("ask", "control", 100, { from: alias, to: [owner, "bob@example.com"] })]);
+    await sweep(dir, f, raw);
+    if (disposition === "reply") {
+      f.mail.push(outbound("answer", "control", 90, { from: owner, to: [alias, "bob@example.com"], body: "Here is the review." }));
+      await sweep(dir, f, raw);
+    } else {
+      const { closeOpenLoop, closeMutedLoops } = await import("../src/core/loops/loops-store.ts");
+      const [row] = await engine.executeRaw<{ id: number }>("SELECT id FROM open_loops WHERE source_id=$1 AND status='open'", [SID]);
+      if (disposition === "mute") {
+        await addSuppression(engine, SID, "thread", "control");
+        await closeMutedLoops(engine, SID, "thread", "control", true);
+        __clearSuppressionCacheForTests(engine);
+      } else await closeOpenLoop(engine, SID, row!.id, disposition === "done" ? "done" : "dropped", "user");
+    }
+    const [before] = (await loops()).filter(l => l.loop_type === "unanswered_inbound");
+    expect(before!.status).not.toBe("open");
+    const changed = { ...raw, a_mail_owner_addresses: owner + "," + alias };
+    await updateRaw(changed); await sweep(dir, f, changed);
+    await updateRaw(raw); await sweep(dir, f, raw); await sweep(dir, f, raw);
+    expect((await loops()).find(l => l.loop_type === "unanswered_inbound")).toEqual(before!);
+    expect(await open()).toHaveLength(0);
+  }));
+}
+
+
+test("F7 boundary returning direction waits for grace and honors a mute after identity reconciliation settles", () => withHome(async () => {
+  const dir = newDir(), owner = "me@example.com", alias = "alias@example.com";
+  const raw = await insertSource(dir, { a_services: "mail", a_mail_owner_addresses: owner });
+  const f = fake([inbound("ask", "grace-turn", 30, { from: alias, to: [owner, "bob@example.com"] })]);
+  await sweep(dir, f, raw);
+  const changed = { ...raw, a_mail_owner_addresses: owner + "," + alias };
+  await updateRaw(changed); await sweep(dir, f, changed);
+  expect(await open()).toHaveLength(0);
+  expect(readAppleState(dir).mail_loops?.identity_reconcile).toBeUndefined();
+  expect(readAppleState(dir).mail_loops?.loop_grace_holds?.["grace-turn"]).toBeDefined();
+  await addSuppression(engine, SID, "thread", "grace-turn"); __clearSuppressionCacheForTests(engine);
+  clock.t += 80 * 3_600_000; await sweep(dir, f, changed);
+  expect(await open()).toHaveLength(0);
+  const { removeSuppression } = await import("../src/core/loops/loops-store.ts");
+  await removeSuppression(engine, SID, "thread", "grace-turn"); __clearSuppressionCacheForTests(engine);
+  await sweep(dir, f, changed);
+  expect((await open()).map(l => l.loop_type)).toEqual(["unanswered_outbound"]);
+  await updateRaw(raw); await sweep(dir, f, raw);
+  expect((await open()).map(l => l.loop_type)).toEqual(["unanswered_inbound"]);
+}));

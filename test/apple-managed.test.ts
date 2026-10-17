@@ -4,6 +4,7 @@
  * real persistence owner (PGLite, plus Postgres when the harness provides it).
  * Modeled on google-managed-delta-abort. Fake readers; synthetic data only.
  */
+import { join } from 'node:path';
 import { afterAll, beforeAll, expect, spyOn, test } from 'bun:test';
 import { runAppleSync } from '../src/core/apple/apple-source.ts';
 import { parseAppleSourceConfig } from '../src/core/apple/source-config.ts';
@@ -12,9 +13,9 @@ import { readManagedConnectorState } from '../src/core/persistence/connector-sta
 import { withEnv } from './helpers/with-env.ts';
 import { completeBaselineSweep, createConnectorFixture, options, sourceCheckpoint } from './helpers/connector-fixture.ts';
 import { AppleReaderError } from '../src/core/apple/readers/errors.ts';
-import type { AppleContact, AppleReaders } from '../src/core/apple/types.ts';
+import type { AppleContact, AppleReaders, AppleSourceState } from '../src/core/apple/types.ts';
 
-const { engines, env, source, setup, teardown } = createConnectorFixture();
+const { home, engines, env, source, setup, teardown } = createConnectorFixture();
 beforeAll(setup, 120_000);
 afterAll(teardown);
 
@@ -200,3 +201,130 @@ test('F6 managed partial and deferred saves publish durable incomplete coverage 
     expect((await answer()).stale).toBe(false);expect((await answer()).completeness).toBe('complete');
   }
 }),180_000);
+
+
+for (const mode of ["cancel", "unavailable", "permission", "interrupted"] as const) {
+  test(`F6 boundary managed ${mode} invalidates observation durably without moving the mail cursor and recovers`, async () => withEnv(env, async () => {
+    const { loopsOperations } = await import("../src/core/ops/loops.ts");
+    for (const engine of engines) {
+      const raw = { kind: "apple", a_services: "mail", a_mail_owner_addresses: "me@example.com" };
+      const f = await source(engine, raw), cfg = parseAppleSourceConfig({ ...raw, a_dir: f.dir }, f.dir);
+      const now = Date.now();
+      const controller = new AbortController(), deadline = new Error("synthetic-deadline");
+      let phase: "baseline" | "gap" | "empty" | "recovery" = "baseline";
+      let observedBeforeRead: AppleSourceState | undefined;
+      const saved = async (): Promise<AppleSourceState> => {
+        const [cp] = await sourceCheckpoint(engine, f.id) as { completed_keys: { state: AppleSourceState }[] }[];
+        return cp!.completed_keys[0]!.state;
+      };
+      const rd: AppleReaders = { ...readers({ contacts: [] }), async mail() {
+        if (phase === "gap") {
+          // Real checkpoint read from inside the abortable observation, not a saveState mock.
+          observedBeforeRead = await saved();
+          if (mode === "cancel") controller.abort(deadline);
+          if (mode === "interrupted") { controller.abort(deadline); throw deadline; }
+          if (mode === "permission") throw new AppleReaderError("permission_denied", "mail", "Synthetic denial", "Synthetic permission fix");
+          return { messages: [], unavailableThreads: ["missing"] };
+        }
+        if (phase === "recovery") return { messages: [{ id: "recovered", threadId: "missing", mailbox: "INBOX", subject: "Example recovery", from: "external@example.com", to: ["me@example.com"], cc: [], date: new Date(now - 100 * 3_600_000).toISOString(), body: "Can you review?", read: true, automated: false, bulk: false }] };
+        return { messages: [] };
+      } };
+      const run = (signal?: AbortSignal) => runAppleSync(engine, f.id, cfg, { ...options, sourceId: f.id, signal }, { readers: rd, now: () => now, log: () => {} });
+      const ctx = { engine, config: {}, logger: { info() {}, warn() {}, error() {} }, dryRun: false, remote: false, sourceId: f.id } as never;
+      const answer = async () => loopsOperations.find(o => o.name === "open_loops")!.handler(ctx, { source_id: f.id, group_by: "counterparty", include_context: false }) as Promise<{ stale: boolean; completeness: string; text: string }>;
+      await completeBaselineSweep(engine, f.id, () => run());
+      await disposePersistenceConsumer(engine);
+      const baseline = await saved();
+      expect(baseline.mail_loops?.complete_at).toBeDefined();
+      expect(await answer()).toMatchObject({ stale: false, completeness: "complete" });
+      // A successful empty observation must remain capable of proving complete.
+      await completeBaselineSweep(engine, f.id, () => run());
+      expect(await answer()).toMatchObject({ stale: false, completeness: "complete" });
+      phase = "gap";
+      if (mode === "cancel" || mode === "interrupted") await expect(run(controller.signal)).rejects.toThrow("synthetic-deadline");
+      else expect((await run()).status).toBe("partial");
+      await disposePersistenceConsumer(engine);
+      if (mode === "cancel" && engine.kind === "pglite") {
+        await engine.disconnect();
+        await engine.connect({ engine: "pglite", database_path: join(home, "database") });
+      }
+      const incomplete = await saved();
+      const position = ({ walk: _walk, ...cursor }: AppleSourceState["mail"]) => cursor;
+      expect(position(incomplete.mail)).toEqual(position(baseline.mail));
+      if (mode === "cancel" || mode === "interrupted") expect(incomplete.mail).toEqual(baseline.mail);
+      expect(incomplete.mail_loops?.complete_at).toBeUndefined();
+      expect(incomplete.mail_loops?.reread).toBe(true);
+      expect(await answer()).toMatchObject({ stale: true, completeness: "partial" });
+      expect((await answer()).text).not.toContain("You are clean");
+      if (mode === "cancel" || mode === "interrupted") {
+        expect(observedBeforeRead?.mail_loops?.complete_at).toBeUndefined();
+        expect(observedBeforeRead?.mail_loops?.coverage_gap).toBe(true);
+        // The pre-read journaled invalidation is the only committed checkpoint since baseline.
+        const committed = await engine.executeRaw<{ fresh: boolean; state: string }>("SELECT (intent->>'fresh')::boolean AS fresh,state FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='connector_v2_checkpoint' ORDER BY created_at DESC LIMIT 1", [f.id]);
+        expect(committed).toEqual([{ fresh: false, state: "committed" }]);
+      }
+      if (mode === "permission") expect(incomplete.last_probe?.mail).toMatchObject({ ok: false, code: "permission_denied" });
+      phase = "empty";
+      await completeBaselineSweep(engine, f.id, () => run()); await disposePersistenceConsumer(engine);
+      expect(await answer()).toMatchObject({ stale: true, completeness: "partial" });
+      expect(position((await saved()).mail)).toEqual(position(baseline.mail));
+      phase = "recovery";
+      await completeBaselineSweep(engine, f.id, () => run()); await disposePersistenceConsumer(engine);
+      const recovered = await saved();
+      expect(recovered.mail_loops?.complete_at).toBeDefined();
+      expect(recovered.mail_loops?.coverage_gap).toBeUndefined();
+      expect(recovered.mail_loops?.pending_threads).toEqual([]);
+      expect(recovered.mail.newest).toBeDefined();
+      expect(Object.keys(recovered.mail.hashes)).toEqual(["missing"]);
+      expect(await answer()).toMatchObject({ stale: false, completeness: "complete" });
+      phase = "empty"; await completeBaselineSweep(engine, f.id, () => run());
+      expect(await answer()).toMatchObject({ stale: false, completeness: "complete" });
+    }
+  }), 180_000);
+}
+
+
+test("F6 boundary managed invalidation refusal and pre-abort never start a reader or claim persisted metadata", async () => withEnv(env, async () => {
+  const { ManagedConnectorSync } = await import("../src/core/persistence/connector-sync.ts");
+  for (const engine of engines) {
+    const raw = { kind: "apple", a_services: "mail", a_mail_owner_addresses: "me@example.com" };
+    const f = await source(engine, raw), cfg = parseAppleSourceConfig({ ...raw, a_dir: f.dir }, f.dir);
+    let calls = 0;
+    const rd: AppleReaders = { ...readers({ contacts: [] }), async mail() { calls++; return []; } };
+    const run = (signal?: AbortSignal) => runAppleSync(engine, f.id, cfg, { ...options, sourceId: f.id, signal }, { readers: rd, log: () => {} });
+    await completeBaselineSweep(engine, f.id, () => run()); await disposePersistenceConsumer(engine);
+    const baseline = await sourceCheckpoint(engine, f.id), before = calls;
+    const controller = new AbortController(); controller.abort(new Error("already-cancelled"));
+    await expect(run(controller.signal)).rejects.toThrow("already-cancelled");
+    expect(calls).toBe(before); expect(await sourceCheckpoint(engine, f.id)).toEqual(baseline);
+    // Exercise the documented false return, not a fabricated successful save.
+    const refused = spyOn(ManagedConnectorSync.prototype, "publishHolds").mockResolvedValue(false);
+    try {
+      await expect(run()).rejects.toMatchObject({ code: "storage_error" });
+      expect(calls).toBe(before); expect(await sourceCheckpoint(engine, f.id)).toEqual(baseline);
+    } finally { refused.mockRestore(); }
+  }
+}), 180_000);
+
+test("F6 boundary managed cancellation preserves a nonempty cursor despite a newer observed message", async () => withEnv(env, async () => {
+  for (const engine of engines) {
+    const raw = { kind: "apple", a_services: "mail", a_mail_owner_addresses: "me@example.com" };
+    const f = await source(engine, raw), cfg = parseAppleSourceConfig({ ...raw, a_dir: f.dir }, f.dir);
+    const now = Date.now(), controller = new AbortController();
+    let cancel = false;
+    const old = { id: "old", threadId: "old", mailbox: "INBOX", subject: "Example notice", from: "peer@example.com", to: ["me@example.com"], cc: [], date: new Date(now - 100 * 3_600_000).toISOString(), body: "Here is the report.", read: true, automated: false, bulk: false };
+    const rd: AppleReaders = { ...readers({ contacts: [] }), async mail() {
+      if (cancel) { controller.abort(new Error("synthetic-cursor-deadline")); return { messages: [{ ...old, id: "new", threadId: "new", date: new Date(now).toISOString() }], unavailableThreads: ["missing"] }; }
+      return [old];
+    } };
+    const run = (signal?: AbortSignal) => runAppleSync(engine, f.id, cfg, { ...options, sourceId: f.id, signal }, { readers: rd, now: () => now, log: () => {} });
+    await completeBaselineSweep(engine, f.id, () => run()); await disposePersistenceConsumer(engine);
+    const saved = async () => (await sourceCheckpoint(engine, f.id) as { completed_keys: { state: AppleSourceState }[] }[])[0]!.completed_keys[0]!.state;
+    const baseline = await saved(); expect(baseline.mail.newest).toBe(old.date); expect(Object.keys(baseline.mail.hashes)).toEqual(["old"]);
+    cancel = true; await expect(run(controller.signal)).rejects.toThrow("synthetic-cursor-deadline"); await disposePersistenceConsumer(engine);
+    const after = await saved();
+    expect(after.mail).toEqual(baseline.mail); expect(after.mail_loops?.complete_at).toBeUndefined(); expect(after.mail_loops?.coverage_gap).toBe(true);
+    const pages = await engine.executeRaw<{ tid: string }>("SELECT frontmatter->>'apple_thread_id' AS tid FROM pages WHERE source_id=$1 AND deleted_at IS NULL", [f.id]);
+    expect(pages).toEqual([{ tid: "old" }]);
+  }
+}), 180_000);
