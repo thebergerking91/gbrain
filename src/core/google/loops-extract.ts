@@ -323,6 +323,13 @@ export async function runLoopsExtract(
   const page = await engine.getPage(payload.slug, { sourceId: payload.sourceId });
   if (!page) return { ...empty, reason: 'page_missing' };
   const fm = (page.frontmatter ?? {}) as Record<string, unknown>;
+  // An Apple Mail page needs its own source's consent (and identity) at run time, not only at enqueue: the
+  // setting may have been withdrawn since the job was queued. Checked before any model call.
+  if (typeof fm.apple_thread_id === 'string') {
+    const { appleExtractionPolicy } = await import('../apple/loops.ts');
+    const policy = await appleExtractionPolicy(engine, payload.sourceId);
+    if (policy.refusal) return { ...empty, reason: policy.refusal };
+  }
   const threadId =
     payload.threadId ?? (typeof fm.thread_id === 'string' ? fm.thread_id : payload.slug);
 

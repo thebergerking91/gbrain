@@ -4,7 +4,8 @@
  *
  * Keys (all prefixed `a_`): a_account, a_services, a_history_days,
  * a_future_days, a_calendar_ids, a_contacts_dir, a_mail_mailboxes,
- * a_mail_days, a_mail_max (config only: per-run message cap, default 500), a_dir.
+ * a_mail_days, a_mail_max (config only: per-run message cap, default 500), a_mail_owner_addresses (the
+ * mailbox owner's addresses; open-loop tracking), a_loops_extract_consent (default false), a_dir.
  *
  * Deliberate difference from the Google parser: an `a_services` value that is
  * present but names no known service parses to an EMPTY list (nothing is
@@ -29,6 +30,28 @@ export const APPLE_DEFAULT_MAIL_DAYS = 30;
 export const APPLE_MAIL_DAYS_MAX = 365;
 export const APPLE_DEFAULT_MAIL_MAX = 500;
 export const APPLE_MAIL_MAX_MAX = 5000;
+export const APPLE_MAIL_OWNER_ADDRESSES_MAX = 20;
+
+const OWNER_ADDRESS_RE = /^[^\s@<>,;()"'\\]+@[^\s@<>,;()"'\\]+\.[^\s@<>,;()"'\\]+$/;
+
+/** A mailbox-owner address as the owner wrote it, lower-cased, or null when it is not a bare email address. */
+export function normalizeOwnerAddress(raw: string): string | null {
+  const t = raw.trim().toLowerCase();
+  return t.length <= 254 && OWNER_ADDRESS_RE.test(t) ? t : null;
+}
+
+/** The valid owner addresses of a csv or array, de-duplicated, sorted. Invalid entries are dropped (fail closed: fewer owners, never invented ones). */
+export function parseOwnerAddresses(raw: unknown): string[] {
+  const tokens = csv(raw) ?? [];
+  const out = new Set<string>();
+  for (const t of tokens) { const a = normalizeOwnerAddress(t); if (a) out.add(a); }
+  return [...out].sort().slice(0, APPLE_MAIL_OWNER_ADDRESSES_MAX);
+}
+
+const TRUE_VALUES = new Set(['true', '1', 'yes', 'on']);
+export function parseBoolFlag(raw: unknown): boolean {
+  return raw === true || (typeof raw === 'string' && TRUE_VALUES.has(raw.trim().toLowerCase())) || raw === 1;
+}
 
 /** A csv string (or a string array) split into trimmed, non-empty, de-duplicated tokens. */
 function csv(raw: unknown): string[] | null {
@@ -90,6 +113,8 @@ export function parseAppleSourceConfig(
     mailMailboxes: mailboxes && mailboxes.length > 0 ? mailboxes : [...APPLE_DEFAULT_MAIL_MAILBOXES],
     mailDays: mailDays !== null ? Math.min(APPLE_MAIL_DAYS_MAX, mailDays) : APPLE_DEFAULT_MAIL_DAYS,
     mailMax: mailMax !== null ? Math.min(APPLE_MAIL_MAX_MAX, mailMax) : APPLE_DEFAULT_MAIL_MAX,
+    mailOwnerAddresses: parseOwnerAddresses(config.a_mail_owner_addresses),
+    loopsExtractConsent: parseBoolFlag(config.a_loops_extract_consent),
     dir: typeof config.a_dir === 'string' && config.a_dir.length > 0 ? config.a_dir : fallbackDir,
   };
 }
@@ -114,5 +139,7 @@ export function appleTuningConfig(apple: Partial<AppleSourceConfig>): Record<str
     ...(apple.contactsDir && apple.contactsDir !== DEFAULT_CONTACTS_DIR ? { a_contacts_dir: apple.contactsDir } : {}),
     ...(apple.mailMailboxes && !sameMailboxes ? { a_mail_mailboxes: apple.mailMailboxes.join(',') } : {}),
     ...(apple.mailDays !== undefined && apple.mailDays !== APPLE_DEFAULT_MAIL_DAYS ? { a_mail_days: apple.mailDays } : {}),
+    ...(apple.mailOwnerAddresses && apple.mailOwnerAddresses.length > 0 ? { a_mail_owner_addresses: apple.mailOwnerAddresses.join(',') } : {}),
+    ...(apple.loopsExtractConsent === true ? { a_loops_extract_consent: true } : {}),
   };
 }

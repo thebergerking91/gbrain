@@ -53,7 +53,8 @@ async function sourceHasGoogleContent(ctx: OperationContext, sourceId: string): 
       typeof c === 'string'
         ? (JSON.parse(c) as Record<string, unknown>)
         : ((c ?? {}) as Record<string, unknown>);
-    return cfg.kind === 'google';
+    // An Apple Mail source with loop tracking consults the same per-source suppression rows.
+    return cfg.kind === 'google' || cfg.kind === 'apple';
   } catch {
     return false;
   }
@@ -104,6 +105,45 @@ async function googleSourceFreshness(
   }
 }
 
+interface AppleLoopsSourceView { id: string; available: boolean; reason?: string; last_sync_at: string | null; stale: boolean }
+
+/**
+ * Apple Mail sources in scope (config only, no Apple read). An available source (Mail on, owner addresses set)
+ * carries freshness from the last COMPLETE Mail loop sweep; an unavailable one (identity_missing) is reported,
+ * never counted as clean. Sources without Mail are not loop sources. Null when no Apple source is in scope, so
+ * Google-only brains answer exactly as before. A read failure fails toward stale.
+ */
+async function appleLoopsSources(
+  ctx: OperationContext,
+  scope: { sourceId?: string; sourceIds?: string[] },
+): Promise<AppleLoopsSourceView[] | null> {
+  try {
+    const rows = await ctx.engine.executeRaw<{ id: string; incarnation: string; local_path: string | null; config: unknown }>(
+      `SELECT id, incarnation::text AS incarnation, local_path, config FROM sources WHERE archived IS NOT TRUE AND config->>'kind' = 'apple' ORDER BY id`, []);
+    const inScope = rows.filter((r) => (!scope.sourceIds || scope.sourceIds.includes(r.id)) && (!scope.sourceId || scope.sourceId === r.id));
+    if (inScope.length === 0) return null;
+    const [{ parseAppleSourceConfig }, { appleLoopsAvailability, appleLoopsFreshness }, { managedBrain, readConnectorCursorState }, { parseSourceConfig }] = await Promise.all([
+      import('../apple/source-config.ts'), import('../apple/loops-status.ts'), import('../connectors/item-holds-store.ts'), import('../sources-load.ts')]);
+    const managed = await managedBrain(ctx.engine);
+    const out: AppleLoopsSourceView[] = [];
+    for (const r of inScope) {
+      const config = parseSourceConfig(r.config);
+      const cfg = parseAppleSourceConfig(config, r.local_path ?? '');
+      const a = appleLoopsAvailability(cfg);
+      if (!a.available) {
+        if (a.reason === 'identity_missing') out.push({ id: r.id, available: false, reason: a.reason, last_sync_at: null, stale: true });
+        continue;
+      }
+      let state: Record<string, unknown> | null = null;
+      try { state = await readConnectorCursorState(ctx.engine, { id: r.id, incarnation: r.incarnation, local_path: r.local_path, config }, managed); } catch { /* unreadable state = stale */ }
+      out.push({ id: r.id, available: true, ...appleLoopsFreshness(cfg, state) });
+    }
+    return out.length > 0 ? out : null;
+  } catch {
+    return [{ id: '(apple)', available: true, last_sync_at: null, stale: true }];
+  }
+}
+
 /**
  * Fix wave 4: held Gmail threads whose newest message falls inside this window
  * (or whose date is unknown) make the answer's coverage partial.
@@ -117,7 +157,7 @@ interface HeldItemView { source_id: string; key: string; sender: string | null; 
  * `partial` whenever a held Gmail thread in scope falls inside the window.
  * Remote callers get the sender and the retry command, never the subject.
  */
-async function heldCoverage(ctx: OperationContext, sources: GoogleSourceFreshness[], trusted: boolean): Promise<{ completeness: 'complete' | 'partial'; held: HeldItemView[] }> {
+async function heldCoverage(ctx: OperationContext, sources: GoogleSourceFreshness[], trusted: boolean, appleIds: ReadonlySet<string> = new Set()): Promise<{ completeness: 'complete' | 'partial'; held: HeldItemView[] }> {
   if (!sources.length) return { completeness: 'complete', held: [] };
   try {
     const { readAllSourceHolds } = await import('../connectors/item-holds-store.ts');
@@ -125,6 +165,8 @@ async function heldCoverage(ctx: OperationContext, sources: GoogleSourceFreshnes
     const held: HeldItemView[] = [];
     for (const entry of await readAllSourceHolds(ctx.engine, { sourceIds: sources.map((s) => s.id) })) {
       for (const record of entry.held) {
+        // Only an Apple MAIL thread can hide a loop; a held calendar or contact says nothing about unanswered mail.
+        if (appleIds.has(entry.sourceId) && !record.key.startsWith('mail:')) continue;
         const at = record.meta.upstream_at ? Date.parse(record.meta.upstream_at) : NaN;
         if (Number.isFinite(at) && now - at > HELD_WINDOW_MS) continue;
         held.push({ source_id: entry.sourceId, key: record.key, sender: record.meta.sender, ...(trusted ? { subject: record.meta.subject } : {}),
@@ -342,13 +384,17 @@ function renderNoCounterparty(lines: string[], none: NoCounterpartyLoops | null,
 
 function renderText(groups: CounterpartyGroup[], none: NoCounterpartyLoops | null, stale: boolean, noGoogleSources: boolean,
   coverage: { completeness: 'complete' | 'partial'; held: HeldItemView[] }, nowMs: number,
-  partialStaleSources: string[]): string {
+  partialStaleSources: string[], appleUnavailable: string[] = [], withApple = false): string {
   const lines: string[] = [];
   const { held } = coverage;
-  if (stale) lines.push('⚠ google sources have not synced recently — this may be out of date.');
+  if (appleUnavailable.length > 0) {
+    lines.push(`⚠ Apple Mail loop tracking is unavailable for ${appleUnavailable.join(', ')} (identity_missing): this is NOT "inbox clean". `
+      + `Set your addresses: gbrain apple loops --source ${appleUnavailable[0]} --mail-owner-addresses <you@example.com>.`);
+  }
+  if (stale) lines.push(`⚠ ${withApple ? 'google and Apple Mail loop' : 'google'} sources have not synced recently — this may be out of date.`);
   else if (partialStaleSources.length > 0) {
     lines.push(
-      `⚠ some google sources have not synced recently — this may be out of date: ${partialStaleSources.join(', ')}.`,
+      `⚠ some ${withApple ? 'google and Apple Mail loop' : 'google'} sources have not synced recently — this may be out of date: ${partialStaleSources.join(', ')}.`,
     );
   }
   const partial = coverage.completeness === 'partial';
@@ -375,6 +421,7 @@ function renderText(groups: CounterpartyGroup[], none: NoCounterpartyLoops | nul
       );
       return lines.join('\n');
     }
+    if (appleUnavailable.length > 0) return lines.join('\n');
     lines.push('No open loops — no unanswered threads older than 24h and no tracked promises. You are clean.');
     return lines.join('\n');
   }
@@ -481,10 +528,20 @@ const open_loops: Operation = {
       ...(loopId === undefined ? {} : { loopId }),
       limit: 500,
     });
-    const freshness = await googleSourceFreshness(ctx, scope);
-    const noGoogleSources = freshness.sources.length === 0;
+    const google = await googleSourceFreshness(ctx, scope);
+    const apple = await appleLoopsSources(ctx, scope);
+    const appleAvailable = (apple ?? []).filter((x) => x.available);
+    const appleUnavailable = (apple ?? []).filter((x) => !x.available);
+    // Google-only brains: `google` is returned untouched. Available Apple Mail sources join the freshness set.
+    const freshSources = [...google.sources, ...appleAvailable.map(({ id, last_sync_at, stale }) => ({ id, last_sync_at, stale }))];
+    const freshness = apple === null ? google : {
+      sources: freshSources,
+      stale: freshSources.length > 0 && freshSources.every((x) => x.stale),
+      staleSources: freshSources.filter((x) => x.stale).map((x) => x.id),
+    };
+    const noGoogleSources = freshness.sources.length === 0 && appleUnavailable.length === 0;
     const partialStaleSources = freshness.stale ? [] : freshness.staleSources;
-    const coverage = await heldCoverage(ctx, freshness.sources, trusted);
+    const coverage = await heldCoverage(ctx, freshness.sources, trusted, new Set(appleAvailable.map((x) => x.id)));
     const deepLinks = trusted ? await deepLinksFor(ctx, loops) : new Map<string, string>();
 
     const truncated = loops.length >= 500;
@@ -500,6 +557,7 @@ const open_loops: Operation = {
         completeness: coverage.completeness,
         held: coverage.held,
         no_google_sources: noGoogleSources,
+        ...(appleUnavailable.length > 0 ? { apple_loops_unavailable: appleUnavailable.map(({ id, reason }) => ({ source_id: id, reason })) } : {}),
         redacted: !trusted,
       };
     }
@@ -602,10 +660,11 @@ const open_loops: Operation = {
       completeness: coverage.completeness,
       held: coverage.held,
       no_google_sources: noGoogleSources,
+      ...(appleUnavailable.length > 0 ? { apple_loops_unavailable: appleUnavailable.map(({ id, reason }) => ({ source_id: id, reason })) } : {}),
       redacted: !trusted,
       as_of: new Date(nowMs).toISOString(),
       ...(trusted && loopId === undefined
-        ? { text: renderText(groups, noCounterparty, freshness.stale, noGoogleSources, coverage, nowMs, partialStaleSources) }
+        ? { text: renderText(groups, noCounterparty, freshness.stale, noGoogleSources, coverage, nowMs, partialStaleSources, appleUnavailable.map((x) => x.id), appleAvailable.length > 0) }
         : {}),
     };
   },

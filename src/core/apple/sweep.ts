@@ -47,6 +47,8 @@ import {
   type AppleSyncDeps,
   type AppleSyncSummary,
 } from './sweep-shared.ts';
+import { appleLoopsAvailability } from './loops-status.ts';
+import { prepareLoopsState, trackMailLoops, type AppleLoopsRun } from './loops.ts';
 import type { AppleCalendarEvent, AppleContact, AppleMailListing, AppleSourceState } from './types.ts';
 
 const DAY_MS = 86_400_000;
@@ -61,6 +63,8 @@ export interface AppleSweepCtx {
   summary: AppleSyncSummary;
   countedSlugs: Set<string>;
   holds: ConnectorHoldSession;
+  /** Open-loop bookkeeping for this run; present only when Mail loop tracking is available (owner addresses set). */
+  loops?: AppleLoopsRun;
 }
 
 const byId = <T,>(key: (x: T) => string) => (a: T, b: T): number => {
@@ -309,7 +313,10 @@ export function mailReadSince(state: AppleSourceState, windowStart: Date, full: 
 export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   const { deps, state, summary } = ctx;
   const windowStart = new Date(deps.now() - deps.cfg.mailDays * DAY_MS);
-  const since = mailReadSince(state, windowStart, deps.opts.full === true);
+  // Loop tracking must see the whole window once when the owner set changed or extraction was just consented.
+  const trackLoops = ctx.loops !== undefined && appleLoopsAvailability(deps.cfg).available;
+  const rereadAll = trackLoops && prepareLoopsState(state, deps.cfg) && state.mail.resume_from === undefined;
+  const since = mailReadSince(state, windowStart, deps.opts.full === true || rereadAll);
   const failedBefore = summary.failedFiles;
   const read = await deps.readers.mail({ since, mailboxes: deps.cfg.mailMailboxes, max: deps.cfg.mailMax,
     ...(state.mail.resume_from && state.mail.resume_id ? { after: { date: state.mail.resume_from, id: state.mail.resume_id } } : {}), ...signalOf(ctx) });
@@ -345,14 +352,19 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
 
   // A thread with an unreadable message still exists upstream: it is live for the sweep (never deleted).
   const live = new Set<string>(listing.unavailableThreads ?? []);
+  // Open-loop bookkeeping: threads with a page this run, and those whose page did not land (failed render/import, held).
+  const rendered = new Set<string>();
+  const notLanded = new Set<string>();
+  const landedSlug = new Map<string, string>();
   for (const thread of groupMailThreads(messages)) {
     if (aborted(ctx)) return;
     const holdKey = `mail:${thread.threadId}`;
     const first = await safeRender(ctx, holdKey, () => renderMailThreadPage(thread, deps.cfg.account));
-    if (!first.ok) { live.add(thread.threadId); continue; }
+    if (!first.ok) { live.add(thread.threadId); notLanded.add(thread.threadId); continue; }
     let page = first.value;
     if (!page) continue; // automated mail renders nothing
     live.add(thread.threadId);
+    rendered.add(thread.threadId);
     const existing = pathByThread.get(thread.threadId);
     if (state.mail.hashes[thread.threadId] === renderedHash(page.relPath, page.markdown) && existing === page.relPath) continue;
     if (existing) {
@@ -361,11 +373,12 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
       let prior;
       try { prior = await loadMailPrior(ctx, existing, stored); } catch (e) {
         if (ctx.holds.shouldAttempt(holdKey, null)) await failItem(ctx, holdKey, e, null, null);
+        notLanded.add(thread.threadId);
         continue;
       }
       if (prior) {
         const carried = await safeRender(ctx, holdKey, () => renderMailThreadPage(thread, deps.cfg.account, prior));
-        if (!carried.ok) continue;
+        if (!carried.ok) { notLanded.add(thread.threadId); continue; }
         if (carried.value) page = carried.value;
       } else {
         // The stored page names messages this listing no longer returns and its body cannot be split back
@@ -377,6 +390,7 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
           if (ctx.holds.shouldAttempt(holdKey, null)) {
             await failItem(ctx, holdKey, new Error(`stored mail page ${existing} holds ${dropped.length} message(s) the reader no longer lists and cannot be carried forward; page left unchanged`), null, null);
           }
+          notLanded.add(thread.threadId);
           continue;
         }
       }
@@ -384,15 +398,36 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
     const final = page;
     const hash = renderedHash(final.relPath, final.markdown);
     if (state.mail.hashes[thread.threadId] === hash && existing === final.relPath) continue;
-    await attemptItem(ctx, holdKey, hash, final, async () => {
-      await importRendered(deps, final.relPath, final.markdown, ctx.activePack, summary, ctx.countedSlugs,
+    const landed = await attemptItem(ctx, holdKey, hash, final, async () => {
+      const slug = await importRendered(deps, final.relPath, final.markdown, ctx.activePack, summary, ctx.countedSlugs,
         { apple_thread_id: thread.threadId, apple_message_ids: thread.messages.map((m) => m.id) });
+      landedSlug.set(thread.threadId, slug);
       if (existing && existing !== final.relPath) await deletePageByRelPath(deps, existing, summary);
       state.mail.hashes[thread.threadId] = hash;
       pathByThread.set(thread.threadId, final.relPath);
     });
+    if (!landed) notLanded.add(thread.threadId);
   }
   if (aborted(ctx)) return;
+
+  if (trackLoops && ctx.loops) {
+    const slugByThread = new Map(landedSlug);
+    const missing = [...rendered].filter((id) => !slugByThread.has(id) && !notLanded.has(id));
+    if (missing.length > 0) {
+      const rows = await deps.engine.executeRaw<{ slug: string; tid: string }>(
+        `SELECT slug, frontmatter->>'apple_thread_id' AS tid FROM pages
+          WHERE source_id = $1 AND deleted_at IS NULL AND frontmatter->>'apple_thread_id' = ANY(string_to_array($2, E'\\n'))`,
+        [deps.sourceId, missing.join('\n')]);
+      for (const r of rows) slugByThread.set(r.tid, r.slug);
+    }
+    // A rendered thread whose page is not in the brain (pending managed write) cannot carry a loop yet.
+    for (const id of rendered) if (!slugByThread.has(id)) notLanded.add(id);
+    await trackMailLoops({
+      engine: deps.engine, sourceId: deps.sourceId, cfg: deps.cfg, state, log: deps.log, now: deps.now, ...signalOf(ctx),
+      run: ctx.loops, messages, slugByThread, notLanded, unavailableThreads: new Set(listing.unavailableThreads ?? []),
+      listingClean: !truncated && readable && summary.failedFiles === failedBefore,
+    });
+  }
 
   // The removal verdict needs a complete listing of the whole window: an incremental read, a capped read
   // and an unreadable-message read are all partial views.

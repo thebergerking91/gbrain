@@ -24,6 +24,7 @@ import { parseAppleSourceConfig } from '../core/apple/source-config.ts';
 import { parseSourceConfig } from '../core/sources-load.ts';
 import { permissionGuide, guideLines, USER_ACTION_CODES, type PermissionGuide } from '../core/apple/permission-guide.ts';
 import { APPLE_DEFAULT_ACCOUNT } from '../core/apple/source-config.ts';
+import { APPLE_LOOPS_EXTRACT_DISCLOSURE, appleLoopsAvailability } from '../core/apple/loops-status.ts';
 import { AppleAddFlagError, appleAddPlatformWarning, buildAppleAddOptions, parseAppleServicesFlag } from './sources-apple-flags.ts';
 import { emitEnvelope, errorEnvelope, showUserBlock, type AppleOut } from './apple-output.ts';
 
@@ -55,14 +56,16 @@ interface Flags {
   noProbe: boolean;
   yes: boolean;
   confirmMail: boolean;
+  consentExtraction: boolean;
+  revokeExtraction: boolean;
   budgetMs: number;
   /** The `sources add` tuning flags, by flag name (`--history-days` ...). */
   extra: Record<string, string>;
   positionals: string[];
 }
 
-const VALUED = new Set(['--services', '--account', '--source', '--sync-budget-ms', '--history-days', '--future-days', '--calendar-ids', '--contacts-dir', '--mail-mailboxes', '--mail-days']);
-const BOOLEAN = new Set(['--json', '--no-sync', '--no-probe', '--yes', '--confirm-mail']);
+const VALUED = new Set(['--services', '--account', '--source', '--sync-budget-ms', '--history-days', '--future-days', '--calendar-ids', '--contacts-dir', '--mail-mailboxes', '--mail-days', '--mail-owner-addresses']);
+const BOOLEAN = new Set(['--json', '--no-sync', '--no-probe', '--yes', '--confirm-mail', '--consent-loops-extraction', '--revoke-loops-extraction']);
 
 export const APPLE_HELP = `gbrain apple — connect Apple Calendar, Contacts and Mail (macOS) to your brain
 
@@ -74,7 +77,11 @@ Subcommands:
             --no-sync                           register only; sync later with: gbrain sync --source <id>
             --sync-budget-ms <ms>               first-sync wall-clock budget (default 90000)
             --source <id>                       source id (default: apple-<account>)
+            --mail-owner-addresses a@x,b@y      your addresses; enables unanswered-mail tracking (never guessed from Sent)
+            --consent-loops-extraction          also send Mail thread text to the configured chat provider for commitment extraction (off by default)
             (+ --history-days --future-days --calendar-ids --contacts-dir --mail-mailboxes --mail-days)
+  loops     [--source <id>] [--mail-owner-addresses a@x,b@y] [--consent-loops-extraction | --revoke-loops-extraction]  [--json]
+            show or change Mail open-loop tracking for an existing Apple source (no Apple data is read)
   status    per-service permission probe, last sync, held items  [--json] [--no-probe]
             (--no-probe: no helper runs; reports the last probe recorded by a sync)
   services  [<source>]  list which services are enabled / disabled for a source  [--json]
@@ -84,7 +91,7 @@ Exit codes: 0 done, 1 failed, 2 waiting on you (a permission, or a Mail confirma
 Read-only toward Apple. No credentials. Docs: docs/guides/apple-connect.md`;
 
 function parseFlags(args: string[]): Flags | { error: string } {
-  const f: Flags = { json: false, noSync: false, noProbe: false, yes: false, confirmMail: false, budgetMs: 90_000, extra: {}, positionals: [] };
+  const f: Flags = { json: false, noSync: false, noProbe: false, yes: false, confirmMail: false, consentExtraction: false, revokeExtraction: false, budgetMs: 90_000, extra: {}, positionals: [] };
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     const eq = a.startsWith('--') ? a.indexOf('=') : -1;
@@ -95,6 +102,8 @@ function parseFlags(args: string[]): Flags | { error: string } {
       else if (key === '--no-sync') f.noSync = true;
       else if (key === '--no-probe') f.noProbe = true;
       else if (key === '--yes') f.yes = true;
+      else if (key === '--consent-loops-extraction') f.consentExtraction = true;
+      else if (key === '--revoke-loops-extraction') f.revokeExtraction = true;
       else f.confirmMail = true;
       continue;
     }
@@ -184,7 +193,8 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
       services: services.join(','), account: f.account,
       historyDays: f.extra['--history-days'], futureDays: f.extra['--future-days'],
       calendarIds: f.extra['--calendar-ids'], contactsDir: f.extra['--contacts-dir'],
-      mailMailboxes: f.extra['--mail-mailboxes'], mailDays: f.extra['--mail-days'],
+      mailMailboxes: f.extra['--mail-mailboxes'], mailDays: f.extra['--mail-days'], mailOwnerAddresses: f.extra['--mail-owner-addresses'],
+      loopsExtractConsent: f.consentExtraction,
       // setup has its own Mail gate just below (--confirm-mail / --yes), which runs before any probe.
       confirmMail: true,
       dir: defaultCloneDir(`${sourceId}-apple`),
@@ -200,7 +210,7 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
     const command = setupCommand(f, services, ['--confirm-mail']);
     const message = 'Mail is the most sensitive service: gbrain will read the subject, sender, recipients, date and plain-text body of recent messages '
       + `(mailboxes ${(addOpts.mailMailboxes ?? ['INBOX', 'Sent']).join(', ')}, last ${addOpts.mailDays ?? 30} days) from Mail.app and store them as pages in your brain. `
-      + 'Attachments are never downloaded. Nothing leaves this Mac except the text sent to your configured AI provider if atom extraction runs on those pages. '
+      + 'Attachments are never downloaded. Nothing leaves this Mac except the text sent to your configured AI provider if atom extraction runs on those pages, or if you separately consent to commitment extraction (--consent-loops-extraction, which needs --mail-owner-addresses and sends Mail thread text to the chat provider configured for this brain). '
       + `Skip Mail with --services calendar,contacts. Confirm Mail by re-running with --confirm-mail (or --yes).`;
     emitEnvelope(out, { ok: false, status: 'awaiting_confirmation', services, source_id: sourceId, next: { command, user_message: message } },
       [showUserBlock(message, command), '', `Next: ${command}`]);
@@ -432,6 +442,60 @@ async function runServices(f: Flags, deps: AppleCommandDeps, out: AppleOut): Pro
   }
 }
 
+// ── loops ────────────────────────────────────────────────────────────────────
+
+/** Show or change the Mail open-loop settings of an Apple source. Writes config only; no Apple data is read and no model is called. */
+async function runLoops(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promise<number> {
+  const handle = await openEngine(deps);
+  if (!handle) return emitFail(out, errorEnvelope('no_brain', 'No gbrain brain is configured yet.', 'There is no Apple source to configure.', 'Run `gbrain init`, then `gbrain apple setup`.'), 1);
+  try {
+    const sources = await listAppleSources(handle.engine);
+    const src = f.source ? sources.find((s) => s.id === f.source) : sources.length === 1 ? sources[0] : undefined;
+    if (!src) {
+      return emitFail(out, errorEnvelope('source_not_found', f.source ? `Apple source "${f.source}" not found.` : 'Pass --source <id>: there is not exactly one Apple source.',
+        `Apple sources: ${sources.map((s) => s.id).join(', ') || 'none'}.`, 'Run `gbrain apple status`.'), 2);
+    }
+    if (f.consentExtraction && f.revokeExtraction) {
+      return emitFail(out, errorEnvelope('invalid_value', 'Choose one of --consent-loops-extraction and --revoke-loops-extraction.', 'They contradict each other.', 'Pass only one.'), 1);
+    }
+    const patch: Record<string, unknown> = {};
+    const next = { ...src.cfg };
+    const ownersRaw = f.extra['--mail-owner-addresses'];
+    if (ownersRaw !== undefined) {
+      try {
+        next.mailOwnerAddresses = buildAppleAddOptions({ services: 'calendar', mailOwnerAddresses: ownersRaw, dir: src.cfg.dir }).mailOwnerAddresses ?? [];
+      } catch (error) {
+        if (error instanceof AppleAddFlagError) return emitFail(out, errorEnvelope(error.code, error.message, 'The owner identity decides message direction; a bad value is never guessed around.', error.suggestion), 1);
+        throw error;
+      }
+      patch.a_mail_owner_addresses = next.mailOwnerAddresses.join(',');
+    }
+    if (f.consentExtraction) {
+      if (!next.services.includes('mail')) return emitFail(out, errorEnvelope('invalid_value', 'This source does not include Mail.', 'Extraction consent applies to Mail threads.', `Run gbrain sources set-services ${src.id} --add mail --confirm-mail first.`), 1);
+      if (next.mailOwnerAddresses.length === 0) return emitFail(out, errorEnvelope('extraction_consent_requires_identity', 'Extraction consent needs --mail-owner-addresses.', 'Without the owner identity no thread is judged.', 'Pass --mail-owner-addresses together with --consent-loops-extraction.'), 1);
+      patch.a_loops_extract_consent = true;
+      next.loopsExtractConsent = true;
+    }
+    if (f.revokeExtraction) { patch.a_loops_extract_consent = false; next.loopsExtractConsent = false; }
+    if (Object.keys(patch).length > 0) await handle.engine.updateSourceConfig(src.id, patch);
+    const availability = appleLoopsAvailability(next);
+    emitEnvelope(out, { ok: true, status: 'ok', source_id: src.id, changed: Object.keys(patch).length > 0,
+      loops: { available: availability.available, ...(availability.available ? { extraction: availability.extraction === 'enabled' ? 'consented' : 'consent_missing' } : { unavailable: availability.reason }), owner_addresses: next.mailOwnerAddresses.length },
+      next: { user_message: availability.available ? `Mail loop tracking is on for ${src.id}. Sync to refresh: gbrain sync --source ${src.id}` : `Mail loop tracking is unavailable for ${src.id}: ${availability.reason}. This is not \"clean\"; set --mail-owner-addresses.` } },
+    [`Source ${src.id}: unanswered-mail tracking ${availability.available ? 'on' : `unavailable (${availability.reason})`}; extraction ${availability.available && availability.extraction === 'enabled' ? 'consented' : 'not consented'}; owners ${next.mailOwnerAddresses.length}.`,
+      ...(f.consentExtraction ? [APPLE_LOOPS_EXTRACT_DISCLOSURE] : []),
+      ...(Object.keys(patch).length > 0 ? [`Run: gbrain sync --source ${src.id}`] : [])]);
+    return availability.available || Object.keys(patch).length === 0 ? 0 : 2;
+  } finally {
+    await handle.close();
+  }
+}
+
+function emitFail(out: AppleOut, e: ReturnType<typeof errorEnvelope>, code: number): number {
+  emitEnvelope(out, e.envelope, e.human);
+  return code;
+}
+
 // ── entry ────────────────────────────────────────────────────────────────────
 
 /** Returns the exit code: 0 done, 1 failed, 2 waiting on the user. */
@@ -453,7 +517,8 @@ export async function runApple(args: string[], deps: AppleCommandDeps = {}): Pro
   if (sub === 'setup') return runSetup(parsed, deps, out);
   if (sub === 'status') return runStatus(parsed, deps, out);
   if (sub === 'services') return runServices(parsed, deps, out);
-  const e = errorEnvelope('unknown_subcommand', `Unknown subcommand: ${sub}.`, 'gbrain apple has setup, status and services.', 'Run `gbrain apple --help`.');
+  if (sub === 'loops') return runLoops(parsed, deps, out);
+  const e = errorEnvelope('unknown_subcommand', `Unknown subcommand: ${sub}.`, 'gbrain apple has setup, status, services and loops.', 'Run `gbrain apple --help`.');
   emitEnvelope(out, e.envelope, e.human);
   return 2;
 }

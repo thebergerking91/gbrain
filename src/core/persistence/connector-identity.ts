@@ -57,6 +57,8 @@ export const CONNECTOR_LEAF_RULES: { google: Record<string, LeafClass | ElidedLe
     mailDays: 'identity', dir: 'identity', contactsDir: 'identity',
     // A per-run read cap, not a scope: changing it must not re-key the checkpoint.
     mailMax: 'excluded',
+    // Loop-tracking settings change what is derived from Mail, not which Mail is read: they must not re-key the checkpoint.
+    mailOwnerAddresses: 'excluded', loopsExtractConsent: 'excluded',
   },
   github: {
     scope: 'identity', repos: 'identity', dir: 'identity',

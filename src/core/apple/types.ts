@@ -25,6 +25,16 @@ export interface AppleSourceConfig {
   mailDays: number;
   /** Per-run cap on messages read (a_mail_max). */
   mailMax: number;
+  /**
+   * Explicit mailbox-owner addresses (a_mail_owner_addresses): lower-case bare addresses. They alone decide
+   * which messages are the owner's for open-loop tracking; the account label and Sent-mailbox membership never do.
+   */
+  mailOwnerAddresses: string[];
+  /**
+   * a_loops_extract_consent (default false): the owner agreed that Mail thread text may go to the configured
+   * chat provider for commitment/decision extraction. Deterministic unanswered tracking never needs it.
+   */
+  loopsExtractConsent: boolean;
   dir: string;
 }
 
@@ -71,6 +81,10 @@ export interface AppleMailMessage {
   /** plain text, capped 20000 chars by the reader */
   body: string;
   read: boolean;
+  /** The helper's header verdict: RFC 3834 Auto-Submitted (not "no") or a text/calendar part. Machine mail neither opens nor closes a loop. Absent = the reader did not classify. */
+  automated?: boolean;
+  /** The helper's header verdict: List-Unsubscribe, List-Id, Precedence bulk/list/junk or a no-reply Reply-To. Bulk mail owes no reply. */
+  bulk?: boolean;
 }
 
 /**
@@ -114,6 +128,52 @@ export interface AppleReaders {
   requestAccess?(service: AppleService): Promise<{ ok: true } | { ok: false; code: AppleReaderErrorCode; fix: string }>;
 }
 
+/** One grace-held thread (the Google shape: the loop its last detection would open at `due_ms`). */
+export interface AppleLoopGraceHold {
+  due_ms: number;
+  slug: string | null;
+  /** Newest message id of the page the spec was computed from. */
+  rev: string | null;
+  spec: {
+    loopType: 'unanswered_inbound' | 'unanswered_outbound';
+    counterpartyEmail: string;
+    summary: string;
+    evidence: Array<{ message_id?: string; page_slug?: string; quote?: string }>;
+    lastActivityMs: number;
+    openedMs: number;
+  } | null;
+}
+
+/** One Mail message as open-loop tracking keeps it (bounded text; direction is decided by the owner addresses at detection time). */
+export interface AppleLoopMessage {
+  id: string;
+  /** Lower-case bare sender address. */
+  from: string;
+  to: string[];
+  cc: string[];
+  subject: string;
+  ms: number;
+  /** Reader header verdicts; undefined = unclassified, which refuses the thread (fail closed). */
+  auto?: boolean;
+  bulk?: boolean;
+  /** Quote-trimmed body, capped; a question mark past the cap is kept as a trailing "?". */
+  body: string;
+}
+
+export interface AppleMailLoopsState {
+  /** Per-thread messages the detector reads (the reader window does not relist old messages of a thread). */
+  threads?: Record<string, AppleLoopMessage[]>;
+  /** Digest of the owner addresses the stored loops were computed for. */
+  digest?: string;
+  /** The whole mail window must be re-read and re-detected (owner set changed, or extraction was just consented); cleared only by a clean run. */
+  reread?: boolean;
+  /** Finish time of the last run that detected loops on the whole mail listing with nothing partial; the only freshness stamp. */
+  complete_at?: string;
+  /** Extraction consent as of the last complete run; turning it on re-candidates the window once. */
+  extract_seen?: boolean;
+  loop_grace_holds?: Record<string, AppleLoopGraceHold>;
+}
+
 /** Cursor / state file persisted next to the managed clone. */
 export interface AppleSourceState {
   version: 1;
@@ -135,6 +195,8 @@ export interface AppleSourceState {
   };
   /** ItemHoldsState (connectors/item-holds.ts); opaque here so types.ts stays dependency-free. */
   item_holds: unknown;
+  /** Open-loop tracking over Mail (src/core/apple/loops.ts); absent until a run had owner addresses. */
+  mail_loops?: AppleMailLoopsState;
   last_probe?: Record<string, { ok: boolean; at: string; code?: string }>;
   last_full_at?: string;
 }

@@ -96,6 +96,22 @@ function addrsOfHeader(headers, name) {
   return found ? found : [];
 }
 
+// Header-only automation verdicts for open-loop tracking (no body is read for them).
+//   automated: RFC 3834 Auto-Submitted other than "no", or a text/calendar message.
+//   bulk:      List-Unsubscribe, List-Id, Precedence bulk/list/junk, or a no-reply Reply-To.
+function automationFlags(headers) {
+  var auto = headerValue(headers, 'Auto-Submitted').toLowerCase();
+  var ctype = headerValue(headers, 'Content-Type').toLowerCase();
+  var precedence = headerValue(headers, 'Precedence').toLowerCase();
+  var replyTo = headerValue(headers, 'Reply-To').toLowerCase();
+  return {
+    automated: (auto !== '' && auto !== 'no') || ctype.indexOf('text/calendar') >= 0,
+    bulk: headerValue(headers, 'List-Unsubscribe') !== '' || headerValue(headers, 'List-Id') !== '' ||
+      precedence === 'bulk' || precedence === 'list' || precedence === 'junk' ||
+      /no-?reply|do-?not-?reply/.test(replyTo)
+  };
+}
+
 function resolveMailboxes(Mail, names) {
   var found = [];
   var seen = {};
@@ -194,7 +210,9 @@ function readMailbox(entry, appIds, items, seenIds, state) {
         cc: addrsOfHeader(headers, 'Cc'),
         date: new Date(dates[i]).toISOString(),
         body: body,
-        read: !!reads[i]
+        read: !!reads[i],
+        automated: automationFlags(headers).automated,
+        bulk: automationFlags(headers).bulk
       });
       seenIds[id] = true;
     } catch (e) {

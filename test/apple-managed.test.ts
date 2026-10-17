@@ -10,7 +10,7 @@ import { parseAppleSourceConfig } from '../src/core/apple/source-config.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { readManagedConnectorState } from '../src/core/persistence/connector-state.ts';
 import { withEnv } from './helpers/with-env.ts';
-import { createConnectorFixture, options, sourceCheckpoint } from './helpers/connector-fixture.ts';
+import { completeBaselineSweep, createConnectorFixture, options, sourceCheckpoint } from './helpers/connector-fixture.ts';
 import { AppleReaderError } from '../src/core/apple/readers/errors.ts';
 import type { AppleContact, AppleReaders } from '../src/core/apple/types.ts';
 
@@ -137,5 +137,39 @@ test('managed apple sweep: a permanently denied service has its denial saved (la
     const check = await appleServicePermissionsCheck(engine, [f.id]);
     expect(check.status).toBe('warn');
     expect(check.details).toMatchObject({ count: 1 });
+  }
+}), 180_000);
+
+test('managed apple sweep: Mail loop state lands in the checkpoint, open loops are written, freshness is read back from the checkpoint, and a Contacts-only run does not freshen Mail', async () => withEnv(env, async () => {
+  const { loopsOperations } = await import('../src/core/ops/loops.ts');
+  const openLoops = loopsOperations.find((o) => o.name === 'open_loops')!;
+  for (const engine of engines) {
+    const owner = 'me-example@example.com';
+    const config = { kind: 'apple', a_account: 'alice-example', a_services: 'contacts,mail', a_mail_owner_addresses: owner };
+    const f = await source(engine, config);
+    const cfg = parseAppleSourceConfig({ ...config, a_dir: f.dir }, f.dir);
+    const old = new Date(Date.now() - 60 * 3_600_000).toISOString();
+    const mail = [{ id: 'm-1', threadId: 'thr-1', mailbox: 'INBOX', subject: 'Plan', from: 'Alice Example <alice-example@example.com>', to: [owner], cc: [], date: old, body: 'Can you review the plan?', read: true, automated: false, bulk: false }];
+    const rd: AppleReaders = { ...readers({ contacts: [] }), async mail() { return structuredClone(mail); } };
+    const ctx = { engine, config: {}, logger: { info() {}, warn() {}, error() {} }, dryRun: false, remote: false, sourceId: f.id } as never;
+    const answer = async () => openLoops.handler(ctx, { source_id: f.id, group_by: 'counterparty', include_context: false }) as Promise<{ stale: boolean; sources: Array<{ last_sync_at: string | null }>; groups: unknown[] }>;
+
+    await completeBaselineSweep(engine, f.id, () => runAppleSync(engine, f.id, cfg, { ...options, sourceId: f.id }, { readers: rd, log: () => {} }));
+    await disposePersistenceConsumer(engine);
+    const [cp] = await sourceCheckpoint(engine, f.id) as { completed_keys: { state?: { mail_loops?: { complete_at?: string; digest?: string; threads?: Record<string, unknown[]> } } }[] }[];
+    const loops = cp!.completed_keys[0]!.state!.mail_loops!;
+    expect(loops.complete_at).toBeDefined();
+    expect(Object.keys(loops.threads ?? {})).toEqual(['thr-1']);
+    const opened = await engine.executeRaw<{ loop_type: string }>("SELECT loop_type FROM open_loops WHERE source_id=$1 AND status='open'", [f.id]);
+    expect(opened.map((r) => r.loop_type)).toEqual(['unanswered_inbound']);
+    const res = await answer();
+    expect(res.stale).toBe(false);
+    expect(res.sources[0]!.last_sync_at).toBe(loops.complete_at as string);
+    expect(res.groups).toHaveLength(1);
+
+    // A Contacts-only configuration (Mail opted out) leaves the Mail loop answer unavailable-by-service, not fresh.
+    const contactsOnly = { ...config, a_services: 'contacts' };
+    await engine.executeRaw("UPDATE sources SET config = $2::text::jsonb WHERE id=$1", [f.id, JSON.stringify(contactsOnly)]);
+    expect((await answer()).sources).toEqual([]);
   }
 }), 180_000);

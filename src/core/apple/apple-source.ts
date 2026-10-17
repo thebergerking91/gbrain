@@ -32,6 +32,8 @@ import { cliOptsToProgressOptions, getCliOptions } from '../cli-options.ts';
 import { AppleReaderError } from './readers/errors.ts';
 import { parseAppleSourceConfig } from './source-config.ts';
 import { emptyAppleState, normalizeAppleState, readAppleState, writeAppleState } from './state.ts';
+import { appleLoopsAvailability } from './loops-status.ts';
+import { enqueueAppleLoopsExtraction, newAppleLoopsRun } from './loops.ts';
 import { sweepCalendar, sweepContacts, sweepMail, type AppleSweepCtx } from './sweep.ts';
 import {
   newAppleSummary,
@@ -166,7 +168,9 @@ async function runAppleSyncInner(
   progress.start('sync.apple_materialize');
 
   try {
-    const ctx: AppleSweepCtx = { deps, state, activePack, summary, countedSlugs, holds };
+    // Mail loop tracking runs only with explicit owner addresses; otherwise Mail syncs exactly as before.
+    const loopsAvail = appleLoopsAvailability(cfg);
+    const ctx: AppleSweepCtx = { deps, state, activePack, summary, countedSlugs, holds, ...(loopsAvail.available ? { loops: newAppleLoopsRun() } : {}) };
     const sweeps: Record<AppleService, (c: AppleSweepCtx) => Promise<void>> = {
       contacts: sweepContacts,
       calendar: sweepCalendar,
@@ -225,6 +229,19 @@ async function runAppleSyncInner(
     }
     await holds.complete();
     if (!opts.signal?.aborted) await runExtractAndEmbed(deps, summary);
+    // Paid extraction is queued only after the cursor and loop state are saved, and only with BOTH the global
+    // switch and this source's consent (enqueueAppleLoopsExtraction). It never fails the sync.
+    let loopsEnqueue: Awaited<ReturnType<typeof enqueueAppleLoopsExtraction>>;
+    if (ctx.loops && !opts.signal?.aborted && !(managed?.deferred)) {
+      try {
+        loopsEnqueue = await enqueueAppleLoopsExtraction({ engine, sourceId, cfg, run: ctx.loops, log });
+        const counts = (r: Record<string, number>): string => Object.entries(r).map(([k, v]) => `${k}=${v}`).join(' ');
+        if (Object.keys(ctx.loops.eligibility).length > 0) log(`[apple] loops_extract eligibility: ${counts(ctx.loops.eligibility)}`);
+        if (Object.keys(ctx.loops.withheld).length > 0) log(`[apple] reply-owed loops withheld: ${counts(ctx.loops.withheld)}`);
+      } catch (e) {
+        log(`[apple] loops_extract enqueue failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
 
     // last_sync_at feeds the staleness gate: it moves when at least one enabled service synced cleanly, so a
     // permanently denied service does not freeze the others' freshness.
@@ -251,6 +268,7 @@ async function runAppleSyncInner(
       pagesAffected: summary.pagesAffected,
       ...(summary.failedFiles > 0 ? { failedFiles: summary.failedFiles } : {}),
       ...connectorHoldsResult(sourceId, holds.summary()),
+      ...(loopsEnqueue ? { loops_enqueue: loopsEnqueue } : {}),
     };
   } finally {
     progress.finish();

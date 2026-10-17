@@ -27,6 +27,8 @@ describe('parseAppleSourceConfig — defaults', () => {
       mailMailboxes: ['INBOX', 'Sent'],
       mailDays: 30,
       mailMax: 500,
+      mailOwnerAddresses: [],
+      loopsExtractConsent: false,
       dir: DIR,
     });
   });

@@ -28,6 +28,9 @@ export function normalizeMessage(raw: unknown): AppleMailMessage {
     date,
     body,
     read: o.read === true,
+    // Header verdicts for open-loop tracking: present only when the helper reported them (absent = unclassified).
+    ...(typeof o.automated === 'boolean' ? { automated: o.automated } : {}),
+    ...(typeof o.bulk === 'boolean' ? { bulk: o.bulk } : {}),
   };
 }
 

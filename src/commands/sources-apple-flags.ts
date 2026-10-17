@@ -13,21 +13,24 @@ import {
   APPLE_HISTORY_DAYS_MAX,
   APPLE_MAIL_DAYS_MAX,
   parseContactsDir,
+  parseOwnerAddresses,
 } from '../core/apple/source-config.ts';
 import { ALL_APPLE_SERVICES, type AppleService } from '../core/apple/types.ts';
 import type { AppleAddOptions } from '../core/apple/source-add-config.ts';
 
 /** Flags that configure an apple source and are meaningless on any other kind. */
-export const APPLE_ONLY_FLAGS = ['calendar-ids', 'mail-mailboxes', 'mail-days'] as const;
+export const APPLE_ONLY_FLAGS = ['calendar-ids', 'mail-mailboxes', 'mail-days', 'mail-owner-addresses'] as const;
 /** Boolean flag: explicit consent to read Mail (the most sensitive service). */
 export const APPLE_CONFIRM_MAIL_FLAG = 'confirm-mail';
+/** Boolean flag: explicit consent to send Mail thread text to the configured chat provider for commitment/decision extraction. */
+export const APPLE_EXTRACT_CONSENT_FLAG = 'consent-loops-extraction';
 /** Services a bare `sources add --kind apple` enables: Mail is never in the default. */
 export const APPLE_DEFAULT_ADD_SERVICES: readonly AppleService[] = ['calendar', 'contacts'];
 /** Flags google and apple share (each kind validates them its own way). */
 export const APPLE_SHARED_FLAGS = ['account', 'services', 'history-days', 'future-days', 'contacts-dir'] as const;
 
 export class AppleAddFlagError extends Error {
-  constructor(public code: 'unknown_service' | 'empty_services' | 'invalid_value' | 'mail_confirmation_required', message: string, public suggestion: string) {
+  constructor(public code: 'unknown_service' | 'empty_services' | 'invalid_value' | 'mail_confirmation_required' | 'extraction_consent_requires_identity', message: string, public suggestion: string) {
     super(message);
     this.name = 'AppleAddFlagError';
   }
@@ -42,6 +45,10 @@ export interface AppleAddRaw {
   contactsDir?: string;
   mailMailboxes?: string;
   mailDays?: string | number;
+  /** `--mail-owner-addresses a@x,b@y`: the mailbox owner's addresses (open-loop direction). */
+  mailOwnerAddresses?: string;
+  /** `--consent-loops-extraction`: the owner agreed Mail text may go to the chat provider for extraction. */
+  loopsExtractConsent?: boolean;
   /** `--confirm-mail` (or setup's own confirmation): required for any source that includes Mail. */
   confirmMail?: boolean;
   dir: string;
@@ -110,6 +117,25 @@ export function buildAppleAddOptions(raw: AppleAddRaw): AppleAddOptions {
     }
     opts.contactsDir = dir;
   }
+  if (raw.mailOwnerAddresses !== undefined) {
+    const owners = parseOwnerAddresses(raw.mailOwnerAddresses);
+    const wanted = raw.mailOwnerAddresses.split(',').map((t) => t.trim()).filter(Boolean);
+    if (owners.length === 0 || owners.length !== new Set(wanted.map((t) => t.toLowerCase())).size) {
+      throw new AppleAddFlagError('invalid_value', '--mail-owner-addresses needs a comma-separated list of bare email addresses (at most 20).',
+        'Pass the addresses (and aliases) you send mail from, e.g. --mail-owner-addresses me@example.com,me-alias@example.com. They decide which messages are yours for unanswered-mail tracking; the account label and the Sent mailbox are never used.');
+    }
+    opts.mailOwnerAddresses = owners;
+  }
+  if (raw.loopsExtractConsent === true) {
+    if (!services.includes('mail')) {
+      throw new AppleAddFlagError('invalid_value', '--consent-loops-extraction applies to Mail, which this source does not include.', 'Add mail to --services (with --confirm-mail), or remove --consent-loops-extraction.');
+    }
+    if (!opts.mailOwnerAddresses || opts.mailOwnerAddresses.length === 0) {
+      throw new AppleAddFlagError('extraction_consent_requires_identity', 'Extraction consent needs --mail-owner-addresses: without the owner identity no thread is judged.',
+        'Pass --mail-owner-addresses with your addresses together with --consent-loops-extraction.');
+    }
+    opts.loopsExtractConsent = true;
+  }
   if (raw.mailMailboxes !== undefined) {
     const boxes = tokens(raw.mailMailboxes);
     if (boxes.length === 0 || boxes.some((b) => b.length > 128 || CONTROL_RE.test(b))) {
@@ -128,7 +154,7 @@ export function buildAppleAddOptions(raw: AppleAddRaw): AppleAddOptions {
 export function mailConfirmationRequired(via: '--services' | 'set-services'): AppleAddFlagError {
   return new AppleAddFlagError('mail_confirmation_required',
     'Mail needs an explicit confirmation: it is the most sensitive Apple service.',
-    `gbrain will read the subject, sender, recipients, date and plain-text body of recent messages from Mail.app and store them as pages in your brain (attachments are never downloaded). `
+    `gbrain will read the subject, sender, recipients, date and plain-text body of recent messages from Mail.app and store them as pages in your brain (attachments are never downloaded). Nothing is sent to an AI provider unless you separately pass --consent-loops-extraction (with --mail-owner-addresses): that sends Mail thread text to the chat provider configured for this brain. `
     + (via === '--services'
       ? 'If the user agrees, add --confirm-mail to the same command (and keep mail in --services).'
       : 'If the user agrees, re-run with --confirm-mail.')

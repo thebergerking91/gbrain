@@ -89,6 +89,8 @@ change starts a fresh sync cursor for the source and asks for `--yes` first.
 | `--contacts-dir <dir>` | `people` | where contact pages go (relative, lower-case segments) |
 | `--mail-mailboxes <a,b>` | `INBOX,Sent` | which mailboxes |
 | `--mail-days <n>` | 30 (max 365) | mail this far back |
+| `--mail-owner-addresses <a,b>` | none | your own addresses; **required** for unanswered-mail tracking (see [Open loops](#open-loops-unanswered-mail)) |
+| `--consent-loops-extraction` | off | consent to send Mail thread text to the chat provider for commitment/decision extraction |
 | `a_mail_max` (config key) | 500 (max 5000) | messages read per run; a larger backlog is read over several runs |
 | `--dir <path>` | `~/.gbrain/clones/<id>-apple` | the managed directory |
 
@@ -165,6 +167,40 @@ event's pages are keyed on its series id plus the occurrence start, so
 `gbrain sync --source <id> --full` removes them. Multi-day timed events show the
 end date as well as the time.
 
+## Open loops (unanswered mail)
+
+`gbrain waiting` / `open_loops` reuse the Google open-loop engine on Mail threads: "I owe a reply"
+(inbound, unanswered after 24 h) and "I'm waiting on them" (your question, unanswered after 72 h), closed
+automatically when the turn flips, with the same grace windows, mutes and noise rules.
+
+```bash
+gbrain apple setup --services calendar,contacts,mail --confirm-mail --mail-owner-addresses me@example.com,me-alias@example.com
+gbrain apple loops --source apple-local --mail-owner-addresses me@example.com   # on an existing source (reads no Apple data)
+```
+
+- **Identity is explicit.** Direction comes only from `--mail-owner-addresses` (config `a_mail_owner_addresses`).
+  The `--account` label is free text and the Sent mailbox is never read as identity (aliases, shared mailboxes).
+  Without owner addresses Mail still imports, but loop tracking is **unavailable (`identity_missing`)**, and
+  `gbrain waiting` says so instead of "You are clean".
+- **No model call for tracking.** Unanswered-mail detection is deterministic and needs no consent.
+- **Extraction is a separate, second consent.** Commitment/decision extraction sends the text of Mail threads
+  (sender, recipients, subject, plain-text body) to the chat provider configured for this brain, one call per
+  eligible thread, within the daily `loops.extraction_max_usd_per_day` cap. It runs only when **both**
+  `loops.extraction_enabled` (global, default on) **and** this source's `--consent-loops-extraction` (default
+  off, needs owner addresses) are set; the job handler re-checks both when it runs. Withdraw with
+  `gbrain apple loops --revoke-loops-extraction`. Turning it on re-reads the mail window once.
+- **Freshness.** `waiting` treats an Apple source as fresh only after a Mail sweep that was complete and
+  detected loops in that same run. A Contacts or Calendar sync, a truncated or partly unreadable Mail run,
+  a held or unimported thread, or a message the helper could not classify keeps the answer stale (`waiting`
+  refuses unless `--stale-ok`). Changing the owner addresses makes the old freshness stale until a clean re-read.
+- **No Gmail labels.** Mail has none, so none are invented. Machine mail (`Auto-Submitted`, `text/calendar`)
+  and bulk mail (`List-Unsubscribe`, `List-Id`, `Precedence: bulk|list|junk`, no-reply `Reply-To`) are recognised
+  from headers the helper reports; the Gmail category rule and `loops.extraction_exclude_labels` have no Apple
+  equivalent. If that exclusion is configured, paid extraction for Apple sources is **withheld**
+  (`excluded_label_unsupported`) rather than ignored; tracking is unaffected. `loops mute` works on Apple sources.
+- **Bounded state.** The detector keeps the last 12 short messages of up to 100 recent threads in the source's
+  cursor state (a 120-character excerpt each), so a grace-held loop can open later without re-reading Mail.
+
 ## Privacy and custody
 
 - **Read-only.** The connector reads Calendar through EventKit, Contacts through
@@ -184,6 +220,7 @@ end date as well as the time.
   chat model under the auto-drain dollar cap. To keep Mail and Calendar pages out
   of atom extraction: `gbrain config set cycle.extract_atoms.connector_pages false`.
   See [spend controls](../operations/spend-controls.md#atom-extraction-auto-drain-cap-and-connector-pages).
+- **Loop extraction is opt-in per source** (`--consent-loops-extraction`): without it no Mail text is sent to a model for open-loop extraction (see [Open loops](#open-loops-unanswered-mail)).
 - Apple connector pages are marked untrusted external content, like Google's.
 - Items that fail repeatedly are held after 3 runs (`gbrain sources status <id>`,
   `gbrain sources retry-held <id>`, doctor `connector_held_items`). A permission
@@ -203,5 +240,6 @@ end date as well as the time.
 | `macos_too_old` | the helper needs macOS 14+ / Command Line Tools 15+ | update macOS and the tools (`xcode-select --install`) |
 | `helper_failed` | the helper crashed | install Xcode Command Line Tools 15+ (`xcode-select --install`) |
 | `mail_confirmation_required` | `sources add` / `set-services` included Mail without `--confirm-mail` | confirm with the user, then add `--confirm-mail` |
+| `extraction_consent_requires_identity` | `--consent-loops-extraction` without `--mail-owner-addresses` | pass the owner addresses with it |
 | `malformed_output` | the helper printed something unparseable | retry once, then report the redacted output |
 | `unknown_service` / `empty_services` | bad `--services` | pick from calendar, contacts, mail |

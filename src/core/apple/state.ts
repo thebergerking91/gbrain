@@ -8,7 +8,7 @@ import { chmodSync, existsSync, readFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { atomicWriteFileSync, mkdirPrivate } from '../atomic-write.ts';
-import type { AppleSourceState } from './types.ts';
+import type { AppleLoopGraceHold, AppleLoopMessage, AppleMailLoopsState, AppleSourceState } from './types.ts';
 
 export function appleStateFile(dir: string): string {
   return join(dir, '.apple-source.json');
@@ -29,6 +29,30 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'obj
 function hashMap(v: unknown): Record<string, string> {
   if (!isRecord(v)) return {};
   return Object.fromEntries(Object.entries(v).filter(([, h]) => typeof h === 'string')) as Record<string, string>;
+}
+
+function loopsState(v: unknown): AppleMailLoopsState | undefined {
+  if (!isRecord(v)) return undefined;
+  const holds: Record<string, AppleLoopGraceHold> = {};
+  if (isRecord(v.loop_grace_holds)) {
+    for (const [id, h] of Object.entries(v.loop_grace_holds)) {
+      if (isRecord(h) && typeof h.due_ms === 'number') holds[id] = h as unknown as AppleLoopGraceHold;
+    }
+  }
+  const threads: Record<string, AppleLoopMessage[]> = {};
+  if (isRecord(v.threads)) {
+    for (const [id, list] of Object.entries(v.threads)) {
+      if (Array.isArray(list)) threads[id] = list.filter((m): m is AppleLoopMessage => isRecord(m) && typeof m.id === 'string' && typeof m.ms === 'number' && typeof m.from === 'string');
+    }
+  }
+  return {
+    ...(Object.keys(threads).length > 0 ? { threads } : {}),
+    ...(typeof v.digest === 'string' ? { digest: v.digest } : {}),
+    ...(v.reread === true ? { reread: true } : {}),
+    ...(typeof v.complete_at === 'string' ? { complete_at: v.complete_at } : {}),
+    ...(typeof v.extract_seen === 'boolean' ? { extract_seen: v.extract_seen } : {}),
+    ...(Object.keys(holds).length > 0 ? { loop_grace_holds: holds } : {}),
+  };
 }
 
 /** Merge a parsed (possibly partial or foreign-shaped) object over the empty state. */
@@ -52,6 +76,7 @@ export function normalizeAppleState(parsed: unknown): AppleSourceState {
       ...(typeof mail.resume_id === 'string' ? { resume_id: mail.resume_id } : {}),
     },
     item_holds: isRecord(parsed.item_holds) ? parsed.item_holds : undefined,
+    ...(loopsState(parsed.mail_loops) ? { mail_loops: loopsState(parsed.mail_loops)! } : {}),
     ...(typeof parsed.last_full_at === 'string' ? { last_full_at: parsed.last_full_at } : {}),
     ...(isRecord(parsed.last_probe) ? { last_probe: parsed.last_probe as AppleSourceState['last_probe'] } : {}),
   };
