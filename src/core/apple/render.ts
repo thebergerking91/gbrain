@@ -342,6 +342,9 @@ export interface MailPrior {
   /** Message ids in page order; `blocks[i]` renders `ids[i]`. */
   ids: string[];
   blocks: string[];
+  /** Timestamp aligned with ids; parsed from rendered headings for legacy pages. */
+  dates: string[];
+  latest: { date: string; from: string; to: string[]; cc: string[]; mailbox: string };
   participants: string[];
   senders: string[];
   mailboxes: string[];
@@ -387,8 +390,17 @@ export function mailPriorFromPage(relPath: string, frontmatter: Record<string, u
   const blocks = parseMailBlocks(body);
   if (ids.length === 0 || blocks.length !== ids.length) return null;
   if (!title || typeof frontmatter.first_message_date !== 'string') return null;
+  const dates = ids.map((_, i) => {
+    const stored = strList(frontmatter.apple_message_dates)[i];
+    if (stored) return stored;
+    const stamp = /^## .* · (\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)/.exec(blocks[i] ?? '')?.[1];
+    return stamp ? `${stamp.replace(' ', 'T')}:00Z` : frontmatter.first_message_date as string;
+  });
   return {
-    relPath, subject: titleText(title), firstDate: frontmatter.first_message_date, ids, blocks,
+    relPath, subject: titleText(title), firstDate: frontmatter.first_message_date, ids, blocks, dates,
+    latest: { date: typeof frontmatter.date === 'string' ? frontmatter.date : frontmatter.first_message_date,
+      from: typeof frontmatter.from === 'string' ? frontmatter.from : '', to: strList(frontmatter.to), cc: strList(frontmatter.cc),
+      mailbox: typeof frontmatter.mailbox === 'string' ? frontmatter.mailbox : '' },
     participants: strList(frontmatter.participants), senders: strList(frontmatter.senders), mailboxes: strList(frontmatter.mailboxes),
   };
 }
@@ -400,55 +412,41 @@ export function mailPriorFromPage(relPath: string, frontmatter: Record<string, u
  * page holds that the reader no longer lists are carried forward verbatim.
  */
 export function renderMailThreadPage(thread: AppleMailThread, account: string, prior?: MailPrior | null): RenderedPage | null {
-  if (thread.messages.length === 0) return null;
-  if (thread.messages.every((m) => isNoiseSender(bareAddress(m.from)))) return null;
-  const listed = new Set(thread.messages.map((m) => m.id));
+  const current = [...thread.messages].sort((a, b) => Date.parse(a.date) - Date.parse(b.date) || a.id.localeCompare(b.id));
+  if (current.length === 0 || current.every((m) => isNoiseSender(bareAddress(m.from)))) return null;
+  const listed = new Set(current.map((m) => m.id));
   const keepIdx = prior ? prior.ids.map((id, i) => (listed.has(id) ? -1 : i)).filter((i) => i >= 0) : [];
   const carriedIds = prior ? keepIdx.map((i) => prior.ids[i]) : [];
-  const carriedBlocks = prior ? keepIdx.map((i) => prior.blocks[i]) : [];
-  const first = thread.messages[0];
-  const last = thread.messages[thread.messages.length - 1];
   const carrying = prior != null && carriedIds.length > 0;
-  const subject = carrying ? prior.subject : titleText(first.subject) || '(no subject)';
-  const firstDate = carrying ? prior.firstDate : first.date;
-  const relPath = carrying ? prior.relPath : mailRelPath(thread);
+  const subject = carrying ? prior.subject : titleText(current[0]!.subject) || '(no subject)';
+  const firstDate = carrying ? prior.firstDate : current[0]!.date;
+  const relPath = carrying ? prior.relPath : mailRelPath({ ...thread, messages: current });
   const participants = new Set<string>(carrying ? prior.participants : []);
   const senders = new Set<string>(carrying ? prior.senders : []);
-  for (const m of thread.messages) {
+  for (const m of current) {
     const from = bareAddress(m.from);
-    if (from) {
-      participants.add(from);
-      senders.add(from);
-    }
-    for (const a of [...m.to, ...m.cc]) {
-      const addr = bareAddress(a);
-      if (addr) participants.add(addr);
-    }
+    if (from) { participants.add(from); senders.add(from); }
+    for (const a of [...m.to, ...m.cc]) { const addr = bareAddress(a); if (addr) participants.add(addr); }
   }
-  const mailboxes = [...new Set([...(carrying ? prior.mailboxes : []), ...thread.messages.map((m) => m.mailbox)])].sort();
-  const ids = [...carriedIds, ...thread.messages.map((m) => m.id)];
+  const mailboxes = [...new Set([...(carrying ? prior.mailboxes : []), ...current.map((m) => m.mailbox)])].sort();
+  const entries = new Map<string, { date: string; block: string }>();
+  if (carrying && prior) for (const i of keepIdx) entries.set(prior.ids[i]!, { date: prior.dates[i] ?? prior.firstDate, block: prior.blocks[i]! });
+  for (const m of current) entries.set(m.id, { date: m.date, block: mailMessageBlock(m) });
+  const merged = [...entries.entries()].map(([id, value]) => ({ id, ...value }))
+    .sort((a, b) => Date.parse(a.date) - Date.parse(b.date) || a.id.localeCompare(b.id));
+  const currentLatest = current[current.length - 1]!;
+  const latest = carrying && prior && Date.parse(prior.latest.date) > Date.parse(currentLatest.date) ? prior.latest : currentLatest;
+  const ids = merged.map((m) => m.id);
   const fm: string[] = [
-    '---',
-    'type: email',
-    `title: ${yamlStr(subject)}`,
-    `apple_thread_id: ${yamlStr(thread.threadId)}`,
-    `apple_message_ids: ${yamlList(ids)}`,
-    `account: ${yamlStr(account)}`,
-    `mailbox: ${yamlStr(last.mailbox)}`,
-    `mailboxes: ${yamlList(mailboxes)}`,
-    `from: ${yamlStr(last.from)}`,
-    `to: ${yamlList(last.to)}`,
-    `cc: ${yamlList(last.cc)}`,
-    `date: ${yamlStr(last.date)}`,
-    `first_message_date: ${yamlStr(firstDate)}`,
-    `message_count: ${ids.length}`,
-    `participants: ${yamlList([...participants].sort())}`,
-    `senders: ${yamlList([...senders].sort())}`,
-    'source_kind: apple',
-    '---',
+    '---', 'type: email', `title: ${yamlStr(subject)}`, `apple_thread_id: ${yamlStr(thread.threadId)}`,
+    `apple_message_ids: ${yamlList(ids)}`, `apple_message_dates: ${yamlList(merged.map((m) => m.date))}`,
+    `account: ${yamlStr(account)}`, `mailbox: ${yamlStr(latest.mailbox)}`, `mailboxes: ${yamlList(mailboxes)}`,
+    `from: ${yamlStr(latest.from)}`, `to: ${yamlList(latest.to)}`, `cc: ${yamlList(latest.cc)}`,
+    `date: ${yamlStr(latest.date)}`, `first_message_date: ${yamlStr(firstDate)}`, `message_count: ${ids.length}`,
+    `participants: ${yamlList([...participants].sort())}`, `senders: ${yamlList([...senders].sort())}`, 'source_kind: apple', '---',
   ];
   const body: string[] = ['', `# ${inline(subject)}`, ''];
-  for (const block of [...carriedBlocks, ...thread.messages.map(mailMessageBlock)]) body.push(block, '');
+  for (const item of merged) body.push(item.block, '');
   body.push(MAIL_FOOTER, '');
   return { relPath, markdown: fm.join('\n') + body.join('\n') };
 }

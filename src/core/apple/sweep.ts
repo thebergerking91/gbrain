@@ -302,7 +302,7 @@ export function mailReadSince(state: AppleSourceState, windowStart: Date, full: 
   if (full) return windowStart;
   const resume = Date.parse(state.mail.resume_from ?? '');
   const newest = Date.parse(state.mail.newest ?? '');
-  const from = Number.isFinite(resume) ? resume : Number.isFinite(newest) ? newest - APPLE_MAIL_OVERLAP_MS : windowStart.getTime();
+  const from = Number.isFinite(resume) ? resume - 1 : Number.isFinite(newest) ? newest - APPLE_MAIL_OVERLAP_MS : windowStart.getTime();
   return new Date(Math.max(windowStart.getTime(), from));
 }
 
@@ -311,7 +311,8 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   const windowStart = new Date(deps.now() - deps.cfg.mailDays * DAY_MS);
   const since = mailReadSince(state, windowStart, deps.opts.full === true);
   const failedBefore = summary.failedFiles;
-  const read = await deps.readers.mail({ since, mailboxes: deps.cfg.mailMailboxes, max: deps.cfg.mailMax, ...signalOf(ctx) });
+  const read = await deps.readers.mail({ since, mailboxes: deps.cfg.mailMailboxes, max: deps.cfg.mailMax,
+    ...(state.mail.resume_from && state.mail.resume_id ? { after: { date: state.mail.resume_from, id: state.mail.resume_id } } : {}), ...signalOf(ctx) });
   const listing: AppleMailListing = Array.isArray(read) ? { messages: read } : read;
   const messages = listing.messages;
   const truncated = listing.truncated === true;
@@ -321,6 +322,11 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
     summary.status = 'partial';
     summary.incomplete.push('mail:truncated');
     deps.log(`[apple] mail listing truncated at ${deps.cfg.mailMax} messages (a_mail_max); the rest is read on the next run`);
+  }
+  if ((listing.unavailableThreads?.length ?? 0) > 0) {
+    summary.status = 'partial';
+    summary.incomplete.push('mail:unavailable_threads');
+    deps.log(`[apple] ${listing.unavailableThreads!.length} mail thread(s) contain unreadable messages; the cursor will not advance`);
   }
   if (!readable) {
     summary.status = 'partial';
@@ -408,14 +414,20 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
 
   state.mail.since = windowStart.toISOString();
   const newestMs = messages.reduce((m, x) => Math.max(m, Date.parse(x.date) || 0), 0);
-  if (truncated) {
-    // The cap keeps the oldest messages first: resume just before the newest one returned.
-    if (newestMs > 0) state.mail.resume_from = new Date(newestMs - 1000).toISOString();
-  } else if (summary.failedFiles === failedBefore && readable) {
-    // Only a clean, complete read advances the incremental cursor; a failed item is re-read next run.
+  const unresolved = !readable || (listing.unavailableThreads?.length ?? 0) > 0 || summary.failedFiles !== failedBefore;
+  if (!unresolved && truncated && messages.length > 0) {
+    // Advance by a stable (date,id) key, not timestamp alone: Mail.app can have
+    // hundreds of messages at one timestamp and its native filter is date-only.
+    const boundary = messages[messages.length - 1]!;
+    state.mail.resume_from = boundary.date;
+    state.mail.resume_id = boundary.id;
+  } else if (!unresolved && !truncated) {
     delete state.mail.resume_from;
+    delete state.mail.resume_id;
     if (newestMs > 0) state.mail.newest = new Date(Math.max(newestMs, Date.parse(state.mail.newest ?? '') || 0)).toISOString();
   }
+  // On any failed import or coverage gap, keep the previous boundary so the
+  // next run repeats the unresolved slice rather than skipping past it.
 }
 
 /**

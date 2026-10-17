@@ -34,12 +34,13 @@ export function normalizeMessage(raw: unknown): AppleMailMessage {
 const OSASCRIPT_PREFIX = ['-l', 'JavaScript'];
 
 export async function readMail(
-  opts: { since: Date; mailboxes: string[]; max?: number; signal?: AbortSignal },
+  opts: { since: Date; mailboxes: string[]; max?: number; after?: { date: string; id: string }; signal?: AbortSignal },
   o: HelperOverrides = {},
 ): Promise<AppleMailListing> {
   const { items, doc } = await withScriptArgs('mail.js', o, OSASCRIPT_PREFIX, async (scriptArgs) => {
     const args = [...scriptArgs, '--since', opts.since.toISOString(), '--mailboxes', opts.mailboxes.join(',')];
     if (opts.max !== undefined) args.push('--max', String(opts.max));
+    if (opts.after) args.push('--after-date', opts.after.date, '--after-id', opts.after.id);
     return runHelperDocument({ service: 'mail', command: o.command ?? OSASCRIPT_BIN, args, signal: opts.signal, timeoutMs: o.timeoutMs, maxStdoutBytes: o.maxStdoutBytes, platform: o.platform, env: o.env });
   });
   return {

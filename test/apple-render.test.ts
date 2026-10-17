@@ -266,6 +266,18 @@ describe('mail render', () => {
     expect(grown.relPath).toBe(full.relPath);
   });
 
+  test('carry-forward preserves chronological order and newest-message metadata when an older slice is reread', () => {
+    const full = renderMailThreadPage(threads[0], 'local')!;
+    const parsed = parseMarkdown(full.markdown, full.relPath);
+    const body = full.markdown.slice(full.markdown.indexOf('\n---\n', 4) + 5);
+    const prior = mailPriorFromPage(full.relPath, parsed.frontmatter as Record<string, unknown>, body, parsed.title)!;
+    const olderOnly = renderMailThreadPage(groupMailThreads([mail[0]])[0], 'local', prior)!;
+    const frontmatter = parseMarkdown(olderOnly.markdown, olderOnly.relPath).frontmatter as Record<string, unknown>;
+    expect(frontmatter.apple_message_ids).toEqual(['m-001', 'm-002']);
+    expect(frontmatter.date).toBe(prior.latest.date);
+    expect(olderOnly.markdown.indexOf('Hello,')).toBeLessThan(olderOnly.markdown.indexOf('Looks good.'));
+  });
+
   test('parseMailBlocks does not split on a heading inside a fenced body', () => {
     const p = renderMailThreadPage(groupMailThreads([{ ...mail[0], body: '## not a message\n```\nx\n```' }])[0], 'local')!;
     const body = p.markdown.slice(p.markdown.indexOf('\n---\n', 4) + 5);

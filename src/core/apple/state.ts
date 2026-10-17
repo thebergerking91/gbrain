@@ -49,6 +49,7 @@ export function normalizeAppleState(parsed: unknown): AppleSourceState {
       hashes: hashMap(mail.hashes),
       ...(typeof mail.newest === 'string' ? { newest: mail.newest } : {}),
       ...(typeof mail.resume_from === 'string' ? { resume_from: mail.resume_from } : {}),
+      ...(typeof mail.resume_id === 'string' ? { resume_id: mail.resume_id } : {}),
     },
     item_holds: isRecord(parsed.item_holds) ? parsed.item_holds : undefined,
     ...(typeof parsed.last_full_at === 'string' ? { last_full_at: parsed.last_full_at } : {}),

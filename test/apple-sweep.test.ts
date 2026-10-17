@@ -4,7 +4,7 @@
  * Linux). Placeholders only: alice-example, acme-example, example.com.
  */
 import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 const read = readFileSync;
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,6 +16,7 @@ import type { SyncOpts } from '../src/commands/sync.ts';
 import { runAppleSync } from '../src/core/apple/apple-source.ts';
 import { appleStateFile, readAppleState } from '../src/core/apple/state.ts';
 import { parseAppleSourceConfig } from '../src/core/apple/source-config.ts';
+import { mailRelPath } from '../src/core/apple/render.ts';
 import { AppleReaderError } from '../src/core/apple/readers/errors.ts';
 import type {
   AppleCalendarEvent,
@@ -56,7 +57,7 @@ interface FakeApple {
   fail: Partial<Record<AppleService, Error>>;
   calls: Record<AppleService, number>;
   lastCalendar?: { from: Date; to: Date; calendarIds: string[] };
-  lastMail?: { since: Date; mailboxes: string[]; max?: number };
+  lastMail?: { since: Date; mailboxes: string[]; max?: number; after?: { date: string; id: string } };
   /** Extra listing flags the fake mail reader returns (truncated / unavailableThreads / incomplete). */
   mailFlags?: Omit<AppleMailListing, 'messages'>;
   /** When set, the fake mail reader honours `since` the way the helper does (only newer messages). */
@@ -88,9 +89,13 @@ function readersOf(f: FakeApple): AppleReaders {
     async mail(opts) {
       f.calls.mail++;
       if (f.fail.mail) throw f.fail.mail;
-      f.lastMail = { since: opts.since, mailboxes: opts.mailboxes, max: opts.max };
-      const all = f.mailFilterSince ? f.mail.filter((m) => Date.parse(m.date) > opts.since.getTime()) : f.mail;
-      return f.mailFlags ? { messages: structuredClone(all), ...f.mailFlags } : structuredClone(all);
+      f.lastMail = { since: opts.since, mailboxes: opts.mailboxes, max: opts.max, after: opts.after };
+      let all = f.mailFilterSince ? f.mail.filter((m) => Date.parse(m.date) > opts.since.getTime()) : f.mail;
+      if (opts.after) all = all.filter((m) => m.date > opts.after!.date || (m.date === opts.after!.date && m.id > opts.after!.id));
+      if (f.mailFlags) return { messages: structuredClone(all), ...f.mailFlags };
+      all = [...all].sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+      const max = opts.max ?? 500;
+      return { messages: structuredClone(all.slice(0, max)), truncated: all.length > max };
     },
     async probe() { return { ok: true as const }; },
   };
@@ -765,14 +770,15 @@ describe('apple sweep — mail reads incrementally and respects the per-run cap 
     const st = readAppleState(dir);
     expect(st.mail.newest).toBeUndefined();
     const newestReturned = Math.max(...oldest.map((m) => Date.parse(m.date)));
-    expect(Date.parse(st.mail.resume_from!)).toBe(newestReturned - 1000);
+    expect(Date.parse(st.mail.resume_from!)).toBe(newestReturned);
 
-    // Next run: not truncated any more; reads from resume_from, then settles and clears it.
+    // Next run: not truncated any more; resumes after the stable date+id boundary.
     f.mail = all;
     f.mailFlags = undefined;
     const second = await sweep(dir, f);
-    expect(f.lastMail!.since.getTime()).toBe(newestReturned - 1000);
     expect(second.status).not.toBe('partial');
+    expect(f.lastMail!.since.getTime()).toBe(newestReturned - 1);
+    expect(f.lastMail!.after).toEqual({ date: st.mail.resume_from!, id: oldest.sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id)).at(-1)!.id });
     const st2 = readAppleState(dir);
     expect(st2.mail.resume_from).toBeUndefined();
     expect(st2.mail.newest).toBeDefined();
@@ -797,8 +803,61 @@ describe('apple sweep — mail reads incrementally and respects the per-run cap 
     expect(mailReadSince(st, start, false).getTime()).toBe(NOW - 3 * DAY);
     expect(mailReadSince(st, start, true).getTime()).toBe(start.getTime());
     st.mail.resume_from = new Date(NOW - 10 * DAY).toISOString();
-    expect(mailReadSince(st, start, false).getTime()).toBe(NOW - 10 * DAY);
+    expect(mailReadSince(st, start, false).getTime()).toBe(NOW - 10 * DAY - 1);
   });
+});
+
+describe('apple mail safe pagination', () => {
+  test('same-timestamp capped pages advance by stable message id and stay within the cap', () => withHome(async () => {
+    const dir = newDir('mail-tie');
+    await insertSource(dir);
+    const f = freshFake();
+    f.mail = Array.from({ length: 6 }, (_, i) => ({ ...f.mail[0]!, id: `tie-${i}`, threadId: 'tie-thread', date: '2026-10-10T08:00:00.000Z', body: `body-${i}` }));
+    f.mailFilterSince = true;
+    const first = await sweep(dir, f, {}, { a_services: 'mail', a_mail_max: 2 });
+    const firstCursor = readAppleState(dir).mail;
+    expect(first.status).toBe('partial');
+    expect(firstCursor.resume_id).toBe('tie-1');
+    expect(f.lastMail!.max).toBe(2);
+    const second = await sweep(dir, f, {}, { a_services: 'mail', a_mail_max: 2 });
+    const secondCursor = readAppleState(dir).mail;
+    expect(second.status).toBe('partial');
+    expect(f.lastMail!.after).toEqual({ date: firstCursor.resume_from!, id: firstCursor.resume_id! });
+    expect(secondCursor.resume_id).toBe('tie-3');
+    await sweep(dir, f, {}, { a_services: 'mail', a_mail_max: 2 });
+    expect(readAppleState(dir).mail.resume_id).toBeUndefined();
+    expect(await slugs('emails/')).toHaveLength(1);
+  }));
+
+  test('a failed import in a truncated slice does not advance past the failed message', () => withHome(async () => {
+    const dir = newDir('mail-failed-cap');
+    await insertSource(dir);
+    const f = freshFake();
+    const first = { ...f.mail[0]!, id: 'failed-first', threadId: 'failed-thread', date: '2026-10-10T08:00:00.000Z' };
+    const later = { ...first, id: 'later-message', date: '2026-10-11T08:00:00.000Z' };
+    f.mail = [first, later];
+    f.mailFilterSince = true;
+    const relPath = mailRelPath({ threadId: first.threadId, messages: [first] });
+    mkdirSync(join(dir, `${relPath}.tmp`), { recursive: true }); // deterministic import failure before any page is written
+    const result = await sweep(dir, f, {}, { a_services: 'mail', a_mail_max: 1 });
+    expect(result.failedFiles).toBe(1);
+    expect(result.status).toBe('partial');
+    expect(readAppleState(dir).mail.resume_from).toBeUndefined();
+    expect(readAppleState(dir).mail.resume_id).toBeUndefined();
+    expect(readAppleState(dir).mail.newest).toBeUndefined();
+    rmSync(join(dir, `${relPath}.tmp`), { recursive: true, force: true });
+  }));
+
+  test('unavailable threads keep the mail cursor pinned for retry', () => withHome(async () => {
+    const dir = newDir('mail-unavailable');
+    await insertSource(dir);
+    const f = freshFake();
+    f.mailFlags = { unavailableThreads: ['unavailable-thread'] };
+    const result = await sweep(dir, f, {}, { a_services: 'mail', a_mail_max: 2 });
+    expect(result.status).toBe('partial');
+    expect(readAppleState(dir).mail.resume_from).toBeUndefined();
+    expect(readAppleState(dir).mail.newest).toBeUndefined();
+  }));
 });
 
 describe('apple sweep — recurring ids and render details', () => {
@@ -816,5 +875,18 @@ describe('apple sweep — recurring ids and render details', () => {
     const full = await sweep(dir, f, { full: true }, { a_services: 'calendar' });
     expect(full.deleted).toBe(1);
     expect(await slugs('calendar/')).toHaveLength(1);
+  }));
+});
+
+describe('Apple sync dry-run safety', () => {
+  test('unmanaged dry-run refuses before any reader or state/page mutation', () => withHome(async () => {
+    const dir = newDir('dry-run');
+    await insertSource(dir);
+    const f = freshFake();
+    const cfg = parseAppleSourceConfig({ kind: 'apple', a_account: 'alice-example', a_dir: dir }, dir);
+    await expect(runAppleSync(engine, SID, cfg, { sourceId: SID, dryRun: true }, { readers: readersOf(f), log: () => {} })).rejects.toThrow(/Apple connector sync does not support --dry-run/);
+    expect(f.calls).toEqual({ calendar: 0, contacts: 0, mail: 0 });
+    expect(await slugs('calendar/')).toHaveLength(0);
+    expect(readAppleState(dir).calendar.hashes).toEqual({});
   }));
 });

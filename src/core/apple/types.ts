@@ -98,8 +98,9 @@ export interface AppleReaders {
   mail(opts: {
     since: Date;
     mailboxes: string[];
-    /** Per-run message cap (a_mail_max). */
     max?: number;
+    /** Exclusive stable cursor; used with `since` at date-1ms for tied timestamps. */
+    after?: { date: string; id: string };
     signal?: AbortSignal;
   }): Promise<AppleMailMessage[] | AppleMailListing>;
   probe(
@@ -127,8 +128,10 @@ export interface AppleSourceState {
     hashes: Record<string, string>;
     /** Newest message date read by the last complete run; the next run re-reads a 2-day overlap before it. */
     newest?: string;
-    /** Newest message date of a run cut short by a_mail_max; the next run resumes from here. */
+    /** Message date at the current capped-read boundary. */
     resume_from?: string;
+    /** Stable message id at that timestamp, to paginate timestamp ties without repeating them. */
+    resume_id?: string;
   };
   /** ItemHoldsState (connectors/item-holds.ts); opaque here so types.ts stays dependency-free. */
   item_holds: unknown;

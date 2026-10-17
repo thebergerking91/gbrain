@@ -11,6 +11,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { runInNewContext } from 'node:vm';
 
 import { AppleReaderError, fixFor } from '../src/core/apple/readers/errors.ts';
 import { runHelper, scrubEnv, MAX_STDERR_BYTES } from '../src/core/apple/readers/run-helper.ts';
@@ -386,6 +387,53 @@ describe('mail listing document', () => {
     }
   });
 
+  test('real JXA pagination emits an exact cap and advances through 600 timestamp ties by stable id', () => {
+    const { readFileSync } = require('node:fs') as typeof import('node:fs');
+    const js = readFileSync(MAIL_SCRIPT, 'utf8');
+    const dates = Array.from({ length: 600 }, () => new Date('2026-10-10T08:00:00.000Z'));
+    const mailbox: any = { name: () => 'INBOX', id: () => 'inbox-example' };
+    mailbox.messages = { whose: (query: any) => {
+      let indexes = dates.map((_, i) => i);
+      const newerThan = query?.dateReceived?._greaterThan;
+      if (newerThan instanceof Date) indexes = indexes.filter((i) => dates[i]!.getTime() > newerThan.getTime());
+      if (Array.isArray(query?._or)) {
+        const selected = new Set(query._or.map((x: any) => x.id._equals));
+        indexes = indexes.filter((i) => selected.has(i));
+      }
+      return {
+        id: () => indexes,
+        messageId: () => indexes.map((i) => `<id-${String(i).padStart(3, '0')}>`),
+        subject: () => indexes.map(() => 'same timestamp'), sender: () => indexes.map(() => 'Alice Example <alice@example.com>'),
+        dateReceived: () => indexes.map((i) => dates[i]), readStatus: () => indexes.map(() => true),
+        allHeaders: () => indexes.map((i) => `Message-ID: <id-${String(i).padStart(3, '0')}>`),
+        content: () => indexes.map((i) => `body-${i}`),
+      };
+    } };
+    const mailApp = { running: () => true, accounts: () => [{}], inbox: mailbox, sentMailbox: mailbox };
+    const invoke = (argv: string[]): any => {
+      let output = '';
+      const $: any = (value: string) => ({ dataUsingEncoding: () => value });
+      $.NSUTF8StringEncoding = 1;
+      $.NSFileHandle = { fileHandleWithStandardOutput: { writeData: (s: string) => { output = s; } } };
+      let exitCode = 0;
+      $.exit = (code: number) => { exitCode = code; };
+      const sandbox = { ObjC: { import() {} }, $, Application: () => mailApp, console };
+      try { runInNewContext(`${js}\nrun(${JSON.stringify(argv)});`, sandbox); } catch (e) { if (!(e as { code?: number }).code) throw e; }
+      expect(exitCode).toBe(0);
+      return JSON.parse(output);
+    };
+    const argv = ['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX', '--max', '500'];
+    const first = invoke(argv);
+    expect(first.items).toHaveLength(500);
+    expect(first.truncated).toBe(true);
+    const boundary = first.items.at(-1)!;
+    const second = invoke([...argv, '--after-date', boundary.date, '--after-id', boundary.id]);
+    expect(second.items).toHaveLength(100);
+    expect(second.truncated).toBe(false);
+    expect(second.items[0].id).not.toBe(boundary.id);
+    expect(new Set([...first.items, ...second.items].map((m: { id: string }) => m.id)).size).toBe(600);
+  });
+
   test('--max is passed to the helper', async () => {
     const script = join(dir, 'mail-args.js');
     writeFileSync(script, `process.stdout.write(JSON.stringify({items:[{id:'m1',date:'2026-01-02T10:00:00Z',subject:process.argv.slice(2).join(' ')}]}))`);
@@ -413,6 +461,7 @@ describe('helper scripts: source-level guards (static; the scripts are not run h
       const swift = readFileSync(f, 'utf8');
       expect(swift).toContain('permission_not_determined');
       expect(swift).toContain('--request-access');
+      if (f === CALENDAR_SCRIPT) expect(swift).toContain('calendarIds.filter { !resolvedIds.contains($0) }');
     }
     expect(readFileSync(CALENDAR_SCRIPT, 'utf8')).toContain('selection_not_found');
     expect(readFileSync(CALENDAR_SCRIPT, 'utf8')).toContain('.birthday');

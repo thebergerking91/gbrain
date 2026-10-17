@@ -88,6 +88,20 @@ describe('setup', () => {
     expect(r.json).toMatchObject({ ok: true, status: 'ok', registered: true, services: ['calendar', 'contacts'] });
   });
 
+  test('an existing broader source is not synced by narrower setup consent', async () => {
+    const initial = await run(['setup', '--json', '--services', 'calendar,contacts', '--no-sync'], { readers: readersWith() });
+    expect(initial.code).toBe(0);
+    const probed: AppleService[] = [];
+    let synced = false;
+    const r = await run(['setup', '--json', '--services', 'contacts'], {
+      readers: readersWith({}, probed), sync: (async () => { synced = true; return okSync(); }) as never,
+    });
+    expect(r.code).toBe(2);
+    expect(r.json.error.code).toBe('service_scope_mismatch');
+    expect(probed).toEqual([]);
+    expect(synced).toBe(false);
+  });
+
   test('--yes and --confirm-mail both confirm; unknown service is a coded error, never widened', async () => {
     for (const flag of ['--yes', '--confirm-mail']) {
       await resetPgliteState(engine);

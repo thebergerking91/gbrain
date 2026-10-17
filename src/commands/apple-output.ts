@@ -23,7 +23,7 @@ export interface AppleEnvelope {
 
 export type AppleErrorCode =
   | 'unsupported_platform' | 'unknown_service' | 'empty_services' | 'invalid_value' | 'unknown_subcommand' | 'mail_confirmation_required'
-  | 'no_brain' | 'source_id_taken' | 'source_not_found' | 'not_apple_source' | 'ambiguous_source' | 'probe_failed' | 'sync_failed';
+  | 'no_brain' | 'source_id_taken' | 'source_not_found' | 'not_apple_source' | 'ambiguous_source' | 'probe_failed' | 'sync_failed' | 'service_scope_mismatch';
 
 export interface AppleOut {
   json: boolean;

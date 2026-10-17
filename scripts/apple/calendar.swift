@@ -137,8 +137,12 @@ let allCalendars = store.calendars(for: .event).filter { $0.type != .birthday }
 let selected: [EKCalendar] = calendarIds.isEmpty ? allCalendars : allCalendars.filter { calendarIds.contains($0.calendarIdentifier) }
 // A configured id that matches nothing is an ERROR, not an empty listing: an empty listing would
 // read as "everything was deleted" to a --full sweep.
-if !calendarIds.isEmpty && selected.isEmpty {
-    fail("selection_not_found", "None of the configured calendar ids matches a calendar on this Mac.")
+if !calendarIds.isEmpty {
+    let resolvedIds = Set(selected.map { $0.calendarIdentifier })
+    let missing = calendarIds.filter { !resolvedIds.contains($0) }
+    if !missing.isEmpty {
+        fail("selection_not_found", "Configured calendar id(s) do not match calendars on this Mac: " + missing.joined(separator: ", ") + ".")
+    }
 }
 
 func isoString(_ d: Date, tz: TimeZone?) -> String {

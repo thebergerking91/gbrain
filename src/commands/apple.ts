@@ -207,6 +207,25 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
     return 2;
   }
 
+  // Refuse a scope mismatch before probing: setup must never use a narrower consent
+  // invocation to sync the broader service set already stored on an existing source.
+  const preflight = await openEngine(deps);
+  if (!preflight) {
+    return fail(errorEnvelope('no_brain', 'No gbrain brain is configured yet.', 'There is no brain to check for an existing Apple source.',
+      'Run `gbrain init`, then re-run `gbrain apple setup`.', { command: 'gbrain init' }), 2);
+  }
+  let existingBeforeProbe: Awaited<ReturnType<typeof listAppleSources>>[number] | undefined;
+  try {
+    existingBeforeProbe = (await listAppleSources(preflight.engine)).find((s) => s.cfg.account === (addOpts.account ?? APPLE_DEFAULT_ACCOUNT) || s.id === sourceId);
+  } finally {
+    await preflight.close();
+  }
+  if (existingBeforeProbe && (existingBeforeProbe.cfg.services.length !== services.length || services.some((s) => !existingBeforeProbe!.cfg.services.includes(s)))) {
+    return fail(errorEnvelope('service_scope_mismatch', `Source ${existingBeforeProbe.id} is already configured for ${existingBeforeProbe.cfg.services.join(', ')}.`,
+      'Setup refuses to probe and sync a different service scope; use sources set-services explicitly first, then confirm the new Mail scope if needed.',
+      `Run gbrain sources set-services ${existingBeforeProbe.id} --add|--remove <service>, then gbrain sync --source ${existingBeforeProbe.id}.`), 2);
+  }
+
   // Probe every selected service (the only Apple access setup makes before the sync).
   const readers = await defaultReaders(deps);
   const interactive = deps.interactive ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);

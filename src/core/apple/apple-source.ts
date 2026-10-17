@@ -18,6 +18,7 @@
  * runs → held, shown by `sources status`, re-attempted by `retry-held`).
  */
 import type { BrainEngine } from '../engine.ts';
+import { OperationError } from '../ops/contract.ts';
 import type { SyncOpts, SyncResult } from '../../commands/sync.ts';
 import {
   pendingConnectorResult,
@@ -119,7 +120,9 @@ export async function runAppleSync(
   opts: SyncOpts,
   injection: AppleSyncInjection = {},
 ): Promise<SyncResult> {
-  return withConnectorSync(engine, sourceId, APPLE_KIND, cfg, opts,
+ if (opts.dryRun) throw new OperationError('invalid_params', 'Apple connector sync does not support --dry-run.',
+   `Apple sync reads system data and materializes pages; refusing before any Apple reader runs. Run gbrain sync --source ${sourceId} without --dry-run.`);
+ return withConnectorSync(engine, sourceId, APPLE_KIND, cfg, opts,
     (managed, options) => runAppleSyncInner(engine, sourceId, cfg, options, managed, injection), pendingConnectorResult);
 }
 

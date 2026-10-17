@@ -48,15 +48,17 @@ function classify(e) {
 }
 
 function parseArgs(argv) {
-  var out = { probe: false, since: null, mailboxes: [], max: DEFAULT_MAX };
+  var out = { probe: false, since: null, mailboxes: [], max: DEFAULT_MAX, afterDate: null, afterId: null };
   for (var i = 0; i < argv.length; i++) {
     var a = String(argv[i]);
     if (a === '--') continue;
     if (a === '--probe') { out.probe = true; continue; }
-    if (a === '--since' || a === '--mailboxes' || a === '--max') {
+    if (a === '--since' || a === '--mailboxes' || a === '--max' || a === '--after-date' || a === '--after-id') {
       if (i + 1 >= argv.length) fail('helper_failed', 'missing value for ' + a, 2);
       var v = String(argv[++i]);
       if (a === '--since') out.since = v;
+      else if (a === '--after-date') out.afterDate = v;
+      else if (a === '--after-id') out.afterId = v;
       else if (a === '--max') {
         var n = parseInt(v, 10);
         if (!(n >= 1)) fail('helper_failed', '--max must be a positive integer', 2);
@@ -137,19 +139,31 @@ function whoseSince(mb, since, until) {
   return mb.messages.whose({ _and: [after, { dateReceived: { _lessThanEquals: until } }] });
 }
 
-// Cheap pass: only the received dates of every matching message (one Apple event per mailbox).
-function listDates(entries, since) {
+function stableMessageId(label, appId, rfcId, headers) {
+  return firstMsgId(String(rfcId || '')) || firstMsgId(headerValue(String(headers || ''), 'Message-ID')) || ('mail-id:' + label + ':' + appId);
+}
+
+// Metadata-only pass across the mailbox; bodies are fetched only for the bounded page below.
+function listCandidates(entries, since) {
   var all = [];
   entries.forEach(function (entry) {
-    var dates = whoseSince(entry.mb, since, null).dateReceived();
-    for (var i = 0; i < dates.length; i++) all.push(new Date(dates[i]).getTime());
+    var spec = whoseSince(entry.mb, since, null);
+    var ids = spec.id();
+    var rfcIds = spec.messageId();
+    var heads = spec.allHeaders();
+    var dates = spec.dateReceived();
+    for (var i = 0; i < ids.length; i++) {
+      var date = new Date(dates[i]).toISOString();
+      all.push({ entry: entry, appId: ids[i], id: stableMessageId(entry.label, ids[i], rfcIds[i], heads[i]), date: date });
+    }
   });
-  all.sort(function (a, b) { return a - b; });
   return all;
 }
 
-function readMailbox(entry, since, until, items, seenIds, state) {
-  var spec = whoseSince(entry.mb, since, until);
+function readMailbox(entry, appIds, items, seenIds, state) {
+  if (appIds.length === 0) return;
+  var clauses = appIds.map(function (id) { return { id: { _equals: id } }; });
+  var spec = entry.mb.messages.whose({ _or: clauses });
   var ids = spec.id();
   var rfcIds = spec.messageId();
   var subjects = spec.subject();
@@ -162,16 +176,15 @@ function readMailbox(entry, since, until, items, seenIds, state) {
     var threadId = '';
     try {
       var headers = String(heads[i] || '');
-      var rfcId = firstMsgId(String(rfcIds[i] || '')) || firstMsgId(headerValue(headers, 'Message-ID'));
+      var id = stableMessageId(entry.label, ids[i], rfcIds[i], headers);
       var ref = firstMsgId(headerValue(headers, 'References'));
       var irt = firstMsgId(headerValue(headers, 'In-Reply-To'));
       var subject = String(subjects[i] || '');
-      threadId = ref || irt || rfcId || ('subject:' + normSubject(subject));
-      var id = rfcId || ('mail-id:' + entry.label + ':' + ids[i]);
+      threadId = ref || irt || firstMsgId(String(rfcIds[i] || '')) || ('subject:' + normSubject(subject));
       if (seenIds[id]) continue;
       var body = String(bodies[i] || '');
       if (body.length > BODY_CAP) body = body.slice(0, BODY_CAP);
-      var item = {
+      items.push({
         id: id,
         threadId: threadId,
         mailbox: entry.label,
@@ -182,12 +195,9 @@ function readMailbox(entry, since, until, items, seenIds, state) {
         date: new Date(dates[i]).toISOString(),
         body: body,
         read: !!reads[i]
-      };
+      });
       seenIds[id] = true;
-      items.push(item);
     } catch (e) {
-      // An unreadable message must not make its thread look deleted: report the thread as
-      // unavailable (or the whole listing as incomplete when even the thread is unknown).
       if (threadId) state.unavailable[threadId] = true;
       else state.incomplete = true;
     }
@@ -224,15 +234,23 @@ function run(argv) {
   var truncated = false;
   try {
     var entries = resolveMailboxes(Mail, args.mailboxes);
-    var until = null;
-    var stamps = listDates(entries, since);
-    if (stamps.length > args.max) {
-      // Over the cap: take the OLDEST --max so the caller can resume from the newest returned.
-      truncated = true;
-      until = new Date(stamps[args.max - 1]);
-    }
+    var candidates = listCandidates(entries, since);
+    candidates.sort(function (a, b) { return a.date === b.date ? (a.id < b.id ? -1 : a.id > b.id ? 1 : 0) : (a.date < b.date ? -1 : 1); });
+    var candidateIds = {};
+    candidates = candidates.filter(function (c) {
+      if (candidateIds[c.id]) return false;
+      candidateIds[c.id] = true;
+      return !args.afterDate || !args.afterId || c.date > args.afterDate || (c.date === args.afterDate && c.id > args.afterId);
+    });
+    truncated = candidates.length > args.max;
+    var selected = candidates.slice(0, args.max);
+    var selectedByEntry = new Map();
+    selected.forEach(function (c) {
+      if (!selectedByEntry.has(c.entry)) selectedByEntry.set(c.entry, []);
+      selectedByEntry.get(c.entry).push(c.appId);
+    });
     var seenIds = {};
-    entries.forEach(function (entry) { readMailbox(entry, since, until, items, seenIds, state); });
+    entries.forEach(function (entry) { readMailbox(entry, selectedByEntry.get(entry) || [], items, seenIds, state); });
   } catch (e2) {
     var c2 = classify(e2);
     fail(c2[0], c2[1]);
@@ -241,5 +259,10 @@ function run(argv) {
     if (a.date !== b.date) return a.date < b.date ? -1 : 1;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
+  if (args.afterDate && args.afterId) {
+    items = items.filter(function (m) { return m.date > args.afterDate || (m.date === args.afterDate && m.id > args.afterId); });
+  }
+  truncated = truncated || items.length > args.max;
+  if (items.length > args.max) items = items.slice(0, args.max);
   emit({ items: items, truncated: truncated, unavailable: Object.keys(state.unavailable), incomplete: state.incomplete }, 0);
 }
