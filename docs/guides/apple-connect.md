@@ -205,9 +205,22 @@ cursor and later mail move on, and:
   message older than the incremental two-day overlap is still reachable. A read that succeeds merges the message
   into its thread page and clears the hold; one that fails again stays held without pinning the cursor; a
   message deleted upstream is dropped. A failed or timed-out retry read is a source error: it counts nothing;
-- a thread whose page *import* is held (3 failed runs) no longer pins the cursor either; it remembers the
-  messages it was built from (up to 100 per thread; a longer thread is reached by `sync --full`) and is rebuilt
-  the same way. At most 25 messages are re-read by id per run; the rest stay due for the next run;
+- a thread whose page *import* is held (3 failed runs) no longer pins the cursor either, and is rebuilt only from
+  **complete** evidence. Up to 100 messages it remembers the `(id, date)` of every message it was built from
+  (the union of what it remembered and what each run lists, so a growing thread never keeps a stale shorter
+  list); a retry reads them by id in batches of 25, at most 100 messages per run, and renders the thread once
+  every message is read, proven unreadable (its own message hold carries it) or gone upstream. A batch that fails,
+  is cut short by the helper budget or is aborted lands and clears nothing: the hold, its counters and the
+  retry request stay as they were. A longer thread (or a locator that cannot be trusted) is recovered by a
+  whole-window **recovery walk**: it re-reads the mail window like an identity reread (removing nothing, resuming
+  across runs under the unchanged read cap), lands the thread's pages as it goes, and clears the hold only when
+  the walk completes without the thread failing again (a held thread the complete walk never saw is gone and is
+  dropped). `sync --full` does the same;
+- retries are fair and bounded: due records are re-attempted least recently attempted first, whole units (one
+  message, or one thread's list) within the 100-message-per-run budget, so what does not fit is first in line
+  next run. A held record that is only being re-attempted is exempt from the circuit breaker, so many poison
+  messages failing again (a quiet mailbox, or 4 or more at once) still advance their reconsideration and
+  backoff; a run whose fresh traffic trips the breaker (a Mail outage) still counts no failure for anything;
 - the circuit breaker judges messages and threads separately, so a Mail.app outage (most messages unreadable at
   once) counts no failure however many threads imported, and at most 100 items per source are held (a run that
   would exceed it fails before saving, so the cursor stays).

@@ -45,6 +45,15 @@ export const HOLD_DAILY_MS = 24 * 3_600_000;
 export const HOLD_TRANSIENT_WINDOW_MS = 7 * 24 * 3_600_000;
 export const HOLD_CAP = 100;
 
+/**
+ * Names the circuit-breaker group of a key (optional; the default is one group for every key, which Google and GitHub
+ * keep). `heldAtStart` is true when the key was already held when the run began, i.e. this run only RE-attempts it.
+ * Returning `null` exempts the key from the breaker's attempted/failure counts: a held item that fails again is not
+ * evidence of a source outage, so it still counts its reconsideration and backoff (unless a judged group tripped the
+ * breaker this run, which suppresses it like any other failure). A connector opts in; nothing else changes.
+ */
+export type HoldGroupOf = (key: string, heldAtStart: boolean) => string | null;
+
 export type HoldErrorScope = 'source' | 'item' | 'rate_limit';
 export type HoldClass = 'content' | 'transient';
 
@@ -216,7 +225,7 @@ export class ItemHoldsRun {
   private readonly succeeded = new Set<string>();
   private readonly retryKeys: ReadonlySet<string>;
 
-  constructor(stored: unknown, private readonly opts: { now?: () => number; full?: boolean; retryKeys?: Iterable<string>; groupOf?: (key: string) => string } = {}) {
+  constructor(stored: unknown, private readonly opts: { now?: () => number; full?: boolean; retryKeys?: Iterable<string>; groupOf?: HoldGroupOf } = {}) {
     this.state = normalizeHolds(stored);
     // `sync --full` resets the holds by re-attempting every held item once: a success clears it; a
     // failure keeps it held (the cursor may already be past it, so demoting or forgetting the record
@@ -295,13 +304,16 @@ export class ItemHoldsRun {
     // The circuit breaker judges each group of keys against its own attempted items. The default is one group, so a
     // connector whose keys are one kind of item is unchanged; a connector mixing kinds (Apple Mail messages and
     // threads) names the groups so that one kind's successes cannot dilute another kind's outage.
-    const groupOf = this.opts.groupOf ?? ((): string => '');
+    const groupFn = this.opts.groupOf ?? ((): string => '');
+    const groupOf = (key: string): string | null => groupFn(key, this.state.items[key]?.state === 'held');
     const groups = new Map<string, { attempted: number; transient: number; byCode: Map<string, number> }>();
-    const group = (key: string) => { const g = groupOf(key); let entry = groups.get(g); if (!entry) groups.set(g, entry = { attempted: 0, transient: 0, byCode: new Map() }); return entry; };
-    for (const key of this.attempted) group(key).attempted++;
+    const group = (name: string) => { let entry = groups.get(name); if (!entry) groups.set(name, entry = { attempted: 0, transient: 0, byCode: new Map() }); return entry; };
+    for (const key of this.attempted) { const name = groupOf(key); if (name !== null) group(name).attempted++; }
     const failures = [...this.failures.entries()];
     for (const [key, failure] of failures) {
-      const entry = group(key);
+      const name = groupOf(key);
+      if (name === null) continue;
+      const entry = group(name);
       if (failure.classified.class === 'transient') entry.transient++;
       entry.byCode.set(failure.classified.code, (entry.byCode.get(failure.classified.code) ?? 0) + 1);
     }
@@ -311,8 +323,9 @@ export class ItemHoldsRun {
       if (g.attempted >= HOLD_BREAKER_MIN_ITEMS && (g.transient * 2 >= g.attempted || sameCode >= HOLD_BREAKER_MIN_ITEMS && sameCode * 2 >= g.attempted)) outageGroups.add(name);
     }
     const outage = outageGroups.size > 0;
-    // A group in outage counts no item failure; the other groups count theirs.
-    const counted = failures.filter(([key]) => !outageGroups.has(groupOf(key)));
+    // A group in outage counts no item failure; the other groups count theirs. An exempt (held re-attempt) failure counts
+    // unless some judged group is in outage this run.
+    const counted = failures.filter(([key]) => { const name = groupOf(key); return name === null ? !outage : !outageGroups.has(name); });
     const newlyHeld: string[] = [];
     let heldCount = Object.values(state.items).filter(record => record.state === 'held').length;
     let exhausted = false;

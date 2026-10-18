@@ -33,7 +33,7 @@ import { AppleReaderError } from './readers/errors.ts';
 import { parseAppleSourceConfig } from './source-config.ts';
 import { emptyAppleState, normalizeAppleState, readAppleState, writeAppleState } from './state.ts';
 import { appleLoopsAvailability } from './loops-status.ts';
-import { mailHoldGroup } from './mail-holds.ts';
+import { applyThreadRefs, mailHoldGroup } from './mail-holds.ts';
 import { enqueueAppleLoopsExtraction, newAppleLoopsRun, prepareLoopsState } from './loops.ts';
 import { sweepCalendar, sweepContacts, sweepMail, type AppleSweepCtx } from './sweep.ts';
 import {
@@ -241,6 +241,7 @@ async function runAppleSyncInner(
 
     // Throws connector_holds_exhausted before any save, so the cursor stays.
     state.item_holds = holds.finish();
+    if (ctx.mailRefs?.size) applyThreadRefs(state.item_holds, ctx.mailRefs);
     // Every cursor here is a content hash set only after its item landed, so a partial run's state is safe to
     // save: a denied or failing service leaves its own hashes untouched and cannot stall the services that
     // succeeded. Freshness moves when at least one service synced cleanly.

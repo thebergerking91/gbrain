@@ -35,8 +35,14 @@ export interface FakeMail {
   noById?: boolean;
   /** Return a budget-exhausted empty slice instead of reading. */
   budgetStop?: boolean;
+  /** The N-th (0-based, per `byId` call in this run's order) read by id fails with this error. */
+  failByIdAt?: { call: number; error: Error };
+  /** Called with the 0-based index of every read by id before it answers (e.g. to abort the run's signal). */
+  onById?: (call: number) => void;
+  /** Ids a read by id silently leaves unresolved: neither read, nor missing, nor unavailable (a truncated helper read). */
+  dropById: Set<string>;
 }
-export const fakeMail = (box: AppleMailMessage[] = []): FakeMail => ({ box, unreadable: new Set(), deferred: new Set(), main: [], byId: [] });
+export const fakeMail = (box: AppleMailMessage[] = []): FakeMail => ({ box, unreadable: new Set(), deferred: new Set(), main: [], byId: [], dropById: new Set() });
 const cmp = (a: AppleMailMessage, b: AppleMailMessage): number => a.date.localeCompare(b.date) || a.id.localeCompare(b.id);
 
 export function readersOf(f: FakeMail): AppleReaders {
@@ -65,11 +71,15 @@ export function readersOf(f: FakeMail): AppleReaders {
     },
     async probe() { return { ok: true as const }; },
     async mailMessages(opts) {
+      const call = f.byId.length;
       f.byId.push(opts.targets.map((t) => ({ ...t })));
+      f.onById?.(call);
       if (f.failById) throw f.failById;
-      const found = opts.targets.flatMap((t) => f.box.filter((m) => m.id === t.id));
+      if (f.failByIdAt && f.failByIdAt.call === call) throw f.failByIdAt.error;
+      const asked = opts.targets.filter((t) => !f.dropById.has(t.id));
+      const found = asked.flatMap((t) => f.box.filter((m) => m.id === t.id));
       const listing = verdict(found.sort(cmp));
-      return { ...listing, targetMissing: opts.targets.filter((t) => !f.box.some((m) => m.id === t.id)).map((t) => t.id) };
+      return { ...listing, targetMissing: asked.filter((t) => !f.box.some((m) => m.id === t.id)).map((t) => t.id) };
     },
   };
   if (f.noById) delete readers.mailMessages;

@@ -80,7 +80,9 @@ export function normalizeAppleState(parsed: unknown): AppleSourceState {
       ...(isRecord(mail.walk) && typeof mail.walk.key === 'string' && typeof mail.walk.since === 'string'
         && ['full', 'reread', 'incremental'].includes(String(mail.walk.purpose)) && Array.isArray(mail.walk.seen)
         ? { walk: { key: mail.walk.key, since: mail.walk.since, purpose: mail.walk.purpose as 'full' | 'reread' | 'incremental',
-          seen: mail.walk.seen.filter((x): x is string => typeof x === 'string') } } : {}),
+          seen: mail.walk.seen.filter((x): x is string => typeof x === 'string'),
+          ...(typeof mail.walk.recover === 'string' ? { recover: mail.walk.recover } : {}),
+          ...(Array.isArray(mail.walk.landed) ? { landed: mail.walk.landed.filter((x): x is string => typeof x === 'string') } : {}) } } : {}),
     },
     item_holds: isRecord(parsed.item_holds) ? parsed.item_holds : undefined,
     ...(loopsState(parsed.mail_loops) ? { mail_loops: loopsState(parsed.mail_loops)! } : {}),

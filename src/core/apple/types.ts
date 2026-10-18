@@ -236,7 +236,13 @@ export interface AppleSourceState {
     /** Stable message id at that timestamp, to paginate timestamp ties without repeating them. */
     resume_id?: string;
     /** Stable enumeration scope/purpose. A suffix cannot stand in for a different full/identity walk. */
-    walk?: { key: string; since: string; purpose: 'full' | 'reread' | 'incremental'; seen: string[] };
+    walk?: {
+      key: string; since: string; purpose: 'full' | 'reread' | 'incremental'; seen: string[];
+      /** A whole-window walk that also recovers held threads no remembered message list can rebuild (Mail hold recovery): when it began (ISO). */
+      recover?: string;
+      /** Such held threads whose page this walk has landed (cleared only when the walk completes), bounded by the hold cap. */
+      landed?: string[];
+    };
   };
   /** ItemHoldsState (connectors/item-holds.ts); opaque here so types.ts stays dependency-free. */
   item_holds: unknown;

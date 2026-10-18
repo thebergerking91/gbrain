@@ -48,7 +48,7 @@ import {
   type AppleSyncSummary,
 } from './sweep-shared.ts';
 import { beginMailWalk } from './mail-walk.ts';
-import { MAIL_THREAD_KEY, encodeThreadRef, planMailHolds, readMailHolds, settleReadMessages, threadHoldKey } from './mail-holds.ts';
+import { MAIL_THREAD_KEY, mergeThreadRef, parseThreadLocator, planMailHolds, readMailHolds, settleReadMessages, threadHoldKey } from './mail-holds.ts';
 import { appleLoopsAvailability } from './loops-status.ts';
 import { prepareLoopsState, trackMailLoops, type AppleLoopsRun } from './loops.ts';
 import type { AppleCalendarEvent, AppleContact, AppleMailListing, AppleSourceState } from './types.ts';
@@ -69,6 +69,10 @@ export interface AppleSweepCtx {
   pins?: number;
   /** Open-loop bookkeeping for this run; present only when Mail loop tracking is available (owner addresses set). */
   loops?: AppleLoopsRun;
+  /** Newest remembered-message locator per Mail thread hold; written into the finished holds (`applyThreadRefs`). */
+  mailRefs?: Map<string, string>;
+  /** Hold keys whose item failed this run (a failure is never cleared by a later settle in the same run). */
+  failedKeys?: Set<string>;
 }
 
 const byId = <T,>(key: (x: T) => string) => (a: T, b: T): number => {
@@ -87,6 +91,7 @@ interface FailDetail { ref?: string | null; upstreamAt?: string | null }
 async function failItem(ctx: AppleSweepCtx, holdKey: string, error: unknown, version: string | null, page: RenderedPage | null, detail: FailDetail = {}): Promise<void> {
   const { deps, summary, holds } = ctx;
   const wasHeld = holds.isHeld(holdKey);
+  (ctx.failedKeys ??= new Set()).add(holdKey);
   const classified = await holds.fail(holdKey, error, { version, slug: page ? page.relPath.replace(/\.md$/, '') : null,
     ...(detail.ref ? { ref: detail.ref } : {}), ...(detail.upstreamAt ? { meta: { upstream_at: detail.upstreamAt } } : {}) });
   summary.failedFiles++;
@@ -98,15 +103,20 @@ async function failItem(ctx: AppleSweepCtx, holdKey: string, error: unknown, ver
   }
 }
 
-/** One item through the holds. True when it was written. */
-async function attemptItem(ctx: AppleSweepCtx, holdKey: string, version: string, page: RenderedPage, work: () => Promise<void>, detail: FailDetail = {}): Promise<boolean> {
-  if (!ctx.holds.shouldAttempt(holdKey, version)) {
+/**
+ * One item through the holds. True when it was written. `admit` re-attempts a held item the holds would skip (a recovery
+ * walk is reading its whole thread now); `settle: false` writes the page but leaves the record for the caller to settle
+ * once the evidence is complete.
+ */
+async function attemptItem(ctx: AppleSweepCtx, holdKey: string, version: string, page: RenderedPage, work: () => Promise<void>, detail: FailDetail = {},
+  opts: { admit?: boolean; settle?: boolean } = {}): Promise<boolean> {
+  if (!ctx.holds.shouldAttempt(holdKey, version) && !opts.admit) {
     ctx.deps.tick(`${holdKey} held`);
     return false;
   }
   try {
     await work();
-    ctx.holds.succeed(holdKey);
+    if (opts.settle !== false) ctx.holds.succeed(holdKey);
     ctx.deps.tick(holdKey);
     return true;
   } catch (e) {
@@ -157,6 +167,7 @@ const signalOf = (ctx: AppleSweepCtx): { signal?: AbortSignal } => (ctx.deps.opt
 const aborted = (ctx: AppleSweepCtx): boolean => ctx.deps.opts.signal?.aborted === true;
 
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+const strList = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
 
 // ── Calendar ─────────────────────────────────────────────────────────────────
 
@@ -327,13 +338,16 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   const trackLoops = ctx.loops !== undefined && appleLoopsAvailability(deps.cfg).available;
   const rereadAll = trackLoops && prepareLoopsState(state, deps.cfg);
   const incrementalSince = mailReadSince(state, windowStart, false);
-  const walk = beginMailWalk(state, deps.cfg, windowStart, deps.opts.full === true, rereadAll, incrementalSince);
+  // Held messages are not read (they cost body time and would starve their neighbours); the ones that are due for a
+  // re-attempt (retry-held, a transient reconsideration, --full) are read again by id below, however old they are.
+  // A due hold no remembered list can rebuild (oversize thread, unusable locator) asks for a whole-window recovery walk.
+  const plan = planMailHolds(ctx.holds);
+  const walk = beginMailWalk(state, deps.cfg, windowStart, deps.opts.full === true, rereadAll, incrementalSince, plan.walk, new Date(deps.now()).toISOString());
+  // A full or recovery walk is the evidence that can rebuild a held oversize thread; a held thread is cleared only when it ends.
+  const recoveryWalk = walk.recover !== undefined;
   const since = new Date(Math.max(Date.parse(walk.since), Date.parse(state.mail.resume_from ?? '') - 1 || 0));
   const failedBefore = summary.failedFiles;
   const pinsBefore = ctx.pins ?? 0;
-  // Held messages are not read (they cost body time and would starve their neighbours); the ones that are due for a
-  // re-attempt (retry-held, a transient reconsideration, --full) are read again by id below, however old they are.
-  const plan = planMailHolds(ctx.holds);
   const read = await deps.readers.mail({ since, mailboxes: deps.cfg.mailMailboxes, max: deps.cfg.mailMax,
     ...(state.mail.resume_from && state.mail.resume_id ? { after: { date: state.mail.resume_from, id: state.mail.resume_id } } : {}),
     ...(plan.exclude.length > 0 ? { exclude: plan.exclude } : {}), ...signalOf(ctx) });
@@ -384,19 +398,43 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   const rendered = new Set<string>();
   const notLanded = new Set<string>();
   const landedSlug = new Map<string, string>();
+  // Held oversize threads this run rebuilt while a recovery walk is reading the whole window (settled only when it ends).
+  const walkLanded = new Set<string>();
   for (const thread of threads) {
     if (aborted(ctx)) return;
     const holdKey = threadHoldKey(thread.threadId);
-    // What a later re-attempt needs to rebuild this thread when it is no longer in the incremental listing.
-    const detail: FailDetail = { ref: encodeThreadRef(thread.messages), upstreamAt: thread.messages[thread.messages.length - 1]?.date ?? null };
+    const record = ctx.holds.holds.record(holdKey);
+    // What a later re-attempt needs to rebuild this thread when it is no longer in the incremental listing: everything the
+    // record remembers plus what this run lists (never just this run's slice, never a stale shorter list).
+    const ref = mergeThreadRef(record, thread.messages);
+    const detail: FailDetail = { ref, upstreamAt: thread.messages[thread.messages.length - 1]?.date ?? null };
+    let walkKind = false; // a held thread only a whole-window walk can rebuild: never settled at a landing
+    let walkBound = false; // ...and admitted by the walk now
+    if (record) {
+      (ctx.mailRefs ??= new Map()).set(holdKey, ref);
+      const locator = parseThreadLocator(record.ref);
+      // A thread with an outstanding import record is rebuilt only from COMPLETE evidence: every remembered message is
+      // listed, on the page already, read by id this run or gone upstream; an oversize thread needs the whole-window walk.
+      const have = new Set<string>([...thread.messages.map((m) => m.id), ...strList(frontmatterByThread.get(thread.threadId)?.apple_message_ids)]);
+      const complete = locator.walk ? record.state !== 'held' || recoveryWalk : locator.targets.every((t) => have.has(t.id) || holdRun.gone.has(t.id) || holdRun.unreadable.has(t.id));
+      if (!complete) {
+        live.add(thread.threadId);
+        notLanded.add(thread.threadId);
+        deps.log(`[apple] mail thread ${record.state === 'held' ? 'held' : 'failing'}: not every remembered message is available this run; it is not rebuilt from partial evidence`);
+        continue;
+      }
+      // Admitted once per walk: a rebuild that failed since the walk began waits for its backoff like any held retry.
+      walkKind = locator.walk && record.state === 'held';
+      walkBound = walkKind && Date.parse(record.last_failed_at) < Date.parse(walk.recover ?? '');
+    }
     const first = await safeRender(ctx, holdKey, () => renderMailThreadPage(thread, deps.cfg.account), detail);
     if (!first.ok) { live.add(thread.threadId); notLanded.add(thread.threadId); continue; }
     let page = first.value;
-    if (!page) continue; // automated mail renders nothing
+    if (!page) { if (walkKind) walkLanded.add(thread.threadId); continue; } // automated mail renders nothing
     live.add(thread.threadId);
     rendered.add(thread.threadId);
     const existing = pathByThread.get(thread.threadId);
-    if (state.mail.hashes[thread.threadId] === renderedHash(page.relPath, page.markdown) && existing === page.relPath) continue;
+    if (state.mail.hashes[thread.threadId] === renderedHash(page.relPath, page.markdown) && existing === page.relPath) { if (walkKind) walkLanded.add(thread.threadId); continue; }
     if (existing) {
       // The read window no longer lists the oldest messages of a long thread: carry them forward from the page.
       const stored = frontmatterByThread.get(thread.threadId) ?? {};
@@ -427,7 +465,7 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
     }
     const final = page;
     const hash = renderedHash(final.relPath, final.markdown);
-    if (state.mail.hashes[thread.threadId] === hash && existing === final.relPath) continue;
+    if (state.mail.hashes[thread.threadId] === hash && existing === final.relPath) { if (walkKind) walkLanded.add(thread.threadId); continue; }
     const landed = await attemptItem(ctx, holdKey, hash, final, async () => {
       const slug = await importRendered(deps, final.relPath, final.markdown, ctx.activePack, summary, ctx.countedSlugs,
         { apple_thread_id: thread.threadId, apple_message_ids: thread.messages.map((m) => m.id) });
@@ -435,10 +473,17 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
       if (existing && existing !== final.relPath) await deletePageByRelPath(deps, existing, summary);
       state.mail.hashes[thread.threadId] = hash;
       pathByThread.set(thread.threadId, final.relPath);
-    }, detail);
+    }, detail, { admit: walkBound, settle: !walkKind });
     if (!landed) notLanded.add(thread.threadId);
+    else if (walkKind) walkLanded.add(thread.threadId);
   }
   if (aborted(ctx)) return;
+  if (recoveryWalk) {
+    // The walk remembers which held threads it has rebuilt so far; one that failed or was not rebuilt this run is forgotten.
+    const landed = new Set([...(walk.landed ?? []), ...walkLanded]);
+    for (const id of notLanded) landed.delete(id);
+    walk.landed = [...landed].sort();
+  }
   // A message read again only clears its hold (or counts as a healthy attempt) when its thread's page landed.
   settleReadMessages(ctx.holds, holdRun, allMessages, notLanded);
   const blockedThreads = holdRun.blockedThreads();
@@ -503,6 +548,18 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   const landingPin = [...notLanded].some((id) => !ctx.holds.holds.isHeld(threadHoldKey(id)));
   const unresolved = !readable || holdRun.pin || (ctx.pins ?? 0) !== pinsBefore || landingPin
     || (!truncated && summary.incomplete.some(g => g.startsWith('mail:')));
+  if (recoveryWalk && !unresolved && !truncated) {
+    // The walk is complete: a held oversize thread it rebuilt (and that has not failed since) is recovered; one it never saw
+    // is gone upstream (or older than the window) and has nothing left to rebuild.
+    const landed = new Set(walk.landed ?? []);
+    for (const record of Object.values(ctx.holds.holds.initial().items)) {
+      if (record.state !== 'held' || !record.key.startsWith(MAIL_THREAD_KEY) || !parseThreadLocator(record.ref).walk) continue;
+      const id = record.key.slice(MAIL_THREAD_KEY.length);
+      if (ctx.failedKeys?.has(record.key) || notLanded.has(id)) continue;
+      if (landed.has(id)) ctx.holds.succeed(record.key);
+      else if (!live.has(id)) { ctx.holds.shouldAttempt(record.key); ctx.holds.drop(record.key); }
+    }
+  }
   if (!unresolved && truncated && messages.length > 0) {
     // Advance by a stable (date,id) key, not timestamp alone: Mail.app can have
     // hundreds of messages at one timestamp and its native filter is date-only.
