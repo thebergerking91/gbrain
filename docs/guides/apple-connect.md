@@ -199,7 +199,9 @@ gbrain apple loops --source apple-local --mail-owner-addresses me@example.com   
 - **Identity is explicit.** Direction comes only from `--mail-owner-addresses` (config `a_mail_owner_addresses`).
   The `--account` label is free text and the Sent mailbox is never read as identity (aliases, shared mailboxes).
   Without owner addresses Mail still imports, but loop tracking is **unavailable (`identity_missing`)**, and
-  `gbrain waiting` says so instead of "You are clean".
+  `gbrain waiting` says so instead of "You are clean". A source with Mail opted out is reported the same way
+  (`mail_disabled`): `waiting` never answers "clean", and never "connect Google", for a Mac whose Mail it is
+  not reading.
 - **No model call for tracking.** Unanswered-mail detection is deterministic and needs no consent.
 - **Extraction is a separate, second consent.** Commitment/decision extraction sends the text of Mail threads
   (sender, recipients, subject, plain-text body) to the chat provider configured for this brain, one call per

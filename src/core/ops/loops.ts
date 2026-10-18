@@ -110,7 +110,8 @@ interface AppleLoopsSourceView { id: string; available: boolean; reason?: string
 /**
  * Apple Mail sources in scope (config only, no Apple read). An available source (Mail on, owner addresses set)
  * carries freshness from the last COMPLETE Mail loop sweep; an unavailable one (identity_missing) is reported,
- * never counted as clean. Sources without Mail are not loop sources. Null when no Apple source is in scope, so
+ * never counted as clean. Sources without Mail are reported too (mail_disabled), so an Apple-only brain is
+ * never told "connect Google". Null when no Apple source is in scope, so
  * Google-only brains answer exactly as before. A read failure fails toward stale.
  */
 async function appleLoopsSources(
@@ -131,7 +132,10 @@ async function appleLoopsSources(
       const cfg = parseAppleSourceConfig(config, r.local_path ?? '');
       const a = appleLoopsAvailability(cfg);
       if (!a.available) {
-        if (a.reason === 'identity_missing') out.push({ id: r.id, available: false, reason: a.reason, last_sync_at: null, stale: true });
+        // Both reasons are reported, never dropped. Observed on a live Mac: a calendar+contacts-only Apple
+        // source was dropped here, `no_google_sources` flipped true and `waiting` told the user to run
+        // `gbrain google setup` — wrong advice for a Mac whose Mail gbrain is simply not reading.
+        out.push({ id: r.id, available: false, reason: a.reason, last_sync_at: null, stale: true });
         continue;
       }
       let state: Record<string, unknown> | null = null;
@@ -384,12 +388,18 @@ function renderNoCounterparty(lines: string[], none: NoCounterpartyLoops | null,
 
 function renderText(groups: CounterpartyGroup[], none: NoCounterpartyLoops | null, stale: boolean, noGoogleSources: boolean,
   coverage: { completeness: 'complete' | 'partial'; held: HeldItemView[]; appleIncomplete?: string[] }, nowMs: number,
-  partialStaleSources: string[], appleUnavailable: string[] = [], withApple = false): string {
+  partialStaleSources: string[], appleUnavailable: Array<{ id: string; reason?: string }> = [], withApple = false): string {
   const lines: string[] = [];
   const { held } = coverage;
-  if (appleUnavailable.length > 0) {
-    lines.push(`⚠ Apple Mail loop tracking is unavailable for ${appleUnavailable.join(', ')} (identity_missing): this is NOT "inbox clean". `
-      + `Set your addresses: gbrain apple loops --source ${appleUnavailable[0]} --mail-owner-addresses <you@example.com>.`);
+  const identityMissing = appleUnavailable.filter((x) => x.reason !== 'mail_disabled').map((x) => x.id);
+  const mailDisabled = appleUnavailable.filter((x) => x.reason === 'mail_disabled').map((x) => x.id);
+  if (identityMissing.length > 0) {
+    lines.push(`⚠ Apple Mail loop tracking is unavailable for ${identityMissing.join(', ')} (identity_missing): this is NOT "inbox clean". `
+      + `Set your addresses: gbrain apple loops --source ${identityMissing[0]} --mail-owner-addresses <you@example.com>.`);
+  }
+  if (mailDisabled.length > 0) {
+    lines.push(`⚠ Apple Mail loop tracking is unavailable for ${mailDisabled.join(', ')} (mail_disabled): Mail is not enabled on this source, so this is NOT "inbox clean". `
+      + `Enable it: gbrain sources set-services ${mailDisabled[0]} --add mail --confirm-mail, then gbrain apple loops --source ${mailDisabled[0]} --mail-owner-addresses <you@example.com>.`);
   }
   if (stale) lines.push(`⚠ ${withApple ? 'google and Apple Mail loop' : 'google'} sources have not synced recently — this may be out of date.`);
   else if (partialStaleSources.length > 0) {
@@ -667,7 +677,7 @@ const open_loops: Operation = {
       redacted: !trusted,
       as_of: new Date(nowMs).toISOString(),
       ...(trusted && loopId === undefined
-        ? { text: renderText(groups, noCounterparty, freshness.stale, noGoogleSources, coverage, nowMs, partialStaleSources, appleUnavailable.map((x) => x.id), appleAvailable.length > 0) }
+        ? { text: renderText(groups, noCounterparty, freshness.stale, noGoogleSources, coverage, nowMs, partialStaleSources, appleUnavailable, appleAvailable.length > 0) }
         : {}),
     };
   },

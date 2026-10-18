@@ -267,7 +267,7 @@ describe('apple loops — availability', () => {
     expect(res.text).not.toContain('No google source is connected');
   }));
 
-  test('mail not enabled: the mail reader is never called, no loop state is written, and the op ignores the source', () => withHome(async () => {
+  test('mail not enabled: the mail reader is never called, no loop state is written, and waiting reports mail_disabled (never "clean", never "connect Google")', () => withHome(async () => {
     const dir = newDir();
     const raw = await insertSource(dir, { a_services: 'contacts' });
     const f = fake([inbound('m-in', 'thr-in', 60)]);
@@ -276,10 +276,16 @@ describe('apple loops — availability', () => {
     expect(await loops()).toHaveLength(0);
     expect(readAppleState(dir).mail_loops).toBeUndefined();
     expect(r.loops_enqueue).toBeUndefined();
+    // Live-Mac regression: a calendar+contacts-only Apple source used to be dropped from the loop view, so an
+    // Apple-only brain was told "No google source is connected… gbrain google setup".
     const res = await waiting();
-    expect(res.apple_loops_unavailable).toBeUndefined();
+    expect(res.apple_loops_unavailable).toEqual([{ source_id: SID, reason: 'mail_disabled' }]);
     expect(res.sources).toEqual([]);
-    expect(res.no_google_sources).toBe(true);
+    expect(res.no_google_sources).toBe(false);
+    expect(res.text).toContain('mail_disabled');
+    expect(res.text).toContain('set-services');
+    expect(res.text).not.toContain('You are clean');
+    expect(res.text).not.toContain('No google source is connected');
   }));
 
   test('availability helper: mail + owners required; consent is separate', () => {
