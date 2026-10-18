@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import type { AppleMailListing } from '../types.ts';
 import type { AppleMailMessage } from '../types.ts';
 import { readerError } from './errors.ts';
-import { runHelperDocument } from './run-helper.ts';
+import { DEFAULT_HELPER_TIMEOUT_MS, runHelperDocument } from './run-helper.ts';
 import { str, strArray, withScriptArgs, type HelperOverrides } from './calendar.ts';
 
 /** Source-tree path of the helper (tests / `osacompile`). Runtime uses the embedded text. */
@@ -14,8 +14,13 @@ export const MAIL_BODY_CAP = 20000;
  * Wall-clock budget the helper gets for reading message bodies. Mail.app can take ~20 s to produce
  * `content` for one HTML newsletter (live-Mac observation), so the helper stops starting new body
  * batches after this and returns what it has as `truncated` + `budgetExhausted`; the sweep resumes
- * from the last message next run. Counted from helper start; with 3-message batches the worst case
- * (45 s + 3 × 20 s) stays under DEFAULT_HELPER_TIMEOUT_MS (120 s).
+ * from the last message next run. Counted from helper start. This is a SOFT limit; the helper is also told
+ * the real hard timeout (`--timeout-ms`) and starts a batch only if its projected end fits inside it, so a
+ * slow pre-phase shrinks or skips the body phase instead of overrunning the kill.
+ *
+ * Limitation (not a guarantee): the JXA helper cannot interrupt a synchronous Apple event, so a single
+ * event (accounts(), a listing, one `content` read) that is itself slower than the remaining time is only
+ * stopped by the hard kill (`helper_timeout`). The pre-phase is not budgeted.
  */
 export const MAIL_BODY_BUDGET_MS = 45_000;
 
@@ -52,7 +57,7 @@ export async function readMail(
     const args = [...scriptArgs, '--since', opts.since.toISOString(), '--mailboxes', opts.mailboxes.join(',')];
     if (opts.max !== undefined) args.push('--max', String(opts.max));
     if (opts.after) args.push('--after-date', opts.after.date, '--after-id', opts.after.id);
-    args.push('--budget-ms', String(MAIL_BODY_BUDGET_MS));
+    args.push('--budget-ms', String(MAIL_BODY_BUDGET_MS), '--timeout-ms', String(o.timeoutMs ?? DEFAULT_HELPER_TIMEOUT_MS));
     return runHelperDocument({ service: 'mail', command: o.command ?? OSASCRIPT_BIN, args, signal: opts.signal, timeoutMs: o.timeoutMs, maxStdoutBytes: o.maxStdoutBytes, platform: o.platform, env: o.env });
   });
   return {

@@ -885,6 +885,39 @@ describe('apple mail safe pagination', () => {
     expect(readAppleState(dir).mail.resume_from).toBeUndefined();
     expect(readAppleState(dir).mail.newest).toBeUndefined();
   }));
+
+  test('a budget-cut read that also has an unreadable thread does not advance the cursor past it, and is never complete', () => withHome(async () => {
+    const dir = newDir('mail-budget-unavailable');
+    await insertSource(dir);
+    const f = freshFake();
+    const oldest = [...f.mail].sort((a, b) => Date.parse(a.date) - Date.parse(b.date)).slice(0, 2);
+    f.mail = oldest;
+    f.mailFlags = { truncated: true, budgetExhausted: true, unavailableThreads: ['poison-thread'] };
+    const r = await sweep(dir, f, { full: true });
+    expect(r.status).toBe('partial');
+    expect(r.deleted).toBe(0);
+    const st = readAppleState(dir);
+    expect(st.mail.resume_from).toBeUndefined();
+    expect(st.mail.resume_id).toBeUndefined();
+    expect(st.mail.newest).toBeUndefined();
+  }));
+
+  test('a budget stop that read zero messages is partial, advances nothing and deletes nothing', () => withHome(async () => {
+    const dir = newDir('mail-budget-zero');
+    await insertSource(dir);
+    const f = freshFake();
+    await sweep(dir, f);
+    const before = readAppleState(dir);
+    const pages = (await slugs('emails/')).length;
+    f.mail = [];
+    f.mailFlags = { truncated: true, budgetExhausted: true };
+    const r = await sweep(dir, f, { full: true });
+    expect(r.status).toBe('partial');
+    expect(r.deleted).toBe(0);
+    expect(await slugs('emails/')).toHaveLength(pages);
+    expect(readAppleState(dir).mail.resume_from).toBeUndefined();
+    expect(readAppleState(dir).mail.newest).toBe(before.mail.newest);
+  }));
 });
 
 describe('apple sweep — recurring ids and render details', () => {

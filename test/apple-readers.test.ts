@@ -507,6 +507,225 @@ describe('mail listing document', () => {
     const messages = Array.isArray(listing) ? listing : listing.messages;
     expect(messages[0]!.subject).toContain('--max 7');
   });
+
+  test('the real helper timeout is passed to the helper as --timeout-ms (default and override)', async () => {
+    const script = join(dir, 'mail-timeout-args.js');
+    writeFileSync(script, `process.stdout.write(JSON.stringify({items:[{id:'m1',date:'2026-01-02T10:00:00Z',subject:process.argv.slice(2).join(' ')}]}))`);
+    const subjectOf = async (timeoutMs?: number) => {
+      const r = createAppleReaders({ command: process.execPath, scriptArgs: [script], platform: 'darwin', ...(timeoutMs ? { timeoutMs } : {}) });
+      const listing = await r.mail({ since: new Date(0), mailboxes: ['INBOX'] });
+      return (Array.isArray(listing) ? listing : listing.messages)[0]!.subject;
+    };
+    expect(await subjectOf()).toContain('--timeout-ms 120000');
+    expect(await subjectOf(90_000)).toContain('--timeout-ms 90000');
+  });
+});
+
+// ── Mail helper (real JXA run in a vm against a synthetic Mail.app; no Apple app, no private data) ──
+type FakeBox = { ids: number[]; dates: Record<number, Date> };
+type MailVmOpts = {
+  boxes: Record<string, FakeBox>;
+  bodyMs?: number; // fake clock cost of one body
+  accountsMs?: number; // fake clock spent before the body phase (accounts(), listing: the "pre-phase")
+  throwFor?: (ids: number[]) => boolean; // `content` throws for this id set
+  vanishAfterMeta?: Set<string>; // `${box}${id}` disappears once the metadata has been read
+  vanishBeforeMeta?: Set<string>; // disappears from the id-filtered selection before any property is read
+  shortBodies?: boolean; // content() returns one body fewer than ids
+  nullBodyFor?: Set<string>; // content() has null at that message
+  emptyBodyFor?: Set<string>; // content() has '' at that message (a genuinely empty body)
+  driftIdsOnContent?: boolean; // the id list changes while content() runs
+};
+const mailDates = (m: number) => new Date(Date.UTC(2026, 9, 10, 8, m));
+const MAIL_ARGV = ['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX,Sent', '--max', '500', '--budget-ms', '45000'];
+
+function makeMailVm(opts: MailVmOpts) {
+  const { readFileSync } = require('node:fs') as typeof import('node:fs');
+  const js = readFileSync(MAIL_SCRIPT, 'utf8');
+  const clock = { now: 1_000_000 };
+  class FakeDate extends Date { static override now(): number { return clock.now; } }
+  const contentCalls: number[][] = [];
+  let metaDone = false;
+  let driftNext = false;
+  const mboxes: Record<string, any> = {};
+  for (const [label, box] of Object.entries(opts.boxes)) {
+    const mb: any = { name: () => label, id: () => `${label}-example` };
+    mb.messages = { whose: (query: any) => {
+      let idx = [...box.ids];
+      const newerThan = query?.dateReceived?._greaterThan;
+      if (newerThan instanceof Date) idx = idx.filter((i) => box.dates[i]!.getTime() > newerThan.getTime());
+      let selection = false;
+      if (Array.isArray(query?._or)) {
+        selection = true;
+        const wanted = new Set(query._or.map((x: any) => x.id._equals));
+        idx = idx.filter((i) => wanted.has(i));
+        if (!metaDone) idx = idx.filter((i) => !opts.vanishBeforeMeta?.has(`${label}${i}`));
+        if (metaDone) idx = idx.filter((i) => !opts.vanishAfterMeta?.has(`${label}${i}`));
+      }
+      const rfc = (i: number) => `<${label}-${i}>`;
+      return {
+        id: () => { const out = [...idx]; if (selection && driftNext) { driftNext = false; return out.reverse(); } return out; },
+        messageId: () => idx.map(rfc), subject: () => idx.map((i) => `subject ${i}`), sender: () => idx.map(() => 'Alice Example <alice@example.com>'),
+        dateReceived: () => idx.map((i) => box.dates[i]),
+        readStatus: () => { if (selection) metaDone = true; return idx.map(() => true); },
+        allHeaders: () => idx.map((i) => `Message-ID: ${rfc(i)}`),
+        content: () => {
+          metaDone = true;
+          contentCalls.push([...idx]);
+          if (opts.throwFor?.(idx)) throw new Error('synthetic -1712');
+          clock.now += (opts.bodyMs ?? 20_000) * idx.length;
+          const out: any[] = idx.map((i) => (opts.nullBodyFor?.has(`${label}${i}`) ? null : opts.emptyBodyFor?.has(`${label}${i}`) ? '' : `body-${label}-${i}`));
+          if (opts.shortBodies) out.pop();
+          if (opts.driftIdsOnContent) driftNext = true;
+          return out;
+        },
+      };
+    } };
+    mboxes[label] = mb;
+  }
+  const mailApp: any = { running: () => true, accounts: () => { clock.now += opts.accountsMs ?? 0; return [{}]; }, inbox: mboxes.INBOX, sentMailbox: mboxes.Sent };
+  const invoke = (argv: string[]): any => {
+    let output = '';
+    const $: any = (value: string) => ({ dataUsingEncoding: () => value });
+    $.NSUTF8StringEncoding = 1;
+    $.NSFileHandle = { fileHandleWithStandardOutput: { writeData: (v: string) => { output = v; } } };
+    let exitCode = 0;
+    $.exit = (code: number) => { exitCode = code; };
+    const sandbox = { ObjC: { import() {} }, $, Application: () => mailApp, console, Date: FakeDate };
+    try { runInNewContext(`${js}\nrun(${JSON.stringify(argv)});`, sandbox); } catch (e) { if (!(e as { code?: number }).code) throw e; }
+    expect(exitCode).toBe(0);
+    return JSON.parse(output);
+  };
+  return { invoke, contentCalls, clock };
+}
+const ids6 = (extra: Partial<MailVmOpts> = {}) => makeMailVm({
+  bodyMs: 100,
+  boxes: { INBOX: { ids: [0, 1, 2, 3, 4, 5], dates: Object.fromEntries([0, 1, 2, 3, 4, 5].map((i) => [i, mailDates(i)])) }, Sent: { ids: [], dates: {} } },
+  ...extra,
+});
+const idsOf = (doc: any): string[] => doc.items.map((m: { id: string }) => m.id);
+
+describe('mail.js bounded body reads (real helper in a vm, synthetic mailbox)', () => {
+  test('interleaved INBOX/Sent drain in strict (date,id) order across budget-limited runs without skips or repeats', () => {
+    const t = makeMailVm({ boxes: {
+      INBOX: { ids: [0, 1, 2, 3], dates: { 0: mailDates(0), 1: mailDates(2), 2: mailDates(4), 3: mailDates(6) } },
+      Sent: { ids: [10, 11, 12, 13], dates: { 10: mailDates(1), 11: mailDates(3), 12: mailDates(5), 13: mailDates(7) } },
+    } });
+    const seen: string[] = [];
+    let argv = [...MAIL_ARGV];
+    for (let run = 0; run < 6; run++) {
+      const doc = t.invoke(argv);
+      expect(doc.incomplete).toBe(false);
+      expect(doc.unavailable).toEqual([]);
+      seen.push(...idsOf(doc));
+      if (!doc.truncated) break;
+      expect(doc.budget_exhausted).toBe(true);
+      const last = doc.items.at(-1)!;
+      argv = [...MAIL_ARGV, '--after-date', last.date, '--after-id', last.id];
+    }
+    expect(seen).toEqual(['<INBOX-0>', '<Sent-10>', '<INBOX-1>', '<Sent-11>', '<INBOX-2>', '<Sent-12>', '<INBOX-3>', '<Sent-13>']);
+  });
+
+  test('a poison batch no longer hides its healthy neighbours: they are retried singly and only the unreadable thread is unavailable', () => {
+    const t = ids6({ throwFor: (ids) => ids.includes(1) });
+    const doc = t.invoke(MAIL_ARGV);
+    expect(idsOf(doc)).toEqual(['<INBOX-0>', '<INBOX-2>', '<INBOX-3>', '<INBOX-4>', '<INBOX-5>']);
+    expect(doc.unavailable).toEqual(['<INBOX-1>']);
+    expect(doc.incomplete).toBe(false);
+    expect(doc.truncated).toBe(false);
+    expect(t.contentCalls).toContainEqual([1]); // the poison message was tried alone
+  });
+
+  test('individual retries stay inside the budget: when time runs out the unretried messages are unavailable, never silently dropped', () => {
+    // 50 s per body: the 3-batch throws instantly, retry of #0 costs 50 s, then the 45 s soft budget is spent.
+    const t = ids6({ bodyMs: 50_000, throwFor: (ids) => ids.length > 1 });
+    const doc = t.invoke(MAIL_ARGV);
+    expect(idsOf(doc)).toEqual(['<INBOX-0>']);
+    expect(doc.unavailable.sort()).toEqual(['<INBOX-1>', '<INBOX-2>']);
+    expect(doc.budget_exhausted).toBe(true);
+    expect(doc.truncated).toBe(true);
+    expect(t.contentCalls.map((c) => c.length)).toEqual([3, 1]);
+  });
+
+  test('a missing (null) body is unavailable, not an empty body; an empty string is a real empty body', () => {
+    const t = ids6({ nullBodyFor: new Set(['INBOX1']), emptyBodyFor: new Set(['INBOX4']) });
+    const doc = t.invoke(MAIL_ARGV);
+    expect(idsOf(doc)).not.toContain('<INBOX-1>');
+    expect(doc.unavailable).toEqual(['<INBOX-1>']);
+    expect(doc.items.find((m: { id: string }) => m.id === '<INBOX-4>').body).toBe('');
+    expect(doc.items.filter((m: { body: string }) => m.body !== '' ).every((m: { id: string; body: string }) => m.body === `body-INBOX-${m.id.match(/-(\d+)>/)![1]}`)).toBe(true);
+  });
+
+  test('a short bodies array is never read positionally: nothing becomes an empty body and every thread stays unavailable', () => {
+    const t = makeMailVm({ bodyMs: 100, shortBodies: true, boxes: { INBOX: { ids: [0, 1, 2], dates: { 0: mailDates(0), 1: mailDates(1), 2: mailDates(2) } }, Sent: { ids: [], dates: {} } } });
+    const doc = t.invoke(MAIL_ARGV);
+    expect(doc.items).toEqual([]);
+    expect(doc.unavailable.sort()).toEqual(['<INBOX-0>', '<INBOX-1>', '<INBOX-2>']);
+  });
+
+  test('id list that shifts while content() runs is rejected as an id/body association drift, then re-read singly', () => {
+    const t = ids6({ driftIdsOnContent: true });
+    const doc = t.invoke(MAIL_ARGV);
+    // The drifting read is discarded; single-message re-reads (reverse of one id is itself) are consistent.
+    expect(idsOf(doc)).toEqual(['<INBOX-0>', '<INBOX-1>', '<INBOX-2>', '<INBOX-3>', '<INBOX-4>', '<INBOX-5>']);
+    expect(t.contentCalls.some((c) => c.length === 1)).toBe(true);
+    for (const m of doc.items) expect(m.body).toBe(`body-INBOX-${m.id.match(/-(\d+)>/)[1]}`);
+  });
+
+  test('an id that disappears between the metadata and body reads keeps its thread unavailable (the cursor must not skip it)', () => {
+    const t = ids6({ vanishAfterMeta: new Set(['INBOX1']) });
+    const doc = t.invoke(MAIL_ARGV);
+    expect(idsOf(doc)).toEqual(['<INBOX-0>', '<INBOX-2>', '<INBOX-3>', '<INBOX-4>', '<INBOX-5>']);
+    expect(doc.unavailable).toEqual(['<INBOX-1>']);
+  });
+
+  test('an id that disappears before its metadata is read makes the run incomplete (thread unknown)', () => {
+    const t = ids6({ vanishBeforeMeta: new Set(['INBOX2']) });
+    const doc = t.invoke(MAIL_ARGV);
+    expect(idsOf(doc)).not.toContain('<INBOX-2>');
+    expect(doc.incomplete).toBe(true);
+  });
+
+  test('slow pre-phase: the body phase is sized to the real helper timeout, not the soft budget alone', () => {
+    // 70 s spent in accounts() before any body read; 20 s per body; default 120 s hard timeout.
+    const t = ids6({ bodyMs: 20_000, accountsMs: 70_000 });
+    const t0 = t.clock.now;
+    const doc = t.invoke(MAIL_ARGV);
+    expect((t.clock.now - t0) / 1000).toBeLessThanOrEqual(110); // 120 s timeout - 10 s reserve
+    expect(doc.items.length).toBe(2); // a batch of 3 would end at 130 s; 2 end at 110 s
+    expect(doc.truncated).toBe(true);
+    expect(doc.budget_exhausted).toBe(true);
+  });
+
+  test('pre-phase so slow that no body read fits: nothing is started, nothing is claimed complete', () => {
+    const t = ids6({ bodyMs: 20_000, accountsMs: 100_000 });
+    const t0 = t.clock.now;
+    const doc = t.invoke(MAIL_ARGV);
+    expect(t.contentCalls).toEqual([]);
+    expect(t.clock.now - t0).toBe(100_000);
+    expect(doc.items).toEqual([]);
+    expect(doc.truncated).toBe(true);
+    expect(doc.budget_exhausted).toBe(true);
+  });
+
+  test('--timeout-ms is the hard limit the helper plans against: a 60 s caller never has a body read projected past 50 s', () => {
+    const t = ids6({ bodyMs: 20_000 });
+    const t0 = t.clock.now;
+    const doc = t.invoke([...MAIL_ARGV, '--timeout-ms', '60000']);
+    expect((t.clock.now - t0) / 1000).toBeLessThanOrEqual(50); // 60 s timeout - 10 s reserve
+    expect(doc.items.length).toBeGreaterThanOrEqual(1);
+    expect(doc.items.length).toBeLessThan(6);
+    expect(doc.truncated).toBe(true);
+  });
+
+  test('the slowest body seen so far raises the projected cost of the next batch', () => {
+    // Batch 1 projects 3 x 20 s (the floor) = 60 s and fits; it really costs 3 x 30 s = 90 s.
+    const t = ids6({ bodyMs: 30_000 });
+    const doc = t.invoke([...MAIL_ARGV, '--budget-ms', '300000']);
+    // After batch 1 (ends at 90 s) a second batch would project 3 x 30 s = 90 s -> 180 s > 110 s: stop.
+    expect(doc.items).toHaveLength(3);
+    expect(doc.budget_exhausted).toBe(true);
+    expect(t.contentCalls).toHaveLength(1);
+  });
 });
 
 describe('helper scripts: source-level guards (static; the scripts are not run here)', () => {

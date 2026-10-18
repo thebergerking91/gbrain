@@ -176,7 +176,17 @@ before the newest one already seen are read (`--full` re-reads the whole
 a 45-second budget, because Mail.app can take 20 seconds to produce the plain text of one HTML
 newsletter (seen on a real Mac): when the budget runs out the run is `partial`, keeps what it read
 (oldest first) and the next `gbrain sync` continues from there, so a slow mailbox drains over a few
-runs instead of timing out. A paginated walk freezes its starting window and
+runs instead of timing out. The helper plans against the real 120-second helper timeout, not just the
+45-second budget: a batch only starts if its projected end (20 seconds per body, or the slowest body seen
+so far) fits, so a slow Mail start-up shrinks or skips the body reads instead of overrunning. This is a
+soft plan, not a guarantee: macOS runs each Mail scripting call synchronously and it cannot be interrupted,
+so one single call that is itself slower than the time left (or a slow start-up before any body is read)
+is only stopped by the hard `helper_timeout` kill. If one batch cannot be read, its messages are retried
+one by one while time allows; a message that still cannot be read (or whose body comes back missing, or
+that vanishes mid-read) keeps its thread unavailable and the cursor does not move past it, so it is
+retried next run, never imported as an empty body. A message that stays unreadable pins the cursor at
+its position (the reader reports `mail:unavailable_threads` every run); skipping such a message needs an
+explicit quarantine decision that this guide does not make for you. A paginated walk freezes its starting window and
 records its purpose, scope/owner digest and the union of seen thread ids in
 `mail.walk`. Full reconciliation waits for the **entire** full walk, never just
 its final suffix. A new full walk or changed identity discards an incompatible

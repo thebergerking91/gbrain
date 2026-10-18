@@ -2,7 +2,7 @@
 //
 // Usage (run by src/core/apple/readers/mail.ts, never from user input):
 //   osascript -l JavaScript mail.js --probe
-//   osascript -l JavaScript mail.js --since <ISO8601> --mailboxes INBOX,Sent [--max 500] [--budget-ms 45000]
+//   osascript -l JavaScript mail.js --since <ISO8601> --mailboxes INBOX,Sent [--max 500] [--budget-ms 45000] [--timeout-ms 120000]
 //
 // Protocol: prints exactly ONE JSON document on stdout.
 //   success: {"items":[AppleMailMessage...], "truncated":bool, "budget_exhausted":bool, "unavailable":[threadId...], "incomplete":bool}  exit 0
@@ -20,6 +20,23 @@
 // (--budget-ms, default 45 s, counted from process start). When the budget runs out the messages read so far (the oldest, in
 // (date,id) order) are returned with truncated:true and budget_exhausted:true; the caller resumes
 // from the last one on its next run, so a slow mailbox drains over several runs instead of timing out.
+//
+// Time accounting. --budget-ms is a SOFT limit: no further body batch starts after it. --timeout-ms is the
+// caller's HARD helper timeout (the process is killed at it); a batch only starts when its projected end
+// (now + messages x max(BODY_COST_FLOOR_MS, slowest per-message cost seen so far)) fits inside
+// timeout - reserve, so a slow pre-phase (accounts(), listing, metadata) shrinks or skips the body phase
+// instead of overrunning the kill. When nothing fits, the helper returns what it has, truncated + budget_exhausted.
+// KNOWN LIMIT, not a guarantee: JXA runs each Apple event synchronously and cannot be interrupted, so the
+// clock is only consulted BETWEEN events. One event (accounts(), a `whose` listing, one `content` read) that
+// itself outlasts the remaining time cannot be stopped from inside the script; the caller's hard kill
+// (helper_timeout) remains the only backstop for that, and the pre-phase is not budgeted at all.
+//
+// Failure handling. A batch whose bulk body read throws is retried one message at a time, only while the
+// budget allows, so one unreadable message no longer hides its healthy neighbours. Anything left unresolved
+// (still throwing, not retried for lack of time, vanished between the metadata and body reads, body missing
+// or not a string, ids/bodies arrays that do not line up) is reported as `unavailable` (its thread) or, when
+// its thread is unknown, `incomplete`; the caller then keeps its cursor and removes nothing. A short, null
+// or non-string body is NEVER turned into an empty body.
 // Read-only: only property reads and `whose` filters are used. Nothing is sent, moved,
 // flagged, marked read, or deleted. Attachments are never touched (no `mailAttachments`
 // access, no save). Bodies come from `content` (plain text) and are capped at BODY_CAP chars.
@@ -35,6 +52,11 @@ var DEFAULT_BUDGET_MS = 45000;
 // Messages per body batch: one slow HTML body is ~20 s, so even a batch of all-slow messages started at
 // the budget's edge (45 s + 3 × 20 s) finishes inside the caller's 120 s helper timeout.
 var BODY_BATCH = 3;
+var DEFAULT_TIMEOUT_MS = 120000;
+// Assumed worst per-message `content` cost until a slower one is observed (live Mac: ~20 s per HTML newsletter).
+var BODY_COST_FLOOR_MS = 20000;
+// Left for output and exit; scaled down for very small --timeout-ms.
+var SAFETY_RESERVE_MS = 10000;
 
 function emit(doc, code) {
   var s = JSON.stringify(doc) + '\n';
@@ -58,12 +80,12 @@ function classify(e) {
 }
 
 function parseArgs(argv) {
-  var out = { probe: false, since: null, mailboxes: [], max: DEFAULT_MAX, afterDate: null, afterId: null, budgetMs: DEFAULT_BUDGET_MS };
+  var out = { probe: false, since: null, mailboxes: [], max: DEFAULT_MAX, afterDate: null, afterId: null, budgetMs: DEFAULT_BUDGET_MS, timeoutMs: DEFAULT_TIMEOUT_MS };
   for (var i = 0; i < argv.length; i++) {
     var a = String(argv[i]);
     if (a === '--') continue;
     if (a === '--probe') { out.probe = true; continue; }
-    if (a === '--since' || a === '--mailboxes' || a === '--max' || a === '--after-date' || a === '--after-id' || a === '--budget-ms') {
+    if (a === '--since' || a === '--mailboxes' || a === '--max' || a === '--after-date' || a === '--after-id' || a === '--budget-ms' || a === '--timeout-ms') {
       if (i + 1 >= argv.length) fail('helper_failed', 'missing value for ' + a, 2);
       var v = String(argv[++i]);
       if (a === '--since') out.since = v;
@@ -78,6 +100,11 @@ function parseArgs(argv) {
         var b = parseInt(v, 10);
         if (!(b >= 1)) fail('helper_failed', '--budget-ms must be a positive integer', 2);
         out.budgetMs = b;
+      }
+      else if (a === '--timeout-ms') {
+        var t = parseInt(v, 10);
+        if (!(t >= 1)) fail('helper_failed', '--timeout-ms must be a positive integer', 2);
+        out.timeoutMs = t;
       }
       else out.mailboxes = v.split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
       continue;
@@ -197,6 +224,9 @@ function idClauses(appIds) {
 
 // Metadata (everything but the body) for the selected messages of one mailbox, in bulk: one Apple
 // event per property. Cheap even for hundreds of messages. Keyed by the Apple message id.
+// The property arrays are positional, so they are trusted only when every one lines up with `ids` and the
+// id list is unchanged after the reads; otherwise nothing from this mailbox is used (the selected messages
+// then have no metadata and are reported incomplete by flagUnresolved, never guessed).
 function readMeta(entry, appIds, metaByKey, state) {
   if (appIds.length === 0) return;
   var spec = entry.mb.messages.whose(idClauses(appIds));
@@ -207,8 +237,15 @@ function readMeta(entry, appIds, metaByKey, state) {
   var dates = spec.dateReceived();
   var reads = spec.readStatus();
   var heads = spec.allHeaders();
+  var idsAfter = spec.id();
+  if (!sameIds(ids, idsAfter)) return;
+  var cols = [rfcIds, subjects, senders, dates, reads, heads];
+  for (var c = 0; c < cols.length; c++) {
+    if (!Array.isArray(cols[c]) || cols[c].length !== ids.length) return;
+  }
   for (var i = 0; i < ids.length; i++) {
     var threadId = '';
+    var key = entry.label + '|' + ids[i];
     try {
       var headers = String(heads[i] || '');
       var id = stableMessageId(entry.label, ids[i], rfcIds[i], headers);
@@ -216,7 +253,7 @@ function readMeta(entry, appIds, metaByKey, state) {
       var irt = firstMsgId(headerValue(headers, 'In-Reply-To'));
       var subject = String(subjects[i] || '');
       threadId = ref || irt || firstMsgId(String(rfcIds[i] || '')) || ('subject:' + normSubject(subject));
-      metaByKey[entry.label + '|' + ids[i]] = {
+      metaByKey[key] = {
         id: id,
         threadId: threadId,
         mailbox: entry.label,
@@ -230,61 +267,148 @@ function readMeta(entry, appIds, metaByKey, state) {
         bulk: automationFlags(headers).bulk
       };
     } catch (e) {
+      state.metaHandled[key] = true;
       if (threadId) state.unavailable[threadId] = true;
       else state.incomplete = true;
     }
   }
 }
 
-// Bodies for one small batch of one mailbox's messages (one `content` Apple event for the batch).
+function sameIds(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  for (var i = 0; i < a.length; i++) if (String(a[i]) !== String(b[i])) return false;
+  return true;
+}
+
+// Bodies for one batch of one mailbox's messages (one `content` Apple event for the batch).
+// Returns false when the batch could not be read AS A BATCH (the call threw, or the ids/bodies arrays are not
+// trustworthy): nothing from it is used and the caller may retry the messages singly. Returns true when the
+// reply was consistent; messages it did not return (vanished) or returned without a string body are left
+// unresolved, or marked unavailable, individually. Resolved messages are recorded in state.resolved.
 function readBodies(entry, appIds, metaByKey, items, seenIds, state) {
-  if (appIds.length === 0) return;
+  if (appIds.length === 0) return true;
   var spec = entry.mb.messages.whose(idClauses(appIds));
-  var ids = spec.id();
-  var bodies;
+  var ids, bodies, idsAfter;
   try {
+    ids = spec.id();
     bodies = spec.content();
+    idsAfter = spec.id();
   } catch (eb) {
-    // One unreadable body fails the whole bulk call: the batch's threads stay "unavailable" (present,
-    // never deleted, re-read next run) instead of failing the run.
-    for (var j = 0; j < ids.length; j++) {
-      var m = metaByKey[entry.label + '|' + ids[j]];
-      if (m) state.unavailable[m.threadId] = true;
-    }
-    return;
+    return false;
+  }
+  // ids, bodies and the re-read ids must line up one to one, and every id must be one we asked for: the
+  // body of message i is trusted only if it demonstrably belongs to ids[i].
+  if (!sameIds(ids, idsAfter) || !Array.isArray(bodies) || bodies.length !== ids.length) return false;
+  var asked = {};
+  appIds.forEach(function (x) { asked[String(x)] = true; });
+  var got = {};
+  for (var q = 0; q < ids.length; q++) {
+    if (!asked[String(ids[q])] || got[String(ids[q])]) return false;
+    got[String(ids[q])] = true;
   }
   for (var i = 0; i < ids.length; i++) {
-    var meta = metaByKey[entry.label + '|' + ids[i]];
-    if (!meta) continue; // its metadata read already failed and was recorded
+    var key = entry.label + '|' + ids[i];
+    var meta = metaByKey[key];
+    if (!meta) continue; // no usable metadata: flagUnresolved reports it
     try {
-      if (seenIds[meta.id]) continue;
-      var body = String(bodies[i] || '');
+      if (typeof bodies[i] !== 'string') {
+        // Missing / null body: unreadable, not empty. Keep the thread unavailable and re-read it next run.
+        state.unavailable[meta.threadId] = true;
+        state.resolved[key] = true;
+        continue;
+      }
+      if (seenIds[meta.id]) { state.resolved[key] = true; continue; }
+      var body = bodies[i];
       if (body.length > BODY_CAP) body = body.slice(0, BODY_CAP);
       var item = {};
       for (var k in meta) item[k] = meta[k];
       item.body = body;
       items.push(item);
       seenIds[meta.id] = true;
+      state.resolved[key] = true;
     } catch (e) {
       state.unavailable[meta.threadId] = true;
+      state.resolved[key] = true;
     }
   }
+  return true;
 }
 
-// Bodies for the selected candidates, oldest first, in batches of BODY_BATCH, until the budget is spent.
+// Worst plausible cost of reading `n` more bodies, from the slowest per-message cost seen so far.
+function projectedCost(n, clock) {
+  return n * Math.max(BODY_COST_FLOOR_MS, clock.perMessageMs);
+}
+
+// May a read of `n` messages start now? The hard deadline always applies; the soft budget applies unless
+// this is the first read of the run (so a run that can still fit one makes progress).
+function mayStart(n, clock, first) {
+  var now = Date.now();
+  if (now + projectedCost(n, clock) > clock.hardDeadline) return false;
+  return first || now - clock.startedAt <= clock.budgetMs;
+}
+
+// Largest batch (<= BODY_BATCH) that may start now; 0 when none may.
+function nextBatchSize(remaining, clock, first) {
+  for (var n = Math.min(BODY_BATCH, remaining); n >= 1; n--) {
+    if (mayStart(n, clock, first)) return n;
+  }
+  return 0;
+}
+
+function groupByEntry(batch) {
+  var byEntry = new Map();
+  batch.forEach(function (c) {
+    if (!byEntry.has(c.entry)) byEntry.set(c.entry, []);
+    byEntry.get(c.entry).push(c);
+  });
+  return byEntry;
+}
+
+// Bodies for the selected candidates, oldest first, in batches of up to BODY_BATCH, while time allows.
+// A batch that cannot be read as a batch is retried one message at a time, again only while time allows.
 // Returns true when it stopped early (the remaining candidates are left for the next run).
-function readSelectedBodies(selected, metaByKey, items, seenIds, state, startedAt, budgetMs) {
-  for (var i = 0; i < selected.length; i += BODY_BATCH) {
-    if (i > 0 && Date.now() - startedAt > budgetMs) return true;
-    var batch = selected.slice(i, i + BODY_BATCH);
-    var byEntry = new Map();
-    batch.forEach(function (c) {
-      if (!byEntry.has(c.entry)) byEntry.set(c.entry, []);
-      byEntry.get(c.entry).push(c.appId);
+function readSelectedBodies(selected, metaByKey, items, seenIds, state, clock) {
+  var i = 0;
+  var first = true;
+  while (i < selected.length) {
+    var n = nextBatchSize(selected.length - i, clock, first);
+    if (n < 1) return true;
+    first = false;
+    var batch = selected.slice(i, i + n);
+    i += n;
+    var t0 = Date.now();
+    batch.forEach(function (c) { state.attempted[c.entry.label + '|' + c.appId] = true; });
+    var failed = [];
+    groupByEntry(batch).forEach(function (cands, entry) {
+      var appIds = cands.map(function (c) { return c.appId; });
+      // A group that was already a single read and failed is genuinely unreadable: no point re-reading it.
+      if (!readBodies(entry, appIds, metaByKey, items, seenIds, state) && cands.length > 1) failed = failed.concat(cands);
     });
-    byEntry.forEach(function (appIds, entry) { readBodies(entry, appIds, metaByKey, items, seenIds, state); });
+    clock.perMessageMs = Math.max(clock.perMessageMs, (Date.now() - t0) / batch.length);
+    for (var f = 0; f < failed.length; f++) {
+      if (!mayStart(1, clock, false)) return true; // the rest stay unresolved -> unavailable
+      var t1 = Date.now();
+      readBodies(failed[f].entry, [failed[f].appId], metaByKey, items, seenIds, state);
+      clock.perMessageMs = Math.max(clock.perMessageMs, Date.now() - t1);
+    }
   }
   return false;
+}
+
+// Every selected message that was attempted but did not get an item or an explicit verdict (still throwing,
+// not retried in time, vanished before the body read) must keep its thread unavailable; with no metadata its
+// thread is unknown, so the run is incomplete. Messages never attempted (time ran out first) are simply
+// beyond the truncated listing. Metadata-less selected messages are incomplete whether attempted or not.
+function flagUnresolved(selected, metaByKey, state) {
+  selected.forEach(function (c) {
+    var key = c.entry.label + '|' + c.appId;
+    var meta = metaByKey[key];
+    if (!meta) {
+      if (!state.metaHandled[key]) state.incomplete = true;
+      return;
+    }
+    if (state.attempted[key] && !state.resolved[key]) state.unavailable[meta.threadId] = true;
+  });
 }
 
 function run(argv) {
@@ -292,6 +416,8 @@ function run(argv) {
   // The budget counts from here: a slow `accounts()` (24 s seen on a live Mac) eats into it, so the
   // body batches that follow still finish inside the caller's helper timeout.
   var startedAt = Date.now();
+  var reserveMs = Math.min(SAFETY_RESERVE_MS, Math.floor(args.timeoutMs / 4));
+  var clock = { startedAt: startedAt, budgetMs: args.budgetMs, hardDeadline: startedAt + args.timeoutMs - reserveMs, perMessageMs: 0 };
 
   var Mail;
   try {
@@ -316,7 +442,7 @@ function run(argv) {
   if (args.mailboxes.length === 0) fail('helper_failed', '--mailboxes is required', 2);
 
   var items = [];
-  var state = { unavailable: {}, incomplete: false };
+  var state = { unavailable: {}, incomplete: false, metaHandled: {}, attempted: {}, resolved: {} };
   var truncated = false;
   var budgetExhausted = false;
   try {
@@ -339,7 +465,8 @@ function run(argv) {
     var metaByKey = {};
     entries.forEach(function (entry) { readMeta(entry, selectedByEntry.get(entry) || [], metaByKey, state); });
     var seenIds = {};
-    budgetExhausted = readSelectedBodies(selected, metaByKey, items, seenIds, state, startedAt, args.budgetMs);
+    budgetExhausted = readSelectedBodies(selected, metaByKey, items, seenIds, state, clock);
+    flagUnresolved(selected, metaByKey, state);
     if (budgetExhausted) truncated = true;
   } catch (e2) {
     var c2 = classify(e2);
