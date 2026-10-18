@@ -112,7 +112,9 @@ behavior and have not been verified against a live prompt on every macOS version
 | Mail | System Settings > Privacy & Security > **Automation** | the "Mail" switch under the app that runs gbrain |
 
 If the app is not listed, run the command once from that app in an interactive
-session so macOS can prompt. **Unattended runs (autopilot, a daemon, cron) cannot
+session so macOS can prompt. "Interactive" means stdin and stdout are the
+terminal: piping setup through `tee` or capturing its output makes gbrain treat
+the run as unattended and it will not ask macOS (pass `--yes` to ask anyway). **Unattended runs (autopilot, a daemon, cron) cannot
 show those prompts**: grant each service by running `gbrain apple setup` or
 `gbrain sync --source <id>` once from a terminal on the Mac, then unattended
 syncs work. A denial recorded by a sync is stored with the source's state, so

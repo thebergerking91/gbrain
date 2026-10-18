@@ -133,9 +133,13 @@ const isCancelled = (status: string | undefined): boolean => /^cancel+ed$/i.test
 export function renderCalendarEventPage(ev: AppleCalendarEvent, account: string): RenderedPage | null {
   if (isCancelled(ev.status)) return null;
   const title = titleText(ev.title) || '(untitled event)';
+  // EventKit returns attendees in no stable order (observed on a live Mac: the same event listed
+  // them differently on consecutive syncs, so the hash-diff rewrote unchanged pages every run).
+  // Sort them so the rendered bytes depend only on the event's content.
   const attendees = ev.attendees
     .map((a) => ({ name: (a.name ?? '').trim(), email: (a.email ?? '').trim() }))
-    .filter((a) => a.name.length > 0 || a.email.length > 0);
+    .filter((a) => a.name.length > 0 || a.email.length > 0)
+    .sort((a, b) => (a.email || a.name).localeCompare(b.email || b.name) || a.name.localeCompare(b.name));
   const fm: string[] = [
     '---',
     'type: meeting',

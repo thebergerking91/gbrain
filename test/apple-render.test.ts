@@ -84,6 +84,20 @@ describe('calendar render', () => {
     expect(renderedHash(a.relPath, a.markdown)).not.toBe(renderedHash(a.relPath, a.markdown + ' '));
   });
 
+  test('attendee order from EventKit does not change the rendered bytes (live-Mac churn)', () => {
+    // Observed on a real Mac: EventKit listed the same event's attendees in a different order on
+    // consecutive syncs, so the hash-diff rewrote unchanged pages every run. Render must sort.
+    const ev = events[0];
+    expect(ev.attendees.length).toBeGreaterThan(1);
+    const reversed = { ...ev, attendees: [...ev.attendees].reverse() };
+    const a = renderCalendarEventPage(ev, 'local')!;
+    const b = renderCalendarEventPage(reversed, 'local')!;
+    expect(b.markdown).toBe(a.markdown);
+    expect(renderedHash(b.relPath, b.markdown)).toBe(renderedHash(a.relPath, a.markdown));
+    const fm = parseMarkdown(a.markdown, a.relPath).frontmatter as Record<string, unknown>;
+    expect(fm.attendees).toEqual([...(fm.attendees as string[])].sort());
+  });
+
   test('hostile notes (fence/frontmatter/heading) stay inside an inert fence', () => {
     const p = renderCalendarEventPage(events[0], 'local')!;
     const parsed = parseMarkdown(p.markdown, p.relPath);
