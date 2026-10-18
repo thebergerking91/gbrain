@@ -95,6 +95,8 @@ export interface AppleMailListing {
   messages: AppleMailMessage[];
   /** More messages matched than the per-run cap; the OLDEST cap-many are returned, resume from the newest. */
   truncated?: boolean;
+  /** `truncated` because the helper's body-read time budget ran out (slow Mail bodies), not because of the cap. */
+  budgetExhausted?: boolean;
   /** Threads with a message that could not be read: present in the account, so never to be swept as deleted. */
   unavailableThreads?: string[];
   /** A message could not even be attributed to a thread: nothing may be swept as deleted this run. */

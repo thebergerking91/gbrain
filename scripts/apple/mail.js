@@ -2,18 +2,24 @@
 //
 // Usage (run by src/core/apple/readers/mail.ts, never from user input):
 //   osascript -l JavaScript mail.js --probe
-//   osascript -l JavaScript mail.js --since <ISO8601> --mailboxes INBOX,Sent [--max 500]
+//   osascript -l JavaScript mail.js --since <ISO8601> --mailboxes INBOX,Sent [--max 500] [--budget-ms 45000]
 //
 // Protocol: prints exactly ONE JSON document on stdout.
-//   success: {"items":[AppleMailMessage...], "truncated":bool, "unavailable":[threadId...], "incomplete":bool}  exit 0
-//     truncated   more than --max messages matched: the OLDEST --max are returned (resume from the newest returned).
+//   success: {"items":[AppleMailMessage...], "truncated":bool, "budget_exhausted":bool, "unavailable":[threadId...], "incomplete":bool}  exit 0
+//     truncated   more messages matched than were returned (the --max cap, or the --budget-ms body budget ran
+//                 out, budget_exhausted:true): the OLDEST ones are returned (resume from the newest returned).
 //     unavailable threads with a message that could not be read: the caller must not treat them as deleted.
 //     incomplete  a message could not even be attributed to a thread: the caller must not delete anything.
 //   failure: {"error":{"code":"...","message":"..."}}  exit non-zero
 //
 // Mail.app is NEVER launched: `Application('Mail').running()` is checked first (probe and sync), and a
 // closed Mail is reported as mail_not_running_or_unconfigured. Properties are fetched in bulk
-// (one Apple event per property over the filtered message set), not per message.
+// (one Apple event per property over the filtered message set), not per message. Bodies are the
+// exception: Mail.app can take ~20 s to produce `content` for one HTML newsletter (observed on a
+// live Mac, cached or not), so bodies are fetched in small bulk batches under a wall-clock budget
+// (--budget-ms, default 45 s, counted from process start). When the budget runs out the messages read so far (the oldest, in
+// (date,id) order) are returned with truncated:true and budget_exhausted:true; the caller resumes
+// from the last one on its next run, so a slow mailbox drains over several runs instead of timing out.
 // Read-only: only property reads and `whose` filters are used. Nothing is sent, moved,
 // flagged, marked read, or deleted. Attachments are never touched (no `mailAttachments`
 // access, no save). Bodies come from `content` (plain text) and are capped at BODY_CAP chars.
@@ -25,6 +31,10 @@ ObjC.import('stdlib');
 
 var BODY_CAP = 20000;
 var DEFAULT_MAX = 500;
+var DEFAULT_BUDGET_MS = 45000;
+// Messages per body batch: one slow HTML body is ~20 s, so even a batch of all-slow messages started at
+// the budget's edge (45 s + 3 × 20 s) finishes inside the caller's 120 s helper timeout.
+var BODY_BATCH = 3;
 
 function emit(doc, code) {
   var s = JSON.stringify(doc) + '\n';
@@ -48,12 +58,12 @@ function classify(e) {
 }
 
 function parseArgs(argv) {
-  var out = { probe: false, since: null, mailboxes: [], max: DEFAULT_MAX, afterDate: null, afterId: null };
+  var out = { probe: false, since: null, mailboxes: [], max: DEFAULT_MAX, afterDate: null, afterId: null, budgetMs: DEFAULT_BUDGET_MS };
   for (var i = 0; i < argv.length; i++) {
     var a = String(argv[i]);
     if (a === '--') continue;
     if (a === '--probe') { out.probe = true; continue; }
-    if (a === '--since' || a === '--mailboxes' || a === '--max' || a === '--after-date' || a === '--after-id') {
+    if (a === '--since' || a === '--mailboxes' || a === '--max' || a === '--after-date' || a === '--after-id' || a === '--budget-ms') {
       if (i + 1 >= argv.length) fail('helper_failed', 'missing value for ' + a, 2);
       var v = String(argv[++i]);
       if (a === '--since') out.since = v;
@@ -63,6 +73,11 @@ function parseArgs(argv) {
         var n = parseInt(v, 10);
         if (!(n >= 1)) fail('helper_failed', '--max must be a positive integer', 2);
         out.max = n;
+      }
+      else if (a === '--budget-ms') {
+        var b = parseInt(v, 10);
+        if (!(b >= 1)) fail('helper_failed', '--budget-ms must be a positive integer', 2);
+        out.budgetMs = b;
       }
       else out.mailboxes = v.split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
       continue;
@@ -176,10 +191,15 @@ function listCandidates(entries, since) {
   return all;
 }
 
-function readMailbox(entry, appIds, items, seenIds, state) {
+function idClauses(appIds) {
+  return { _or: appIds.map(function (id) { return { id: { _equals: id } }; }) };
+}
+
+// Metadata (everything but the body) for the selected messages of one mailbox, in bulk: one Apple
+// event per property. Cheap even for hundreds of messages. Keyed by the Apple message id.
+function readMeta(entry, appIds, metaByKey, state) {
   if (appIds.length === 0) return;
-  var clauses = appIds.map(function (id) { return { id: { _equals: id } }; });
-  var spec = entry.mb.messages.whose({ _or: clauses });
+  var spec = entry.mb.messages.whose(idClauses(appIds));
   var ids = spec.id();
   var rfcIds = spec.messageId();
   var subjects = spec.subject();
@@ -187,7 +207,6 @@ function readMailbox(entry, appIds, items, seenIds, state) {
   var dates = spec.dateReceived();
   var reads = spec.readStatus();
   var heads = spec.allHeaders();
-  var bodies = spec.content();
   for (var i = 0; i < ids.length; i++) {
     var threadId = '';
     try {
@@ -197,10 +216,7 @@ function readMailbox(entry, appIds, items, seenIds, state) {
       var irt = firstMsgId(headerValue(headers, 'In-Reply-To'));
       var subject = String(subjects[i] || '');
       threadId = ref || irt || firstMsgId(String(rfcIds[i] || '')) || ('subject:' + normSubject(subject));
-      if (seenIds[id]) continue;
-      var body = String(bodies[i] || '');
-      if (body.length > BODY_CAP) body = body.slice(0, BODY_CAP);
-      items.push({
+      metaByKey[entry.label + '|' + ids[i]] = {
         id: id,
         threadId: threadId,
         mailbox: entry.label,
@@ -209,12 +225,10 @@ function readMailbox(entry, appIds, items, seenIds, state) {
         to: addrsOfHeader(headers, 'To'),
         cc: addrsOfHeader(headers, 'Cc'),
         date: new Date(dates[i]).toISOString(),
-        body: body,
         read: !!reads[i],
         automated: automationFlags(headers).automated,
         bulk: automationFlags(headers).bulk
-      });
-      seenIds[id] = true;
+      };
     } catch (e) {
       if (threadId) state.unavailable[threadId] = true;
       else state.incomplete = true;
@@ -222,8 +236,62 @@ function readMailbox(entry, appIds, items, seenIds, state) {
   }
 }
 
+// Bodies for one small batch of one mailbox's messages (one `content` Apple event for the batch).
+function readBodies(entry, appIds, metaByKey, items, seenIds, state) {
+  if (appIds.length === 0) return;
+  var spec = entry.mb.messages.whose(idClauses(appIds));
+  var ids = spec.id();
+  var bodies;
+  try {
+    bodies = spec.content();
+  } catch (eb) {
+    // One unreadable body fails the whole bulk call: the batch's threads stay "unavailable" (present,
+    // never deleted, re-read next run) instead of failing the run.
+    for (var j = 0; j < ids.length; j++) {
+      var m = metaByKey[entry.label + '|' + ids[j]];
+      if (m) state.unavailable[m.threadId] = true;
+    }
+    return;
+  }
+  for (var i = 0; i < ids.length; i++) {
+    var meta = metaByKey[entry.label + '|' + ids[i]];
+    if (!meta) continue; // its metadata read already failed and was recorded
+    try {
+      if (seenIds[meta.id]) continue;
+      var body = String(bodies[i] || '');
+      if (body.length > BODY_CAP) body = body.slice(0, BODY_CAP);
+      var item = {};
+      for (var k in meta) item[k] = meta[k];
+      item.body = body;
+      items.push(item);
+      seenIds[meta.id] = true;
+    } catch (e) {
+      state.unavailable[meta.threadId] = true;
+    }
+  }
+}
+
+// Bodies for the selected candidates, oldest first, in batches of BODY_BATCH, until the budget is spent.
+// Returns true when it stopped early (the remaining candidates are left for the next run).
+function readSelectedBodies(selected, metaByKey, items, seenIds, state, startedAt, budgetMs) {
+  for (var i = 0; i < selected.length; i += BODY_BATCH) {
+    if (i > 0 && Date.now() - startedAt > budgetMs) return true;
+    var batch = selected.slice(i, i + BODY_BATCH);
+    var byEntry = new Map();
+    batch.forEach(function (c) {
+      if (!byEntry.has(c.entry)) byEntry.set(c.entry, []);
+      byEntry.get(c.entry).push(c.appId);
+    });
+    byEntry.forEach(function (appIds, entry) { readBodies(entry, appIds, metaByKey, items, seenIds, state); });
+  }
+  return false;
+}
+
 function run(argv) {
   var args = parseArgs(argv);
+  // The budget counts from here: a slow `accounts()` (24 s seen on a live Mac) eats into it, so the
+  // body batches that follow still finish inside the caller's helper timeout.
+  var startedAt = Date.now();
 
   var Mail;
   try {
@@ -250,6 +318,7 @@ function run(argv) {
   var items = [];
   var state = { unavailable: {}, incomplete: false };
   var truncated = false;
+  var budgetExhausted = false;
   try {
     var entries = resolveMailboxes(Mail, args.mailboxes);
     var candidates = listCandidates(entries, since);
@@ -267,8 +336,11 @@ function run(argv) {
       if (!selectedByEntry.has(c.entry)) selectedByEntry.set(c.entry, []);
       selectedByEntry.get(c.entry).push(c.appId);
     });
+    var metaByKey = {};
+    entries.forEach(function (entry) { readMeta(entry, selectedByEntry.get(entry) || [], metaByKey, state); });
     var seenIds = {};
-    entries.forEach(function (entry) { readMailbox(entry, selectedByEntry.get(entry) || [], items, seenIds, state); });
+    budgetExhausted = readSelectedBodies(selected, metaByKey, items, seenIds, state, startedAt, args.budgetMs);
+    if (budgetExhausted) truncated = true;
   } catch (e2) {
     var c2 = classify(e2);
     fail(c2[0], c2[1]);
@@ -282,5 +354,5 @@ function run(argv) {
   }
   truncated = truncated || items.length > args.max;
   if (items.length > args.max) items = items.slice(0, args.max);
-  emit({ items: items, truncated: truncated, unavailable: Object.keys(state.unavailable), incomplete: state.incomplete }, 0);
+  emit({ items: items, truncated: truncated, budget_exhausted: budgetExhausted, unavailable: Object.keys(state.unavailable), incomplete: state.incomplete }, 0);
 }

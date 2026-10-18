@@ -434,6 +434,71 @@ describe('mail listing document', () => {
     expect(new Set([...first.items, ...second.items].map((m: { id: string }) => m.id)).size).toBe(600);
   });
 
+  test('real JXA body budget: one slow batch spends it, the helper reports budget_exhausted, and later runs drain the rest', () => {
+    // Live-Mac finding: Mail.app took ~20 s to produce `content` for each HTML newsletter, so a single
+    // bulk body read of 35 messages overran the 120 s helper timeout. The helper now reads bodies in
+    // batches of 3 under --budget-ms and resumes from the last message it returned.
+    const { readFileSync } = require('node:fs') as typeof import('node:fs');
+    const js = readFileSync(MAIL_SCRIPT, 'utf8');
+    const dates = Array.from({ length: 10 }, (_, i) => new Date(Date.UTC(2026, 9, 10, 8, i)));
+    let fakeNow = 1_000_000;
+    let bodyMs = 20_000; // what one body costs Mail.app
+    class FakeDate extends Date { static override now(): number { return fakeNow; } }
+    let contentCalls = 0;
+    const mailbox: any = { name: () => 'INBOX', id: () => 'inbox-example' };
+    mailbox.messages = { whose: (query: any) => {
+      let indexes = dates.map((_, i) => i);
+      const newerThan = query?.dateReceived?._greaterThan;
+      if (newerThan instanceof Date) indexes = indexes.filter((i) => dates[i]!.getTime() > newerThan.getTime());
+      if (Array.isArray(query?._or)) {
+        const selected = new Set(query._or.map((x: any) => x.id._equals));
+        indexes = indexes.filter((i) => selected.has(i));
+      }
+      return {
+        id: () => indexes,
+        messageId: () => indexes.map((i) => `<id-${String(i).padStart(3, '0')}>`),
+        subject: () => indexes.map(() => 'slow newsletter'), sender: () => indexes.map(() => 'Alice Example <alice@example.com>'),
+        dateReceived: () => indexes.map((i) => dates[i]), readStatus: () => indexes.map(() => true),
+        allHeaders: () => indexes.map((i) => `Message-ID: <id-${String(i).padStart(3, '0')}>`),
+        content: () => { contentCalls++; fakeNow += bodyMs * indexes.length; return indexes.map((i) => `body-${i}`); },
+      };
+    } };
+    const mailApp = { running: () => true, accounts: () => [{}], inbox: mailbox, sentMailbox: mailbox };
+    const invoke = (argv: string[]): any => {
+      let output = '';
+      const $: any = (value: string) => ({ dataUsingEncoding: () => value });
+      $.NSUTF8StringEncoding = 1;
+      $.NSFileHandle = { fileHandleWithStandardOutput: { writeData: (s: string) => { output = s; } } };
+      let exitCode = 0;
+      $.exit = (code: number) => { exitCode = code; };
+      const sandbox = { ObjC: { import() {} }, $, Application: () => mailApp, console, Date: FakeDate };
+      try { runInNewContext(`${js}\nrun(${JSON.stringify(argv)});`, sandbox); } catch (e) { if (!(e as { code?: number }).code) throw e; }
+      expect(exitCode).toBe(0);
+      return JSON.parse(output);
+    };
+    const argv = ['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX', '--max', '500', '--budget-ms', '45000'];
+    // Run 1: the first batch (3 bodies, 60 s of Mail time) spends the budget; the helper keeps it and stops.
+    const first = invoke(argv);
+    expect(first.items.map((m: { id: string }) => m.id)).toEqual(['<id-000>', '<id-001>', '<id-002>']);
+    expect(first.truncated).toBe(true);
+    expect(first.budget_exhausted).toBe(true);
+    expect(first.incomplete).toBe(false);
+    expect(contentCalls).toBe(1);
+    // Run 2 resumes after the stable (date,id) boundary and reads the next batch.
+    const b1 = first.items.at(-1)!;
+    const second = invoke([...argv, '--after-date', b1.date, '--after-id', b1.id]);
+    expect(second.items.map((m: { id: string }) => m.id)).toEqual(['<id-003>', '<id-004>', '<id-005>']);
+    expect(second.budget_exhausted).toBe(true);
+    // Run 3: bodies are fast now; the remaining four come back in one run, complete.
+    bodyMs = 100;
+    const b2 = second.items.at(-1)!;
+    const third = invoke([...argv, '--after-date', b2.date, '--after-id', b2.id]);
+    expect(third.items).toHaveLength(4);
+    expect(third.truncated).toBe(false);
+    expect(third.budget_exhausted).toBe(false);
+    expect(new Set([...first.items, ...second.items, ...third.items].map((m: { id: string }) => m.id)).size).toBe(10);
+  });
+
   test('--max is passed to the helper', async () => {
     const script = join(dir, 'mail-args.js');
     writeFileSync(script, `process.stdout.write(JSON.stringify({items:[{id:'m1',date:'2026-01-02T10:00:00Z',subject:process.argv.slice(2).join(' ')}]}))`);

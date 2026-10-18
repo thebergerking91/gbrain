@@ -172,7 +172,11 @@ modifies nothing.
 
 Mail reads are incremental: after the first run only messages since two days
 before the newest one already seen are read (`--full` re-reads the whole
-`--mail-days` window), capped per run by `a_mail_max`. A paginated walk freezes its starting window and
+`--mail-days` window), capped per run by `a_mail_max`. Message bodies are read in small batches under
+a 45-second budget, because Mail.app can take 20 seconds to produce the plain text of one HTML
+newsletter (seen on a real Mac): when the budget runs out the run is `partial`, keeps what it read
+(oldest first) and the next `gbrain sync` continues from there, so a slow mailbox drains over a few
+runs instead of timing out. A paginated walk freezes its starting window and
 records its purpose, scope/owner digest and the union of seen thread ids in
 `mail.walk`. Full reconciliation waits for the **entire** full walk, never just
 its final suffix. A new full walk or changed identity discards an incompatible
@@ -274,7 +278,7 @@ gbrain apple loops --source apple-local --mail-owner-addresses me@example.com   
 | `permission_denied` | Calendar/Contacts access denied | see [Permissions](#permissions) |
 | `automation_denied` | Mail scripting denied | Automation pane, enable Mail for the app |
 | `mail_not_running_or_unconfigured` | Mail.app has no account / is not ready | open Mail, add an account, retry |
-| `helper_timeout` | a helper ran over its 120 s limit | retry; narrow the window or mailboxes |
+| `helper_timeout` | a helper ran over its 120 s limit | retry (Mail bodies are budgeted and resume, so a repeat usually means a stuck permission dialog); narrow the window or mailboxes |
 | `permission_not_determined` | macOS has not asked yet (not a denial) | run `gbrain apple setup` interactively and click Allow |
 | `selection_not_found` | a configured calendar id or mailbox matches nothing | fix `--calendar-ids` / `--mail-mailboxes` |
 | `macos_too_old` | the helper needs macOS 14+ / Command Line Tools 15+ | update macOS and the tools (`xcode-select --install`) |

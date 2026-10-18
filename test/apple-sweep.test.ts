@@ -784,6 +784,33 @@ describe('apple sweep — mail reads incrementally and respects the per-run cap 
     expect(st2.mail.newest).toBeDefined();
   }));
 
+  test('a read cut short by the helper body budget is partial, says so, and resumes like a capped read', () => withHome(async () => {
+    // Live-Mac finding: Mail.app can take ~20 s per HTML newsletter body, so the helper stops at a time
+    // budget and reports budget_exhausted; the sweep must treat that exactly like a capped read.
+    const dir = newDir('mail-budget');
+    await insertSource(dir);
+    const f = freshFake();
+    const all = structuredClone(f.mail);
+    const oldest = [...all].sort((a, b) => Date.parse(a.date) - Date.parse(b.date)).slice(0, 1);
+    f.mail = oldest;
+    f.mailFlags = { truncated: true, budgetExhausted: true };
+    const first = await sweep(dir, f);
+    expect(first.status).toBe('partial');
+    expect(logs.some((l) => l.includes('body time budget'))).toBe(true);
+    const st = readAppleState(dir);
+    expect(st.mail.newest).toBeUndefined();
+    expect(st.mail.resume_from).toBe(oldest[0]!.date);
+    expect(st.mail.resume_id).toBe(oldest[0]!.id);
+
+    f.mail = all;
+    f.mailFlags = undefined;
+    const second = await sweep(dir, f);
+    expect(second.status).not.toBe('partial');
+    expect(f.lastMail!.after).toEqual({ date: oldest[0]!.date, id: oldest[0]!.id });
+    expect(readAppleState(dir).mail.resume_from).toBeUndefined();
+    expect(readAppleState(dir).mail.newest).toBeDefined();
+  }));
+
   test('a bare-array reader (older shape) still works and counts as complete', () => withHome(async () => {
     const dir = newDir('mail-array');
     await insertSource(dir);

@@ -331,7 +331,9 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   if (truncated) {
     summary.status = 'partial';
     summary.incomplete.push('mail:truncated');
-    deps.log(`[apple] mail listing truncated at ${deps.cfg.mailMax} messages (a_mail_max); the rest is read on the next run`);
+    deps.log(listing.budgetExhausted === true
+      ? `[apple] mail read stopped at the helper's body time budget after ${messages.length} message(s) (Mail.app is slow to produce some bodies); the rest is read on the next run`
+      : `[apple] mail listing truncated at ${deps.cfg.mailMax} messages (a_mail_max); the rest is read on the next run`);
   }
   if ((listing.unavailableThreads?.length ?? 0) > 0) {
     summary.status = 'partial';

@@ -10,6 +10,14 @@ import { str, strArray, withScriptArgs, type HelperOverrides } from './calendar.
 export const MAIL_SCRIPT = fileURLToPath(new URL('../../../../scripts/apple/mail.js', import.meta.url));
 export const OSASCRIPT_BIN = '/usr/bin/osascript';
 export const MAIL_BODY_CAP = 20000;
+/**
+ * Wall-clock budget the helper gets for reading message bodies. Mail.app can take ~20 s to produce
+ * `content` for one HTML newsletter (live-Mac observation), so the helper stops starting new body
+ * batches after this and returns what it has as `truncated` + `budgetExhausted`; the sweep resumes
+ * from the last message next run. Counted from helper start; with 3-message batches the worst case
+ * (45 s + 3 × 20 s) stays under DEFAULT_HELPER_TIMEOUT_MS (120 s).
+ */
+export const MAIL_BODY_BUDGET_MS = 45_000;
 
 export function normalizeMessage(raw: unknown): AppleMailMessage {
   const o = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
@@ -44,11 +52,13 @@ export async function readMail(
     const args = [...scriptArgs, '--since', opts.since.toISOString(), '--mailboxes', opts.mailboxes.join(',')];
     if (opts.max !== undefined) args.push('--max', String(opts.max));
     if (opts.after) args.push('--after-date', opts.after.date, '--after-id', opts.after.id);
+    args.push('--budget-ms', String(MAIL_BODY_BUDGET_MS));
     return runHelperDocument({ service: 'mail', command: o.command ?? OSASCRIPT_BIN, args, signal: opts.signal, timeoutMs: o.timeoutMs, maxStdoutBytes: o.maxStdoutBytes, platform: o.platform, env: o.env });
   });
   return {
     messages: items.map(normalizeMessage),
     truncated: doc.truncated === true,
+    budgetExhausted: doc.budget_exhausted === true,
     unavailableThreads: strArray(doc.unavailable),
     incomplete: doc.incomplete === true,
   };
