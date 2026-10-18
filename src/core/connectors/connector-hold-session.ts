@@ -37,12 +37,12 @@ export class ConnectorHoldSession {
 
   private constructor(private readonly engine: BrainEngine, private readonly sourceId: string, private readonly incarnation: string | null,
     private readonly managed: ManagedConnectorSync | null, private readonly empty: Record<string, unknown>, stored: unknown,
-    private readonly retryKeys: ReadonlySet<string>, opts: { full?: boolean; now?: () => number }) {
+    private readonly retryKeys: ReadonlySet<string>, opts: { full?: boolean; now?: () => number; groupOf?: (key: string) => string }) {
     this.holds = new ItemHoldsRun(stored, { ...opts, retryKeys });
   }
 
   static async open(engine: BrainEngine, sourceId: string, managed: ManagedConnectorSync | null, empty: Record<string, unknown>,
-    stored: unknown, opts: { full?: boolean; now?: () => number } = {}): Promise<ConnectorHoldSession> {
+    stored: unknown, opts: { full?: boolean; now?: () => number; groupOf?: (key: string) => string } = {}): Promise<ConnectorHoldSession> {
     const [row] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [sourceId]).catch(() => []);
     const incarnation = row?.incarnation ?? null;
     const keys = incarnation ? await readHoldRetryKeys(engine, sourceId, incarnation).catch(() => []) : [];

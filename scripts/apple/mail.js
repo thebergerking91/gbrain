@@ -3,13 +3,24 @@
 // Usage (run by src/core/apple/readers/mail.ts, never from user input):
 //   osascript -l JavaScript mail.js --probe
 //   osascript -l JavaScript mail.js --since <ISO8601> --mailboxes INBOX,Sent [--max 500] [--budget-ms 45000] [--timeout-ms 120000]
+//                                   [--after-date <ISO8601> --after-id <id>] [--exclude '["<id>",...]']
+//   osascript -l JavaScript mail.js --targets '[{"id":"<id>","date":"<ISO8601>"},...]' --mailboxes INBOX,Sent [--budget-ms ..] [--timeout-ms ..]
 //
 // Protocol: prints exactly ONE JSON document on stdout.
-//   success: {"items":[AppleMailMessage...], "truncated":bool, "budget_exhausted":bool, "unavailable":[threadId...], "incomplete":bool}  exit 0
+//   success: {"items":[AppleMailMessage...], "truncated":bool, "budget_exhausted":bool, "unavailable":[threadId...],
+//             "unavailable_messages":[{"id","date","thread_id"}...], "deferred":[threadId...], "target_missing":[id...], "incomplete":bool}  exit 0
 //     truncated   more messages matched than were returned (the --max cap, or the --budget-ms body budget ran
 //                 out, budget_exhausted:true): the OLDEST ones are returned (resume from the newest returned).
 //     unavailable threads with a message that could not be read: the caller must not treat them as deleted.
 //     incomplete  a message could not even be attributed to a thread: the caller must not delete anything.
+//     unavailable_messages  the subset of unreadable messages PROVEN unreadable one by one (a single-message read that
+//                 failed, a definite null/non-string body, or a per-message error): stable id, received date, thread.
+//                 Only these may be counted toward a hold; a batch neighbour that merely was not retried in time is not.
+//     deferred    threads with an unresolved message that is NOT proven (batch failed and the retry did not fit, or the
+//                 message vanished mid-read): the caller pins its cursor and counts nothing.
+//     --exclude   stable message ids to skip entirely (held messages): never listed, read or reported.
+//     --targets   re-read exactly these messages (stable id + received date) wherever they are, instead of a window
+//                 listing; target_missing names the requested ids the mailbox no longer has.
 //   failure: {"error":{"code":"...","message":"..."}}  exit non-zero
 //
 // Mail.app is NEVER launched: `Application('Mail').running()` is checked first (probe and sync), and a
@@ -80,17 +91,21 @@ function classify(e) {
 }
 
 function parseArgs(argv) {
-  var out = { probe: false, since: null, mailboxes: [], max: DEFAULT_MAX, afterDate: null, afterId: null, budgetMs: DEFAULT_BUDGET_MS, timeoutMs: DEFAULT_TIMEOUT_MS };
+  var out = { probe: false, since: null, mailboxes: [], max: DEFAULT_MAX, afterDate: null, afterId: null, budgetMs: DEFAULT_BUDGET_MS, timeoutMs: DEFAULT_TIMEOUT_MS, exclude: null, targets: null };
   for (var i = 0; i < argv.length; i++) {
     var a = String(argv[i]);
     if (a === '--') continue;
     if (a === '--probe') { out.probe = true; continue; }
-    if (a === '--since' || a === '--mailboxes' || a === '--max' || a === '--after-date' || a === '--after-id' || a === '--budget-ms' || a === '--timeout-ms') {
+    if (a === '--since' || a === '--mailboxes' || a === '--max' || a === '--after-date' || a === '--after-id' || a === '--budget-ms' || a === '--timeout-ms' || a === '--exclude' || a === '--targets') {
       if (i + 1 >= argv.length) fail('helper_failed', 'missing value for ' + a, 2);
       var v = String(argv[++i]);
       if (a === '--since') out.since = v;
       else if (a === '--after-date') out.afterDate = v;
       else if (a === '--after-id') out.afterId = v;
+      else if (a === '--exclude') out.exclude = parseJsonArray(a, v, function (x) { return typeof x === 'string' && x.length > 0; });
+      else if (a === '--targets') {
+        out.targets = parseJsonArray(a, v, function (x) { return x && typeof x.id === 'string' && x.id.length > 0 && typeof x.date === 'string' && !isNaN(new Date(x.date).getTime()); });
+      }
       else if (a === '--max') {
         var n = parseInt(v, 10);
         if (!(n >= 1)) fail('helper_failed', '--max must be a positive integer', 2);
@@ -112,6 +127,14 @@ function parseArgs(argv) {
     fail('helper_failed', 'unknown argument: ' + a, 2);
   }
   return out;
+}
+
+function parseJsonArray(flag, text, valid) {
+  var parsed;
+  try { parsed = JSON.parse(text); } catch (e) { fail('helper_failed', flag + ' must be a JSON array', 2); }
+  if (!Array.isArray(parsed)) fail('helper_failed', flag + ' must be a JSON array', 2);
+  for (var i = 0; i < parsed.length; i++) if (!valid(parsed[i])) fail('helper_failed', flag + ' has an invalid entry', 2);
+  return parsed;
 }
 
 function normSubject(s) {
@@ -202,10 +225,10 @@ function stableMessageId(label, appId, rfcId, headers) {
 }
 
 // Metadata-only pass across the mailbox; bodies are fetched only for the bounded page below.
-function listCandidates(entries, since) {
+function listCandidates(entries, since, until) {
   var all = [];
   entries.forEach(function (entry) {
-    var spec = whoseSince(entry.mb, since, null);
+    var spec = whoseSince(entry.mb, since, until || null);
     var ids = spec.id();
     var rfcIds = spec.messageId();
     var heads = spec.allHeaders();
@@ -268,10 +291,21 @@ function readMeta(entry, appIds, metaByKey, state) {
       };
     } catch (e) {
       state.metaHandled[key] = true;
-      if (threadId) state.unavailable[threadId] = true;
-      else state.incomplete = true;
+      if (threadId) {
+        state.unavailable[threadId] = true;
+        // This one message threw while its metadata was assembled: proven, and its identity is the candidate's.
+        var cand = state.cand[key];
+        if (cand) markProven(state, cand.id, threadId, cand.date);
+        else state.deferred[threadId] = true;
+      } else state.incomplete = true;
     }
   }
+}
+
+// A message proven unreadable on its own: the only kind of failure the caller may count toward a hold.
+function markProven(state, id, threadId, date) {
+  if (!id || !threadId || !date) { state.incomplete = true; return; }
+  if (!state.bad[id]) state.bad[id] = { id: id, date: date, thread_id: threadId };
 }
 
 function sameIds(a, b) {
@@ -314,6 +348,7 @@ function readBodies(entry, appIds, metaByKey, items, seenIds, state) {
       if (typeof bodies[i] !== 'string') {
         // Missing / null body: unreadable, not empty. Keep the thread unavailable and re-read it next run.
         state.unavailable[meta.threadId] = true;
+        markProven(state, meta.id, meta.threadId, meta.date);
         state.resolved[key] = true;
         continue;
       }
@@ -328,6 +363,7 @@ function readBodies(entry, appIds, metaByKey, items, seenIds, state) {
       state.resolved[key] = true;
     } catch (e) {
       state.unavailable[meta.threadId] = true;
+      markProven(state, meta.id, meta.threadId, meta.date);
       state.resolved[key] = true;
     }
   }
@@ -382,13 +418,16 @@ function readSelectedBodies(selected, metaByKey, items, seenIds, state, clock) {
     groupByEntry(batch).forEach(function (cands, entry) {
       var appIds = cands.map(function (c) { return c.appId; });
       // A group that was already a single read and failed is genuinely unreadable: no point re-reading it.
-      if (!readBodies(entry, appIds, metaByKey, items, seenIds, state) && cands.length > 1) failed = failed.concat(cands);
+      if (!readBodies(entry, appIds, metaByKey, items, seenIds, state)) {
+        if (cands.length > 1) failed = failed.concat(cands);
+        else state.single[cands[0].entry.label + '|' + cands[0].appId] = true;
+      }
     });
     clock.perMessageMs = Math.max(clock.perMessageMs, (Date.now() - t0) / batch.length);
     for (var f = 0; f < failed.length; f++) {
       if (!mayStart(1, clock, false)) return true; // the rest stay unresolved -> unavailable
       var t1 = Date.now();
-      readBodies(failed[f].entry, [failed[f].appId], metaByKey, items, seenIds, state);
+      if (!readBodies(failed[f].entry, [failed[f].appId], metaByKey, items, seenIds, state)) state.single[failed[f].entry.label + '|' + failed[f].appId] = true;
       clock.perMessageMs = Math.max(clock.perMessageMs, Date.now() - t1);
     }
   }
@@ -407,7 +446,13 @@ function flagUnresolved(selected, metaByKey, state) {
       if (!state.metaHandled[key]) state.incomplete = true;
       return;
     }
-    if (state.attempted[key] && !state.resolved[key]) state.unavailable[meta.threadId] = true;
+    if (state.attempted[key] && !state.resolved[key]) {
+      state.unavailable[meta.threadId] = true;
+      // Proven only when this message was read on its own and that read failed. A batch neighbour that was not
+      // retried in time, or a message that vanished mid-read, is deferred: it pins the caller's cursor, nothing more.
+      if (state.single[key]) markProven(state, meta.id, meta.threadId, meta.date);
+      else state.deferred[meta.threadId] = true;
+    }
   });
 }
 
@@ -436,29 +481,54 @@ function run(argv) {
   }
   if (args.probe) emit({ items: [], status: 'available' }, 0);
 
-  if (!args.since) fail('helper_failed', '--since is required', 2);
-  var since = new Date(args.since);
-  if (isNaN(since.getTime())) fail('helper_failed', '--since must be ISO8601', 2);
+  if (!args.targets && !args.since) fail('helper_failed', '--since is required', 2);
+  var since = args.since ? new Date(args.since) : null;
+  if (since && isNaN(since.getTime())) fail('helper_failed', '--since must be ISO8601', 2);
   if (args.mailboxes.length === 0) fail('helper_failed', '--mailboxes is required', 2);
 
   var items = [];
-  var state = { unavailable: {}, incomplete: false, metaHandled: {}, attempted: {}, resolved: {} };
+  var state = { unavailable: {}, incomplete: false, metaHandled: {}, attempted: {}, resolved: {}, single: {}, bad: {}, deferred: {}, cand: {} };
   var truncated = false;
   var budgetExhausted = false;
+  var targetMissing = [];
   try {
     var entries = resolveMailboxes(Mail, args.mailboxes);
-    var candidates = listCandidates(entries, since);
+    var candidates;
+    var targetMode = !!args.targets;
+    if (targetMode) {
+      // Targeted read: only the named messages, found through a narrow received-date window around each one. The
+      // window cursor, the --max cap and the --exclude list do not apply: the caller named exactly what it wants.
+      var wanted = {};
+      var found = {};
+      candidates = [];
+      args.targets.forEach(function (t) {
+        wanted[t.id] = true;
+        var at = new Date(t.date).getTime();
+        listCandidates(entries, new Date(at - 1000), new Date(at + 1000)).forEach(function (c) {
+          if (c.id === t.id && !found[c.id]) { found[c.id] = true; candidates.push(c); }
+        });
+      });
+      Object.keys(wanted).forEach(function (id) { if (!found[id]) targetMissing.push(id); });
+    } else {
+      candidates = listCandidates(entries, since);
+    }
     candidates.sort(function (a, b) { return a.date === b.date ? (a.id < b.id ? -1 : a.id > b.id ? 1 : 0) : (a.date < b.date ? -1 : 1); });
     var candidateIds = {};
+    var excluded = {};
+    (args.exclude || []).forEach(function (id) { excluded[id] = true; });
     candidates = candidates.filter(function (c) {
       if (candidateIds[c.id]) return false;
       candidateIds[c.id] = true;
+      if (targetMode) return true;
+      // A held message is never listed, read or reported: it costs no body time and cannot starve its neighbours.
+      if (excluded[c.id]) return false;
       return !args.afterDate || !args.afterId || c.date > args.afterDate || (c.date === args.afterDate && c.id > args.afterId);
     });
-    truncated = candidates.length > args.max;
-    var selected = candidates.slice(0, args.max);
+    truncated = !targetMode && candidates.length > args.max;
+    var selected = targetMode ? candidates : candidates.slice(0, args.max);
     var selectedByEntry = new Map();
     selected.forEach(function (c) {
+      state.cand[c.entry.label + '|' + c.appId] = c;
       if (!selectedByEntry.has(c.entry)) selectedByEntry.set(c.entry, []);
       selectedByEntry.get(c.entry).push(c.appId);
     });
@@ -476,10 +546,15 @@ function run(argv) {
     if (a.date !== b.date) return a.date < b.date ? -1 : 1;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
-  if (args.afterDate && args.afterId) {
+  if (!args.targets && args.afterDate && args.afterId) {
     items = items.filter(function (m) { return m.date > args.afterDate || (m.date === args.afterDate && m.id > args.afterId); });
   }
-  truncated = truncated || items.length > args.max;
-  if (items.length > args.max) items = items.slice(0, args.max);
-  emit({ items: items, truncated: truncated, budget_exhausted: budgetExhausted, unavailable: Object.keys(state.unavailable), incomplete: state.incomplete }, 0);
+  if (!args.targets) {
+    truncated = truncated || items.length > args.max;
+    if (items.length > args.max) items = items.slice(0, args.max);
+  }
+  var doc = { items: items, truncated: truncated, budget_exhausted: budgetExhausted, unavailable: Object.keys(state.unavailable),
+    unavailable_messages: Object.keys(state.bad).map(function (id) { return state.bad[id]; }), deferred: Object.keys(state.deferred), incomplete: state.incomplete };
+  if (args.targets) doc.target_missing = targetMissing;
+  emit(doc, 0);
 }

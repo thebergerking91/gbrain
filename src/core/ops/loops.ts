@@ -165,12 +165,13 @@ async function heldCoverage(ctx: OperationContext, sources: GoogleSourceFreshnes
   if (!sources.length) return { completeness: 'complete', held: [] };
   try {
     const { readAllSourceHolds } = await import('../connectors/item-holds-store.ts');
+    const { isAppleMailHoldKey } = await import('../apple/loops-status.ts');
     const now = Date.now();
     const held: HeldItemView[] = [];
     for (const entry of await readAllSourceHolds(ctx.engine, { sourceIds: sources.map((s) => s.id) })) {
       for (const record of entry.held) {
         // Only an Apple MAIL thread can hide a loop; a held calendar or contact says nothing about unanswered mail.
-        if (appleIds.has(entry.sourceId) && !record.key.startsWith('mail:')) continue;
+        if (appleIds.has(entry.sourceId) && !isAppleMailHoldKey(record.key)) continue;
         const at = record.meta.upstream_at ? Date.parse(record.meta.upstream_at) : NaN;
         if (Number.isFinite(at) && now - at > HELD_WINDOW_MS) continue;
         held.push({ source_id: entry.sourceId, key: record.key, sender: record.meta.sender, ...(trusted ? { subject: record.meta.subject } : {}),

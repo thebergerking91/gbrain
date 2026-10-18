@@ -19,6 +19,9 @@ import type { AppleMailLoopsState, AppleSourceConfig, AppleSourceState } from '.
 
 export const APPLE_LOOPS_STALE_AFTER_MS = 24 * 3_600_000;
 
+/** Hold keys that can hide an unanswered-mail loop: a Mail thread (`mail:<thread>`) or an unreadable Mail message (`mail-message:<id>`). */
+export const isAppleMailHoldKey = (key: string): boolean => key.startsWith('mail:') || key.startsWith('mail-message:');
+
 export type AppleLoopsUnavailableReason = 'mail_disabled' | 'identity_missing';
 
 export type AppleLoopsAvailability =

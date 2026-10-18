@@ -48,6 +48,7 @@ import {
   type AppleSyncSummary,
 } from './sweep-shared.ts';
 import { beginMailWalk } from './mail-walk.ts';
+import { MAIL_THREAD_KEY, encodeThreadRef, planMailHolds, readMailHolds, settleReadMessages, threadHoldKey } from './mail-holds.ts';
 import { appleLoopsAvailability } from './loops-status.ts';
 import { prepareLoopsState, trackMailLoops, type AppleLoopsRun } from './loops.ts';
 import type { AppleCalendarEvent, AppleContact, AppleMailListing, AppleSourceState } from './types.ts';
@@ -64,6 +65,8 @@ export interface AppleSweepCtx {
   summary: AppleSyncSummary;
   countedSlugs: Set<string>;
   holds: ConnectorHoldSession;
+  /** Failures this run that must keep a cursor where it is: an item not held when the run began, or any failure that is not item-scoped. */
+  pins?: number;
   /** Open-loop bookkeeping for this run; present only when Mail loop tracking is available (owner addresses set). */
   loops?: AppleLoopsRun;
 }
@@ -79,18 +82,24 @@ const messageOf = (e: unknown): string => (e instanceof Error ? e.message : Stri
 // ── Item holds ───────────────────────────────────────────────────────────────
 
 /** Counts one item failure (hold bookkeeping, summary, log). Managed write errors are rethrown by the hold session. */
-async function failItem(ctx: AppleSweepCtx, holdKey: string, error: unknown, version: string | null, page: RenderedPage | null): Promise<void> {
+interface FailDetail { ref?: string | null; upstreamAt?: string | null }
+
+async function failItem(ctx: AppleSweepCtx, holdKey: string, error: unknown, version: string | null, page: RenderedPage | null, detail: FailDetail = {}): Promise<void> {
   const { deps, summary, holds } = ctx;
   const wasHeld = holds.isHeld(holdKey);
-  const classified = await holds.fail(holdKey, error, { version, slug: page ? page.relPath.replace(/\.md$/, '') : null });
+  const classified = await holds.fail(holdKey, error, { version, slug: page ? page.relPath.replace(/\.md$/, '') : null,
+    ...(detail.ref ? { ref: detail.ref } : {}), ...(detail.upstreamAt ? { meta: { upstream_at: detail.upstreamAt } } : {}) });
   summary.failedFiles++;
   deps.log(`[apple] ${holdKey} failed${classified.scope === 'rate_limit' ? ' (rate limited; not counted toward a hold)' : ''}: ${messageOf(error)}`);
-  // A held item that fails again after being re-admitted does not make the run partial.
-  if (!wasHeld || classified.scope === 'rate_limit') summary.status = 'partial';
+  // A held item that fails again after being re-admitted neither makes the run partial nor holds a cursor back.
+  if (!wasHeld || classified.scope !== 'item') {
+    summary.status = 'partial';
+    ctx.pins = (ctx.pins ?? 0) + 1;
+  }
 }
 
 /** One item through the holds. True when it was written. */
-async function attemptItem(ctx: AppleSweepCtx, holdKey: string, version: string, page: RenderedPage, work: () => Promise<void>): Promise<boolean> {
+async function attemptItem(ctx: AppleSweepCtx, holdKey: string, version: string, page: RenderedPage, work: () => Promise<void>, detail: FailDetail = {}): Promise<boolean> {
   if (!ctx.holds.shouldAttempt(holdKey, version)) {
     ctx.deps.tick(`${holdKey} held`);
     return false;
@@ -101,18 +110,18 @@ async function attemptItem(ctx: AppleSweepCtx, holdKey: string, version: string,
     ctx.deps.tick(holdKey);
     return true;
   } catch (e) {
-    await failItem(ctx, holdKey, e, version, page);
+    await failItem(ctx, holdKey, e, version, page, detail);
     return false;
   }
 }
 
 /** Run a pure render; a throw is an item failure (version unknown), never a sweep failure. */
-async function safeRender<T>(ctx: AppleSweepCtx, holdKey: string, render: () => T): Promise<{ ok: true; value: T } | { ok: false }> {
+async function safeRender<T>(ctx: AppleSweepCtx, holdKey: string, render: () => T, detail: FailDetail = {}): Promise<{ ok: true; value: T } | { ok: false }> {
   try {
     return { ok: true, value: render() };
   } catch (e) {
     if (!ctx.holds.shouldAttempt(holdKey, null)) return { ok: false };
-    await failItem(ctx, holdKey, e, null, null);
+    await failItem(ctx, holdKey, e, null, null, detail);
     return { ok: false };
   }
 }
@@ -321,8 +330,13 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   const walk = beginMailWalk(state, deps.cfg, windowStart, deps.opts.full === true, rereadAll, incrementalSince);
   const since = new Date(Math.max(Date.parse(walk.since), Date.parse(state.mail.resume_from ?? '') - 1 || 0));
   const failedBefore = summary.failedFiles;
+  const pinsBefore = ctx.pins ?? 0;
+  // Held messages are not read (they cost body time and would starve their neighbours); the ones that are due for a
+  // re-attempt (retry-held, a transient reconsideration, --full) are read again by id below, however old they are.
+  const plan = planMailHolds(ctx.holds);
   const read = await deps.readers.mail({ since, mailboxes: deps.cfg.mailMailboxes, max: deps.cfg.mailMax,
-    ...(state.mail.resume_from && state.mail.resume_id ? { after: { date: state.mail.resume_from, id: state.mail.resume_id } } : {}), ...signalOf(ctx) });
+    ...(state.mail.resume_from && state.mail.resume_id ? { after: { date: state.mail.resume_from, id: state.mail.resume_id } } : {}),
+    ...(plan.exclude.length > 0 ? { exclude: plan.exclude } : {}), ...signalOf(ctx) });
   const listing: AppleMailListing = Array.isArray(read) ? { messages: read } : read;
   const messages = listing.messages;
   const truncated = listing.truncated === true;
@@ -335,10 +349,16 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
       ? `[apple] mail read stopped at the helper's body time budget after ${messages.length} message(s) (Mail.app is slow to produce some bodies); the rest is read on the next run`
       : `[apple] mail listing truncated at ${deps.cfg.mailMax} messages (a_mail_max); the rest is read on the next run`);
   }
-  if ((listing.unavailableThreads?.length ?? 0) > 0) {
+  const holdRun = await readMailHolds({ holds: ctx.holds, plan, listing, mailboxes: deps.cfg.mailMailboxes,
+    readTargets: deps.readers.mailMessages ? (o) => deps.readers.mailMessages!(o) : undefined, ...signalOf(ctx), log: deps.log });
+  if (holdRun.readFailed) summary.status = 'partial';
+  // The listing the cursor follows is the main read; messages read by id only feed rendering and open-loop evidence.
+  const listed = new Set(messages.map((m) => m.id));
+  const allMessages = holdRun.extra.length > 0 ? [...messages, ...holdRun.extra.filter((m) => !listed.has(m.id))] : messages;
+  if (holdRun.pin) {
     summary.status = 'partial';
     summary.incomplete.push('mail:unavailable_threads');
-    deps.log(`[apple] ${listing.unavailableThreads!.length} mail thread(s) contain unreadable messages; the cursor will not advance`);
+    deps.log(`[apple] ${new Set([...(listing.unavailableThreads ?? []), ...holdRun.failedThreads, ...holdRun.deferred]).size} mail thread(s) contain unreadable messages; the cursor will not advance`);
   }
   if (!readable) {
     summary.status = 'partial';
@@ -355,17 +375,21 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
     frontmatterByThread.set(id, o.frontmatter);
   }
 
-  // A thread with an unreadable message still exists upstream: it is live for the sweep (never deleted).
-  const live = new Set<string>([...walk.seen, ...(listing.unavailableThreads ?? [])]);
-  for (const thread of groupMailThreads(messages)) live.add(thread.threadId);
+  // A thread with an unreadable message still exists upstream: it is live for the sweep (never deleted), and stays live
+  // while a message hold keeps its page incomplete, even after the cursor has moved past the message.
+  const live = new Set<string>([...walk.seen, ...(listing.unavailableThreads ?? []), ...holdRun.blockedThreads()]);
+  const threads = groupMailThreads(allMessages);
+  for (const thread of threads) live.add(thread.threadId);
   // Open-loop bookkeeping: threads with a page this run, and those whose page did not land (failed render/import, held).
   const rendered = new Set<string>();
   const notLanded = new Set<string>();
   const landedSlug = new Map<string, string>();
-  for (const thread of groupMailThreads(messages)) {
+  for (const thread of threads) {
     if (aborted(ctx)) return;
-    const holdKey = `mail:${thread.threadId}`;
-    const first = await safeRender(ctx, holdKey, () => renderMailThreadPage(thread, deps.cfg.account));
+    const holdKey = threadHoldKey(thread.threadId);
+    // What a later re-attempt needs to rebuild this thread when it is no longer in the incremental listing.
+    const detail: FailDetail = { ref: encodeThreadRef(thread.messages), upstreamAt: thread.messages[thread.messages.length - 1]?.date ?? null };
+    const first = await safeRender(ctx, holdKey, () => renderMailThreadPage(thread, deps.cfg.account), detail);
     if (!first.ok) { live.add(thread.threadId); notLanded.add(thread.threadId); continue; }
     let page = first.value;
     if (!page) continue; // automated mail renders nothing
@@ -378,23 +402,23 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
       const stored = frontmatterByThread.get(thread.threadId) ?? {};
       let prior;
       try { prior = await loadMailPrior(ctx, existing, stored); } catch (e) {
-        if (ctx.holds.shouldAttempt(holdKey, null)) await failItem(ctx, holdKey, e, null, null);
+        if (ctx.holds.shouldAttempt(holdKey, null)) await failItem(ctx, holdKey, e, null, null, detail);
         notLanded.add(thread.threadId);
         continue;
       }
       if (prior) {
-        const carried = await safeRender(ctx, holdKey, () => renderMailThreadPage(thread, deps.cfg.account, prior));
+        const carried = await safeRender(ctx, holdKey, () => renderMailThreadPage(thread, deps.cfg.account, prior), detail);
         if (!carried.ok) { notLanded.add(thread.threadId); continue; }
         if (carried.value) page = carried.value;
       } else {
         // The stored page names messages this listing no longer returns and its body cannot be split back
         // into per-message blocks: rewriting it from the listing would silently drop them. Keep the page.
-        const listed = new Set(thread.messages.map((m) => m.id));
+        const listedIds = new Set(thread.messages.map((m) => m.id));
         const storedIds = Array.isArray(stored.apple_message_ids) ? stored.apple_message_ids.filter((x): x is string => typeof x === 'string') : [];
-        const dropped = storedIds.filter((id) => !listed.has(id));
+        const dropped = storedIds.filter((id) => !listedIds.has(id));
         if (dropped.length > 0) {
           if (ctx.holds.shouldAttempt(holdKey, null)) {
-            await failItem(ctx, holdKey, new Error(`stored mail page ${existing} holds ${dropped.length} message(s) the reader no longer lists and cannot be carried forward; page left unchanged`), null, null);
+            await failItem(ctx, holdKey, new Error(`stored mail page ${existing} holds ${dropped.length} message(s) the reader no longer lists and cannot be carried forward; page left unchanged`), null, null, detail);
           }
           notLanded.add(thread.threadId);
           continue;
@@ -411,14 +435,17 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
       if (existing && existing !== final.relPath) await deletePageByRelPath(deps, existing, summary);
       state.mail.hashes[thread.threadId] = hash;
       pathByThread.set(thread.threadId, final.relPath);
-    });
+    }, detail);
     if (!landed) notLanded.add(thread.threadId);
   }
   if (aborted(ctx)) return;
+  // A message read again only clears its hold (or counts as a healthy attempt) when its thread's page landed.
+  settleReadMessages(ctx.holds, holdRun, allMessages, notLanded);
+  const blockedThreads = holdRun.blockedThreads();
 
   // The removal verdict needs a complete listing of the whole window: an incremental read, a capped read
-  // and an unreadable-message read are all partial views.
-  if (walk.purpose === 'full' && !truncated && readable && (listing.unavailableThreads?.length ?? 0) === 0 && summary.failedFiles === failedBefore && notLanded.size === 0) {
+  // and an unreadable-message read are all partial views. A held message's thread is live, so it never counts as gone.
+  if (walk.purpose === 'full' && !truncated && readable && !holdRun.pin && summary.failedFiles === failedBefore && notLanded.size === 0) {
     const gone: Array<{ key: string; path: string }> = [];
     for (const [tid, path] of pathByThread) {
       if (live.has(tid)) continue;
@@ -437,7 +464,7 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   if (trackLoops && state.mail_loops) {
     if (!readable) state.mail_loops.coverage_gap = true;
     else if (walk.purpose !== 'incremental' && !truncated && live.size > 0 && summary.failedFiles === failedBefore
-      && (listing.unavailableThreads?.length ?? 0) === 0) delete state.mail_loops.coverage_gap;
+      && !holdRun.pin) delete state.mail_loops.coverage_gap;
     if (state.mail_loops.coverage_gap) ctx.loops?.gaps.push('unresolved_coverage');
   }
   if (trackLoops && ctx.loops) {
@@ -452,16 +479,29 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
     }
     // A rendered thread whose page is not in the brain (pending managed write) cannot carry a loop yet.
     for (const id of rendered) if (!slugByThread.has(id)) notLanded.add(id);
+    // A thread whose page import is HELD keeps coverage incomplete like a held message does, wherever the cursor is
+    // (also when the incremental read no longer lists it), without a whole-window re-read per run.
+    const heldThreads = new Set(blockedThreads);
+    const listedThreads = new Set(threads.map((t) => t.threadId));
+    for (const record of Object.values(ctx.holds.holds.initial().items)) {
+      if (record.state !== 'held' || !record.key.startsWith(MAIL_THREAD_KEY)) continue;
+      const id = record.key.slice(MAIL_THREAD_KEY.length);
+      if (!listedThreads.has(id) || notLanded.has(id)) heldThreads.add(id);
+    }
     await trackMailLoops({
       engine: deps.engine, sourceId: deps.sourceId, cfg: deps.cfg, state, log: deps.log, now: deps.now, ...signalOf(ctx),
-      run: ctx.loops, messages, slugByThread, notLanded, unavailableThreads: new Set(listing.unavailableThreads ?? []),
-      listingClean: !truncated && readable && (listing.unavailableThreads?.length ?? 0) === 0 && summary.failedFiles === failedBefore && notLanded.size === 0 && !summary.incomplete.some(g => g.startsWith('mail:')),
+      run: ctx.loops, messages: allMessages, slugByThread, notLanded, unavailableThreads: new Set(listing.unavailableThreads ?? []),
+      heldThreads, recoveredThreads: holdRun.clearedThreads(),
+      listingClean: !truncated && readable && !holdRun.pin && summary.failedFiles === failedBefore && [...notLanded].every(id => heldThreads.has(id)) && !summary.incomplete.some(g => g.startsWith('mail:')),
     });
   }
 
   state.mail.since = windowStart.toISOString();
   const newestMs = messages.reduce((m, x) => Math.max(m, Date.parse(x.date) || 0), 0);
-  const unresolved = !readable || (listing.unavailableThreads?.length ?? 0) > 0 || summary.failedFiles !== failedBefore || notLanded.size > 0
+  // A thread that did not land blocks the cursor unless it was already held when the run began (held threads are visible
+  // through the holds and never hold a cursor back); a first-time failure, a pending write or a non-item error does.
+  const landingPin = [...notLanded].some((id) => !ctx.holds.holds.isHeld(threadHoldKey(id)));
+  const unresolved = !readable || holdRun.pin || (ctx.pins ?? 0) !== pinsBefore || landingPin
     || (!truncated && summary.incomplete.some(g => g.startsWith('mail:')));
   if (!unresolved && truncated && messages.length > 0) {
     // Advance by a stable (date,id) key, not timestamp alone: Mail.app can have

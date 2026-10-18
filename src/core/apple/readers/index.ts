@@ -4,7 +4,7 @@ import { AppleReaderError, readerError } from './errors.ts';
 import { assertDarwin } from './run-helper.ts';
 import { readCalendar, probeCalendar, requestCalendarAccess, type HelperOverrides } from './calendar.ts';
 import { readContacts, probeContacts, requestContactsAccess } from './contacts.ts';
-import { readMail, probeMail } from './mail.ts';
+import { readMail, readMailMessages, probeMail } from './mail.ts';
 
 export { AppleReaderError, fixFor, readerError } from './errors.ts';
 export type { AppleReaderErrorCode } from './errors.ts';
@@ -23,6 +23,10 @@ export function createAppleReaders(overrides: HelperOverrides = {}): AppleReader
     async mail(opts) {
       assertDarwin('mail', overrides.platform);
       return readMail(opts, overrides);
+    },
+    async mailMessages(opts) {
+      assertDarwin('mail', overrides.platform);
+      return readMailMessages(opts, overrides);
     },
     /**
      * Run the service's access request once so macOS shows its prompt. Calendar and Contacts use the

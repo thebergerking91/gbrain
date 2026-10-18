@@ -97,6 +97,13 @@ export interface TrackInput {
   notLanded: ReadonlySet<string>;
   /** Threads with an unreadable message: never judged. */
   unavailableThreads: ReadonlySet<string>;
+  /**
+   * Threads with an outstanding unreadable-message HOLD (the cursor has moved, or may move, past the message): never
+   * judged, and Mail coverage stays incomplete until the message is read again. They do not force a whole-window re-read.
+   */
+  heldThreads?: ReadonlySet<string>;
+  /** Threads whose message hold this run settled: re-judged from their durable page even if the listing did not return them. */
+  recoveredThreads?: ReadonlySet<string>;
   /** The listing was complete (not truncated, readable) and no mail item failed this run. */
   listingClean: boolean;
 }
@@ -154,9 +161,12 @@ export async function trackMailLoops(input: TrackInput): Promise<void> {
 
   // The page is the recoverable evidence store. Re-evaluate all imported threads, including quiet
   // grace-held threads and eligible revisions outside the incremental overlap. Cache eviction is irrelevant.
+  const held = input.heldThreads ?? new Set<string>();
+  const recovered = input.recoveredThreads ?? new Set<string>();
   const pending = new Set(loops.pending_threads ?? []);
   for (const id of input.unavailableThreads) pending.add(id);
   for (const id of input.notLanded) pending.add(id);
+  for (const id of held) pending.add(id);
   const rows = await input.engine.executeRaw<{ slug: string; frontmatter: Record<string, unknown> }>(
     `SELECT slug, frontmatter FROM pages WHERE source_id=$1 AND deleted_at IS NULL
       AND frontmatter->>'apple_thread_id' IS NOT NULL`, [input.sourceId]);
@@ -164,9 +174,9 @@ export async function trackMailLoops(input: TrackInput): Promise<void> {
   for (const page of rows) {
     if (input.signal?.aborted) { run.gaps.push('aborted'); break; }
     const id = String(page.frontmatter.apple_thread_id);
-    if (input.unavailableThreads.has(id) || input.notLanded.has(id)) continue;
+    if (input.unavailableThreads.has(id) || input.notLanded.has(id) || held.has(id)) continue;
     // An earlier unavailable/import-failed slice is not repaired by an old stored page alone.
-    if (pending.has(id) && !listed.has(id)) continue;
+    if (pending.has(id) && !listed.has(id) && !recovered.has(id)) continue;
     const evidence = pageLoopMessages(page.frontmatter);
     const thread = evidence && toLoopThread(id, evidence, cfg.account);
     if (!thread) {
@@ -191,8 +201,16 @@ export async function trackMailLoops(input: TrackInput): Promise<void> {
   const obligations = await input.engine.executeRaw<{ thread_id: string }>(`SELECT DISTINCT thread_id FROM open_loops
     WHERE source_id=$1 AND status='open' AND detector='deterministic_thread' AND thread_id IS NOT NULL`, [input.sourceId]);
   for (const { thread_id } of obligations) if (!detected.has(thread_id)) pending.add(thread_id);
+  // A recovered thread with no page has nothing left to judge; it is no longer pending (a page that failed to land stays so).
+  const pages = new Set(rows.map(page => String(page.frontmatter.apple_thread_id)));
+  for (const id of recovered) {
+    if (!pages.has(id) && !input.notLanded.has(id) && !input.unavailableThreads.has(id) && !held.has(id)) pending.delete(id);
+  }
   loops.pending_threads = [...pending].sort();
-  if (pending.size > 0) run.gaps.push('unresolved_threads');
+  // Threads pending ONLY because a message hold keeps them incomplete block freshness but not the cursor's way forward:
+  // they are re-judged when the message is read again, not by re-reading the whole window every run.
+  const heldOnly = pending.size > 0 && [...pending].every(id => held.has(id));
+  if (pending.size > 0) run.gaps.push(heldOnly ? 'held_messages' : 'unresolved_threads');
   if (!input.listingClean) run.gaps.push('mail_listing_partial');
   if (run.gaps.length === 0) {
     loops.complete_at = new Date(input.now()).toISOString();
@@ -201,6 +219,12 @@ export async function trackMailLoops(input: TrackInput): Promise<void> {
     return;
   }
   delete loops.complete_at;
+  if (run.gaps.every(gap => gap === 'held_messages')) {
+    // The whole window was re-read cleanly and only held messages remain: nothing more to re-read for them.
+    delete loops.reread;
+    log('[apple] mail loops not fresh this run (held_messages); coverage stays incomplete until the held message(s) are read again');
+    return;
+  }
   loops.reread = true;
   log(`[apple] mail loops not fresh this run (${[...new Set(run.gaps)].join(', ')}); unresolved coverage is retried before freshness`);
 }

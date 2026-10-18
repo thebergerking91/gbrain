@@ -33,6 +33,7 @@ import { AppleReaderError } from './readers/errors.ts';
 import { parseAppleSourceConfig } from './source-config.ts';
 import { emptyAppleState, normalizeAppleState, readAppleState, writeAppleState } from './state.ts';
 import { appleLoopsAvailability } from './loops-status.ts';
+import { mailHoldGroup } from './mail-holds.ts';
 import { enqueueAppleLoopsExtraction, newAppleLoopsRun, prepareLoopsState } from './loops.ts';
 import { sweepCalendar, sweepContacts, sweepMail, type AppleSweepCtx } from './sweep.ts';
 import {
@@ -163,7 +164,7 @@ async function runAppleSyncInner(
   const firstRun = Object.keys(state.calendar.hashes).length + Object.keys(state.contacts.hashes).length + Object.keys(state.mail.hashes).length === 0
     && state.calendar.window === undefined && state.mail.since === undefined;
   const holds = await ConnectorHoldSession.open(engine, sourceId, managed, emptyAppleState() as unknown as Record<string, unknown>,
-    state.item_holds, { full: opts.full });
+    state.item_holds, { full: opts.full, groupOf: mailHoldGroup, now: deps.now });
   state.item_holds = holds.holds.initial();
   progress.start('sync.apple_materialize');
 

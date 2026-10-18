@@ -87,6 +87,20 @@ export interface AppleMailMessage {
   bulk?: boolean;
 }
 
+/** One message the reader proved unreadable (stable id, received date, owning thread). */
+export interface AppleUnavailableMessage {
+  id: string;
+  /** ISO 8601 received date, the same value the message carries when readable. */
+  date: string;
+  threadId: string;
+}
+
+/** A specific message to re-read wherever it is, outside the incremental read window. */
+export interface AppleMailTarget {
+  id: string;
+  date: string;
+}
+
 /**
  * What a mail reader may return instead of a bare array when it knows the
  * listing is not the whole story. A bare `AppleMailMessage[]` means "complete".
@@ -99,6 +113,20 @@ export interface AppleMailListing {
   budgetExhausted?: boolean;
   /** Threads with a message that could not be read: present in the account, so never to be swept as deleted. */
   unavailableThreads?: string[];
+  /**
+   * Messages PROVEN unreadable: the reader tried each one on its own (or got a definite "no body" for it) and failed,
+   * with the stable id, the received date and the thread it belongs to. Only these may feed an item hold, because
+   * only these identify the poison message rather than its batch neighbours.
+   */
+  unavailableMessages?: AppleUnavailableMessage[];
+  /**
+   * The subset of `unavailableThreads` that is NOT explained by a proven message (a batch that failed and could not be
+   * retried in time, a message that vanished mid-read): the cursor stays pinned and nothing is counted. When omitted
+   * next to `unavailableMessages`, every unavailable thread without a proven message is treated as deferred.
+   */
+  deferredThreads?: string[];
+  /** Targeted reads only: requested messages the mailbox no longer has (deleted or moved); their holds can be dropped. */
+  targetMissing?: string[];
   /** A message could not even be attributed to a thread: nothing may be swept as deleted this run. */
   incomplete?: boolean;
 }
@@ -117,8 +145,15 @@ export interface AppleReaders {
     max?: number;
     /** Exclusive stable cursor; used with `since` at date-1ms for tied timestamps. */
     after?: { date: string; id: string };
+    /** Stable ids of held messages the reader must not read (it neither lists nor reports them). */
+    exclude?: string[];
     signal?: AbortSignal;
   }): Promise<AppleMailMessage[] | AppleMailListing>;
+  /**
+   * Re-reads specific messages by stable id and received date, wherever they are. Optional: a reader without it
+   * cannot retry a held message outside the incremental window (the hold stays, visible).
+   */
+  mailMessages?(opts: { mailboxes: string[]; targets: AppleMailTarget[]; signal?: AbortSignal }): Promise<AppleMailListing>;
   probe(
     service: AppleService,
   ): Promise<{ ok: true } | { ok: false; code: AppleReaderErrorCode; fix: string }>;

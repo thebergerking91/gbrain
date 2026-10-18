@@ -184,9 +184,38 @@ so one single call that is itself slower than the time left (or a slow start-up 
 is only stopped by the hard `helper_timeout` kill. If one batch cannot be read, its messages are retried
 one by one while time allows; a message that still cannot be read (or whose body comes back missing, or
 that vanishes mid-read) keeps its thread unavailable and the cursor does not move past it, so it is
-retried next run, never imported as an empty body. A message that stays unreadable pins the cursor at
-its position (the reader reports `mail:unavailable_threads` every run); skipping such a message needs an
-explicit quarantine decision that this guide does not make for you. A paginated walk freezes its starting window and
+retried next run, never imported as an empty body.
+
+**A message that stays unreadable is held, like a Gmail thread.** Only a message the helper *proved*
+unreadable on its own (a single-message read that failed, or a body that came back missing) counts: a batch
+neighbour that was merely not retried in time, a message that vanished mid-read, an unattributable message, a
+permission or automation error, a helper timeout and a budget stop are never holds and keep pinning the cursor
+exactly as before. Three runs that each attempted the same message and failed hold it (the same threshold, hold
+storage, `gbrain sources retry-held`, doctor check and `gbrain sources status` listing as Gmail). Until then
+those runs keep the cursor where it was, and healthy messages around the poison still import. From the next run
+on the held message is excluded from the read (it costs no body time and cannot starve its neighbours), the
+cursor and later mail move on, and:
+
+- its thread stays **live**: a full walk never removes the page of a thread that still has a held message, and
+  the thread page simply lacks the message until it is read again;
+- Mail open-loop coverage stays **incomplete** (`gbrain waiting` reports it) until the message is actually read
+  again, however old it is and even though the cursor has moved on;
+- `gbrain sources retry-held <id>`, a due transient reconsideration (1 h, 6 h, 24 h, then daily for 7 days) and
+  `gbrain sync --full` re-read the message **by its stable id and received date**, wherever it is, so a held
+  message older than the incremental two-day overlap is still reachable. A read that succeeds merges the message
+  into its thread page and clears the hold; one that fails again stays held without pinning the cursor; a
+  message deleted upstream is dropped. A failed or timed-out retry read is a source error: it counts nothing;
+- a thread whose page *import* is held (3 failed runs) no longer pins the cursor either; it remembers the
+  messages it was built from (up to 100 per thread; a longer thread is reached by `sync --full`) and is rebuilt
+  the same way. At most 25 messages are re-read by id per run; the rest stay due for the next run;
+- the circuit breaker judges messages and threads separately, so a Mail.app outage (most messages unreadable at
+  once) counts no failure however many threads imported, and at most 100 items per source are held (a run that
+  would exceed it fails before saving, so the cursor stays).
+
+This is bounded by what the helper can observe: a single Mail scripting call that blocks cannot be interrupted
+from inside the script, so a message whose read hangs is only ever stopped by the hard `helper_timeout`, which is
+a source error and never counts toward a hold. The soft body budget limits how many reads start; it does not
+guarantee a run finishes. A paginated walk freezes its starting window and
 records its purpose, scope/owner digest and the union of seen thread ids in
 `mail.walk`. Full reconciliation waits for the **entire** full walk, never just
 its final suffix. A new full walk or changed identity discards an incompatible

@@ -328,3 +328,59 @@ test("F6 boundary managed cancellation preserves a nonempty cursor despite a new
     expect(pages).toEqual([{ tid: "old" }]);
   }
 }), 180_000);
+
+test('managed Mail poison recovery: three failed runs hold the message, the cursor and later mail move on, the thread stays incomplete, retry-held reads it by id and recovers', async () => withEnv(env, async () => {
+  const { loopsOperations } = await import('../src/core/ops/loops.ts');
+  const { readAllSourceHolds } = await import('../src/core/connectors/item-holds-store.ts');
+  const { retryHeld } = await import('../src/commands/sources-retry-held.ts');
+  const { OWNER, DAY, fakeMail, mk, readersOf } = await import('./helpers/apple-mail-fake.ts');
+  for (const engine of engines) {
+    const raw = { kind: 'apple', a_account: 'alice-example', a_services: 'mail', a_mail_days: 60, a_mail_owner_addresses: OWNER };
+    const f = await source(engine, raw), cfg = parseAppleSourceConfig({ ...raw, a_dir: f.dir }, f.dir);
+    // Freshness is judged against the real clock, so the synthetic mailbox is dated relative to it.
+    const T0 = Date.now(), dayIso = (n: number): string => new Date(T0 - n * DAY).toISOString();
+    const msg = (id: string, thread: string, n: number) => mk(id, thread, 0, { date: dayIso(n) });
+    const mail = fakeMail([msg('<a@x>', 'thr-a', 20)]);
+    const run = () => runAppleSync(engine, f.id, cfg, { ...options, sourceId: f.id }, { readers: readersOf(mail), now: () => T0, log: () => {} });
+    const saved = async (): Promise<AppleSourceState> => ((await sourceCheckpoint(engine, f.id)) as { completed_keys: { state: AppleSourceState }[] }[])[0]!.completed_keys[0]!.state;
+    const held = async () => (await readAllSourceHolds(engine, { sourceIds: [f.id] }))[0]?.held ?? [];
+    const ctx = { engine, config: {}, logger: { info() {}, warn() {}, error() {} }, dryRun: false, remote: false, sourceId: f.id } as never;
+    const answer = async () => loopsOperations.find((o) => o.name === 'open_loops')!.handler(ctx, { source_id: f.id, group_by: 'counterparty', include_context: false }) as Promise<{ stale: boolean; completeness: string }>;
+    const pageHas = async (needle: string) => (await engine.executeRaw<{ compiled_truth: string }>(
+      "SELECT compiled_truth FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND frontmatter->>'apple_thread_id' IS NOT NULL", [f.id])).some((p) => p.compiled_truth.includes(needle));
+
+    await completeBaselineSweep(engine, f.id, run); await disposePersistenceConsumer(engine);
+    const baselineNewest = (await saved()).mail.newest;
+    expect(await answer()).toMatchObject({ stale: false, completeness: 'complete' });
+
+    mail.box.push(msg('<p@x>', 'thr-a', 19), msg('<b@x>', 'thr-b', 18));
+    mail.unreadable.add('<p@x>');
+    for (let i = 1; i <= 3; i++) {
+      expect((await run()).status).toBe('partial');
+      await disposePersistenceConsumer(engine);
+      // A failed run pins the cursor; the healthy sibling and the neighbouring thread still import.
+      expect((await saved()).mail.newest).toBe(baselineNewest);
+    }
+    expect(await pageHas('Synthetic body of <b@x>.')).toBe(true);
+    expect(await held()).toEqual([expect.objectContaining({ key: 'mail-message:<p@x>', state: 'held', attempts: 3, ref: 'thr-a', meta: expect.objectContaining({ upstream_at: dayIso(19) }) })]);
+
+    // Held at the start of run 4: excluded from the read, the cursor passes it, and later mail imports.
+    mail.box.push(msg('<c@x>', 'thr-c', 1));
+    const fourth = await run(); await disposePersistenceConsumer(engine);
+    expect(mail.main.at(-1)!.exclude).toEqual(['<p@x>']);
+    expect(fourth.status).not.toBe('partial');
+    expect(Date.parse((await saved()).mail.newest!)).toBeGreaterThan(Date.parse(baselineNewest!));
+    expect(await pageHas('Synthetic body of <c@x>.')).toBe(true);
+    expect(await answer()).toMatchObject({ completeness: 'partial' });
+
+    // Recovery through retry-held: the message is read by id and the thread page carries it; coverage completes.
+    mail.unreadable.clear();
+    expect((await retryHeld(engine, f.id)).scheduled).toBe(1);
+    const recovered = await run(); await disposePersistenceConsumer(engine);
+    expect(recovered.status).not.toBe('partial');
+    expect(await held()).toEqual([]);
+    expect(await pageHas('Synthetic body of <p@x>.')).toBe(true);
+    expect((await saved()).mail_loops?.pending_threads).toEqual([]);
+    expect(await answer()).toMatchObject({ stale: false, completeness: 'complete' });
+  }
+}), 240_000);

@@ -551,8 +551,12 @@ function makeMailVm(opts: MailVmOpts) {
     const mb: any = { name: () => label, id: () => `${label}-example` };
     mb.messages = { whose: (query: any) => {
       let idx = [...box.ids];
-      const newerThan = query?.dateReceived?._greaterThan;
-      if (newerThan instanceof Date) idx = idx.filter((i) => box.dates[i]!.getTime() > newerThan.getTime());
+      for (const clause of Array.isArray(query?._and) ? query._and : [query]) {
+        const newerThan = clause?.dateReceived?._greaterThan;
+        const notAfter = clause?.dateReceived?._lessThanEquals;
+        if (newerThan instanceof Date) idx = idx.filter((i) => box.dates[i]!.getTime() > newerThan.getTime());
+        if (notAfter instanceof Date) idx = idx.filter((i) => box.dates[i]!.getTime() <= notAfter.getTime());
+      }
       let selection = false;
       if (Array.isArray(query?._or)) {
         selection = true;
@@ -725,6 +729,110 @@ describe('mail.js bounded body reads (real helper in a vm, synthetic mailbox)', 
     expect(doc.items).toHaveLength(3);
     expect(doc.budget_exhausted).toBe(true);
     expect(t.contentCalls).toHaveLength(1);
+  });
+});
+
+describe('mail.js message-level verdicts (real helper in a vm, synthetic mailbox)', () => {
+  const idOf = (n: number): string => `<INBOX-${n}>`;
+  const proven = (doc: any): Array<{ id: string; date: string; thread_id: string }> => [...doc.unavailable_messages].sort((a, b) => (a.id < b.id ? -1 : 1));
+
+  test('only the message read on its own and found unreadable is proven; its healthy batch neighbours are not blamed', () => {
+    const t = ids6({ throwFor: (ids) => ids.includes(1) });
+    const doc = t.invoke(MAIL_ARGV);
+    expect(proven(doc)).toEqual([{ id: idOf(1), date: mailDates(1).toISOString(), thread_id: idOf(1) }]);
+    expect(doc.deferred).toEqual([]);
+    expect(doc.unavailable).toEqual([idOf(1)]);
+  });
+
+  test('a batch that failed and could not be retried in time is deferred, never proven (nothing may count it)', () => {
+    const t = ids6({ bodyMs: 50_000, throwFor: (ids) => ids.length > 1 });
+    const doc = t.invoke(MAIL_ARGV);
+    expect(doc.unavailable.sort()).toEqual([idOf(1), idOf(2)]);
+    expect(doc.unavailable_messages).toEqual([]);
+    expect(doc.deferred.sort()).toEqual([idOf(1), idOf(2)]);
+  });
+
+  test('a missing (null) body is proven unreadable; a body whose id vanished mid-read is deferred; an id with no metadata is incomplete', () => {
+    const nul = ids6({ nullBodyFor: new Set(['INBOX1']) }).invoke(MAIL_ARGV);
+    expect(proven(nul).map((m) => m.id)).toEqual([idOf(1)]);
+    expect(nul.deferred).toEqual([]);
+    const vanished = ids6({ vanishAfterMeta: new Set(['INBOX1']) }).invoke(MAIL_ARGV);
+    expect(vanished.unavailable_messages).toEqual([]);
+    expect(vanished.deferred).toEqual([idOf(1)]);
+    const noMeta = ids6({ vanishBeforeMeta: new Set(['INBOX2']) }).invoke(MAIL_ARGV);
+    expect(noMeta.unavailable_messages).toEqual([]);
+    expect(noMeta.incomplete).toBe(true);
+  });
+
+  test('--exclude: a held message is never listed, read or reported, costs no body time and does not count toward the cap', () => {
+    const t = ids6({ throwFor: (ids) => ids.includes(1) });
+    const doc = t.invoke([...MAIL_ARGV, '--exclude', JSON.stringify([idOf(1)])]);
+    expect(idsOf(doc)).toEqual([0, 2, 3, 4, 5].map(idOf));
+    expect(doc.unavailable).toEqual([]);
+    expect(doc.unavailable_messages).toEqual([]);
+    expect(t.contentCalls.flat()).not.toContain(1);
+    const capped = ids6().invoke(['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX,Sent', '--max', '3', '--budget-ms', '45000', '--exclude', JSON.stringify([idOf(1)])]);
+    expect(idsOf(capped)).toEqual([0, 2, 3].map(idOf));
+    expect(capped.truncated).toBe(true);
+  });
+
+  test('--targets reads exactly the named messages wherever they are (outside any window), reports the missing ones, and proves unreadable ones', () => {
+    const argv = (targets: Array<{ id: string; date: string }>) => ['--targets', JSON.stringify(targets), '--mailboxes', 'INBOX,Sent', '--budget-ms', '45000'];
+    const t = ids6({ throwFor: (ids) => ids.includes(4) });
+    const doc = t.invoke(argv([
+      { id: idOf(2), date: mailDates(2).toISOString() },
+      { id: idOf(4), date: mailDates(4).toISOString() },
+      { id: '<gone@example.com>', date: mailDates(3).toISOString() },
+    ]));
+    expect(idsOf(doc)).toEqual([idOf(2)]);
+    expect(doc.target_missing).toEqual(['<gone@example.com>']);
+    expect(proven(doc)).toEqual([{ id: idOf(4), date: mailDates(4).toISOString(), thread_id: idOf(4) }]);
+    // Nothing but the two found messages was ever read for a body.
+    expect(new Set(t.contentCalls.flat())).toEqual(new Set([2, 4]));
+    expect(doc.truncated).toBe(false);
+  });
+});
+
+describe('mail reader listing documents carry message identity', () => {
+  const readerFor = (doc: Record<string, unknown>) => {
+    const script = join(dir, `mail-doc-${Math.random().toString(36).slice(2)}.js`);
+    writeFileSync(script, `process.stdout.write(JSON.stringify(Object.assign({items:[{id:'m1',date:'2026-01-02T10:00:00Z'}]}, ${JSON.stringify(doc)}, {args:process.argv.slice(2)})))`);
+    return createAppleReaders({ command: process.execPath, scriptArgs: [script], platform: 'darwin' });
+  };
+
+  test('proven unreadable messages, deferred threads and missing targets flow through; an old document without them stays unchanged', async () => {
+    const r = readerFor({ unavailable: ['t1', 't2'], unavailable_messages: [{ id: 'm9', date: '2026-01-01T10:00:00Z', thread_id: 't1' }], deferred: ['t2'], target_missing: ['m7'] });
+    const listing = await r.mail({ since: new Date(0), mailboxes: ['INBOX'] }) as import('../src/core/apple/types.ts').AppleMailListing;
+    expect(listing.unavailableMessages).toEqual([{ id: 'm9', date: '2026-01-01T10:00:00Z', threadId: 't1' }]);
+    expect(listing.deferredThreads).toEqual(['t2']);
+    expect(listing.targetMissing).toEqual(['m7']);
+    expect(listing.incomplete).toBe(false);
+    const old = await readerFor({ unavailable: ['t1'] }).mail({ since: new Date(0), mailboxes: ['INBOX'] }) as import('../src/core/apple/types.ts').AppleMailListing;
+    expect(old.unavailableMessages).toBeUndefined();
+    expect(old.deferredThreads).toBeUndefined();
+    expect(old.unavailableThreads).toEqual(['t1']);
+  });
+
+  test('an unreadable-message entry without a stable id, a date or a thread is dropped and the listing is incomplete (unknown identity stays conservative)', async () => {
+    for (const bad of [{ date: '2026-01-01T10:00:00Z', thread_id: 't1' }, { id: 'm9', thread_id: 't1' }, { id: 'm9', date: '2026-01-01T10:00:00Z' }, { id: 'm9', date: 'not a date', thread_id: 't1' }]) {
+      const listing = await readerFor({ unavailable: ['t1'], unavailable_messages: [bad] }).mail({ since: new Date(0), mailboxes: ['INBOX'] }) as import('../src/core/apple/types.ts').AppleMailListing;
+      expect(listing.unavailableMessages).toEqual([]);
+      expect(listing.incomplete).toBe(true);
+    }
+  });
+
+  test('--exclude and --targets are passed as JSON argv entries; a targeted read sends no --since', async () => {
+    const r = readerFor({});
+    const main = await r.mail({ since: new Date(0), mailboxes: ['INBOX'], exclude: ['<a b,c@x>'] }) as any;
+    expect(Array.isArray(main) ? [] : main.messages).toHaveLength(1);
+    const echo = createAppleReaders({ command: process.execPath, scriptArgs: [(() => { const f = join(dir, 'mail-echo.js'); writeFileSync(f, `process.stdout.write(JSON.stringify({items:[{id:'m1',date:'2026-01-02T10:00:00Z',subject:JSON.stringify(process.argv.slice(2))}]}))`); return f; })()], platform: 'darwin' });
+    const argsOf = async (read: () => Promise<any>): Promise<string[]> => JSON.parse((await read()).messages[0].subject);
+    const mainArgs = await argsOf(() => echo.mail({ since: new Date(0), mailboxes: ['INBOX'], exclude: ['<a b,c@x>'] }));
+    expect(JSON.parse(mainArgs[mainArgs.indexOf('--exclude') + 1]!)).toEqual(['<a b,c@x>']);
+    const targetArgs = await argsOf(() => echo.mailMessages!({ mailboxes: ['INBOX'], targets: [{ id: '<a@x>', date: '2026-01-02T10:00:00Z' }] }));
+    expect(JSON.parse(targetArgs[targetArgs.indexOf('--targets') + 1]!)).toEqual([{ id: '<a@x>', date: '2026-01-02T10:00:00Z' }]);
+    expect(targetArgs).not.toContain('--since');
+    expect(targetArgs).toContain('--timeout-ms');
   });
 });
 

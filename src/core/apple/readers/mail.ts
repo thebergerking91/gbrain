@@ -1,7 +1,6 @@
 /** Mail reader: Mail.app public scripting dictionary via scripts/apple/mail.js (JXA, read-only). */
 import { fileURLToPath } from 'node:url';
-import type { AppleMailListing } from '../types.ts';
-import type { AppleMailMessage } from '../types.ts';
+import type { AppleMailListing, AppleMailMessage, AppleMailTarget, AppleUnavailableMessage } from '../types.ts';
 import { readerError } from './errors.ts';
 import { DEFAULT_HELPER_TIMEOUT_MS, runHelperDocument } from './run-helper.ts';
 import { str, strArray, withScriptArgs, type HelperOverrides } from './calendar.ts';
@@ -49,24 +48,66 @@ export function normalizeMessage(raw: unknown): AppleMailMessage {
 
 const OSASCRIPT_PREFIX = ['-l', 'JavaScript'];
 
+/**
+ * The proven-unreadable messages of a helper document. An entry without a stable id, a parseable date and a thread
+ * cannot identify what to hold, so it is dropped and the listing is reported `incomplete` instead (conservative: the
+ * cursor stays pinned and nothing is counted or removed).
+ */
+function unavailableMessagesOf(doc: Record<string, unknown>): { messages: AppleUnavailableMessage[]; malformed: boolean } {
+  const raw = Array.isArray(doc.unavailable_messages) ? doc.unavailable_messages : [];
+  const messages: AppleUnavailableMessage[] = [];
+  let malformed = false;
+  for (const entry of raw) {
+    const o = (entry && typeof entry === 'object' ? entry : {}) as Record<string, unknown>;
+    const id = str(o.id);
+    const date = str(o.date);
+    const threadId = str(o.thread_id);
+    if (id && date && threadId && Number.isFinite(Date.parse(date))) messages.push({ id, date, threadId });
+    else malformed = true;
+  }
+  return { messages, malformed };
+}
+
+function listingOf(items: unknown[], doc: Record<string, unknown>): AppleMailListing {
+  const proven = unavailableMessagesOf(doc);
+  return {
+    messages: items.map(normalizeMessage),
+    truncated: doc.truncated === true,
+    budgetExhausted: doc.budget_exhausted === true,
+    unavailableThreads: strArray(doc.unavailable),
+    ...(Array.isArray(doc.unavailable_messages) ? { unavailableMessages: proven.messages } : {}),
+    ...(Array.isArray(doc.deferred) ? { deferredThreads: strArray(doc.deferred) } : {}),
+    ...(Array.isArray(doc.target_missing) ? { targetMissing: strArray(doc.target_missing) } : {}),
+    incomplete: doc.incomplete === true || proven.malformed,
+  };
+}
+
 export async function readMail(
-  opts: { since: Date; mailboxes: string[]; max?: number; after?: { date: string; id: string }; signal?: AbortSignal },
+  opts: { since: Date; mailboxes: string[]; max?: number; after?: { date: string; id: string }; exclude?: string[]; signal?: AbortSignal },
   o: HelperOverrides = {},
 ): Promise<AppleMailListing> {
   const { items, doc } = await withScriptArgs('mail.js', o, OSASCRIPT_PREFIX, async (scriptArgs) => {
     const args = [...scriptArgs, '--since', opts.since.toISOString(), '--mailboxes', opts.mailboxes.join(',')];
     if (opts.max !== undefined) args.push('--max', String(opts.max));
     if (opts.after) args.push('--after-date', opts.after.date, '--after-id', opts.after.id);
+    if (opts.exclude?.length) args.push('--exclude', JSON.stringify(opts.exclude));
     args.push('--budget-ms', String(MAIL_BODY_BUDGET_MS), '--timeout-ms', String(o.timeoutMs ?? DEFAULT_HELPER_TIMEOUT_MS));
     return runHelperDocument({ service: 'mail', command: o.command ?? OSASCRIPT_BIN, args, signal: opts.signal, timeoutMs: o.timeoutMs, maxStdoutBytes: o.maxStdoutBytes, platform: o.platform, env: o.env });
   });
-  return {
-    messages: items.map(normalizeMessage),
-    truncated: doc.truncated === true,
-    budgetExhausted: doc.budget_exhausted === true,
-    unavailableThreads: strArray(doc.unavailable),
-    incomplete: doc.incomplete === true,
-  };
+  return listingOf(items, doc);
+}
+
+/** Re-reads specific messages (stable id + received date) wherever they are; same time limits as a listing read. */
+export async function readMailMessages(
+  opts: { mailboxes: string[]; targets: AppleMailTarget[]; signal?: AbortSignal },
+  o: HelperOverrides = {},
+): Promise<AppleMailListing> {
+  const { items, doc } = await withScriptArgs('mail.js', o, OSASCRIPT_PREFIX, async (scriptArgs) => {
+    const args = [...scriptArgs, '--targets', JSON.stringify(opts.targets.map((t) => ({ id: t.id, date: t.date }))), '--mailboxes', opts.mailboxes.join(','),
+      '--budget-ms', String(MAIL_BODY_BUDGET_MS), '--timeout-ms', String(o.timeoutMs ?? DEFAULT_HELPER_TIMEOUT_MS)];
+    return runHelperDocument({ service: 'mail', command: o.command ?? OSASCRIPT_BIN, args, signal: opts.signal, timeoutMs: o.timeoutMs, maxStdoutBytes: o.maxStdoutBytes, platform: o.platform, env: o.env });
+  });
+  return listingOf(items, doc);
 }
 
 export async function probeMail(o: HelperOverrides = {}): Promise<void> {
