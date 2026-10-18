@@ -33,7 +33,8 @@ import { AppleReaderError } from './readers/errors.ts';
 import { parseAppleSourceConfig } from './source-config.ts';
 import { emptyAppleState, normalizeAppleState, readAppleState, writeAppleState } from './state.ts';
 import { appleLoopsAvailability } from './loops-status.ts';
-import { applyThreadRefs, mailHoldGroup } from './mail-holds.ts';
+import { applyThreadRefs, mailHoldGroup, retainedUnits } from './mail-holds.ts';
+import { reconcileRecovery } from './mail-recovery.ts';
 import { enqueueAppleLoopsExtraction, newAppleLoopsRun, prepareLoopsState } from './loops.ts';
 import { sweepCalendar, sweepContacts, sweepMail, type AppleSweepCtx } from './sweep.ts';
 import {
@@ -242,6 +243,8 @@ async function runAppleSyncInner(
     // Throws connector_holds_exhausted before any save, so the cursor stays.
     state.item_holds = holds.finish();
     if (ctx.mailRefs?.size) applyThreadRefs(state.item_holds, ctx.mailRefs);
+    // The staged recovery evidence follows the holds just merged: a cleared hold takes its mail text with it (same checkpoint write).
+    reconcileRecovery(state, retainedUnits(state.item_holds), deps.now());
     // Every cursor here is a content hash set only after its item landed, so a partial run's state is safe to
     // save: a denied or failing service leaves its own hashes untouched and cannot stall the services that
     // succeeded. Freshness moves when at least one service synced cleanly.
@@ -253,7 +256,7 @@ async function runAppleSyncInner(
           // A pending publication cannot leave the previous complete Mail answer authoritative.
           if (state.mail_loops) { delete state.mail_loops.complete_at; state.mail_loops.reread = true; }
           await managed.publishHolds(emptyAppleState() as unknown as Record<string, unknown>, state.item_holds,
-            { last_probe: state.last_probe, ...(state.mail_loops ? { mail_loops: state.mail_loops } : {}) });
+            { last_probe: state.last_probe, ...(state.mail_loops ? { mail_loops: state.mail_loops } : {}), mail_recovery: state.mail_recovery });
         }
       }
     } else {

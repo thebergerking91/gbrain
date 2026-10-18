@@ -8,6 +8,7 @@ import { chmodSync, existsSync, readFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { atomicWriteFileSync, mkdirPrivate } from '../atomic-write.ts';
+import { normalizeMailRecovery } from './mail-recovery.ts';
 import type { AppleLoopGraceHold, AppleLoopMessage, AppleMailLoopsState, AppleSourceState } from './types.ts';
 
 export function appleStateFile(dir: string): string {
@@ -86,6 +87,7 @@ export function normalizeAppleState(parsed: unknown): AppleSourceState {
     },
     item_holds: isRecord(parsed.item_holds) ? parsed.item_holds : undefined,
     ...(loopsState(parsed.mail_loops) ? { mail_loops: loopsState(parsed.mail_loops)! } : {}),
+    ...(normalizeMailRecovery(parsed.mail_recovery) ? { mail_recovery: normalizeMailRecovery(parsed.mail_recovery)! } : {}),
     ...(typeof parsed.last_full_at === 'string' ? { last_full_at: parsed.last_full_at } : {}),
     ...(isRecord(parsed.last_probe) ? { last_probe: parsed.last_probe as AppleSourceState['last_probe'] } : {}),
   };

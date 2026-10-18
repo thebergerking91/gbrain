@@ -545,6 +545,6 @@ describe('Apple Mail poison recovery — remembered thread messages', () => {
   test('a thread longer than the bound is remembered as a whole-window locator, never as a partial list that would rebuild it without its older messages', () => {
     const many = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `<m${i}@x>`, date: dayIso(1) }));
     expect(JSON.parse(encodeThreadRef(many(APPLE_THREAD_REF_MAX))).m).toHaveLength(APPLE_THREAD_REF_MAX);
-    expect(JSON.parse(encodeThreadRef(many(APPLE_THREAD_REF_MAX + 1)))).toEqual({ w: APPLE_THREAD_REF_MAX + 1 });
+    expect(JSON.parse(encodeThreadRef(many(APPLE_THREAD_REF_MAX + 1)))).toEqual({ w: APPLE_THREAD_REF_MAX + 1, o: dayIso(1) });
   });
 });

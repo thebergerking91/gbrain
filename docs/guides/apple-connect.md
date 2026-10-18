@@ -208,17 +208,27 @@ cursor and later mail move on, and:
 - a thread whose page *import* is held (3 failed runs) no longer pins the cursor either, and is rebuilt only from
   **complete** evidence. Up to 100 messages it remembers the `(id, date)` of every message it was built from
   (the union of what it remembered and what each run lists, so a growing thread never keeps a stale shorter
-  list); a retry reads them by id in batches of 25, at most 100 messages per run, and renders the thread once
-  every message is read, proven unreadable (its own message hold carries it) or gone upstream. A batch that fails,
-  is cut short by the helper budget or is aborted lands and clears nothing: the hold, its counters and the
-  retry request stay as they were. A longer thread (or a locator that cannot be trusted) is recovered by a
+  list); a retry reads them by id and renders the thread once every message is read, proven unreadable (its own
+  message hold carries it) or gone upstream. A slow Mail.app hands the helper only a few bodies per call (3 were
+  observed) and always the oldest, so what a run reads is **kept**: the messages read by id accumulate across
+  runs in a bounded staging inside the same cursor state (`mail_recovery`; saved by the same checkpoint write as
+  the holds, never a side file, never logged, never sent to a model, dropped with the hold). Each call asks only for
+  what is still unresolved, in whole-thread packs sized to what the helper has been seen to resolve; at most 4
+  calls per run, and a call that resolves nothing ends the run's reads. Nothing is rendered or cleared from
+  partial evidence: the hold, its counters and the retry request stay as they were (a budget stop is not a
+  failure and is never counted). Total staging is bounded across all holds (100 messages, 2.5 MiB, one full
+  thread at a time; a thread that does not fit yet is read within a run only and is admitted when room frees up),
+  and expires after 14 days. A longer thread (or a locator that cannot be trusted) is recovered by a
   whole-window **recovery walk**: it re-reads the mail window like an identity reread (removing nothing, resuming
   across runs under the unchanged read cap), lands the thread's pages as it goes, and clears the hold only when
   the walk completes without the thread failing again (a held thread the complete walk never saw is gone and is
-  dropped). `sync --full` does the same;
-- retries are fair and bounded: due records are re-attempted least recently attempted first, whole units (one
-  message, or one thread's list) within the 100-message-per-run budget, so what does not fit is first in line
-  next run. A held record that is only being re-attempted is exempt from the circuit breaker, so many poison
+  dropped). The walk's locator remembers the oldest message it knew; when the mail window (`a_mail_days`) no
+  longer reaches that message the walk cannot prove the thread, so nothing partial lands, the hold and the
+  incomplete coverage stay (and no futile walk is started) until the window covers it again: the window is never
+  widened for you. `sync --full` does the same;
+- retries are fair and bounded: units (one message, or one thread's list) rotate by a persisted turn (not by a
+  failure count) within the per-run call budget, so a small readable unit is never starved behind a large one and
+  what does not fit is first in line next run. A held record that is only being re-attempted is exempt from the circuit breaker, so many poison
   messages failing again (a quiet mailbox, or 4 or more at once) still advance their reconsideration and
   backoff; a run whose fresh traffic trips the breaker (a Mail outage) still counts no failure for anything;
 - the circuit breaker judges messages and threads separately, so a Mail.app outage (most messages unreadable at

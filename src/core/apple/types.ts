@@ -217,6 +217,25 @@ export interface AppleMailLoopsState {
   loop_grace_holds?: Record<string, AppleLoopGraceHold>;
 }
 
+/**
+ * Bounded persistent staging of Mail hold recovery (mail-recovery.ts): the by-id evidence of held thread imports accumulates
+ * here across runs, because a slow Mail.app hands the helper only a few bodies per call. It lives in the one cursor state, so
+ * it is saved by the same canonical checkpoint write as the holds it belongs to and is dropped with them.
+ */
+export interface AppleMailRecoveryState {
+  version: 1;
+  /** Runs that read for recovery; the rotation clock (no wall clock, no failure count). */
+  turn: number;
+  /** Largest targeted batch the helper has been seen to resolve; a hint, never a proof. */
+  capacity?: number;
+  /** Holds admitted to staging (hold key -> last served turn, the targets reserved, and when it last made progress). */
+  units: Record<string, { turn: number; n: number; at?: string }>;
+  /** Messages read by id and not yet rendered, by message id. */
+  staged: Record<string, { at: string; m: AppleMailMessage }>;
+  /** Messages a read by id found gone upstream, by message id (value: when). */
+  gone: Record<string, string>;
+}
+
 /** Cursor / state file persisted next to the managed clone. */
 export interface AppleSourceState {
   version: 1;
@@ -248,6 +267,8 @@ export interface AppleSourceState {
   item_holds: unknown;
   /** Open-loop tracking over Mail (src/core/apple/loops.ts); absent until a run had owner addresses. */
   mail_loops?: AppleMailLoopsState;
+  /** Staged Mail hold recovery evidence (mail-recovery.ts); absent when nothing is staged. */
+  mail_recovery?: AppleMailRecoveryState;
   last_probe?: Record<string, { ok: boolean; at: string; code?: string }>;
   last_full_at?: string;
 }

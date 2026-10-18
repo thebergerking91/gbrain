@@ -27,19 +27,25 @@
  *    id in bounded batches of one run and rendered once every message is accounted for (read, proven unreadable or gone
  *    upstream); a thread too long for a list (or an unreadable locator) is recovered by a whole-window walk
  *    (`MailHoldPlan.walk`) and cleared only when that walk completes. A partial batch never lands or clears anything.
+ *  - the evidence of a held thread accumulates ACROSS runs (mail-recovery.ts: bounded persistent staging in the one cursor
+ *    state), because a slow Mail hands the helper only a few bodies per call. Each call asks only for what is still
+ *    unresolved, oldest first, in whole-unit packs sized to what the helper has been seen to resolve; units rotate by a
+ *    persisted turn (not by failures: truncation is not poison and never counts); a call that resolves nothing ends the run's
+ *    reads; the thread is rendered and its hold cleared only when every remembered message is resolved.
+ *  - a whole-window walk can prove a thread only when the thread's remembered oldest message lies inside the walk's window
+ *    (`ThreadLocator.oldest`); otherwise the hold, the thread and the coverage gap stay until the window covers it again.
  */
 import type { ConnectorHoldSession } from '../connectors/connector-hold-session.ts';
 import { ConnectorItemUnreadableError } from '../connectors/item-holds.ts';
-import type { AppleMailListing, AppleMailMessage, AppleMailTarget, AppleUnavailableMessage } from './types.ts';
+import { admit, APPLE_MAIL_TARGET_MAX, isEmptyRecovery, reconcileRecovery, stage } from './mail-recovery.ts';
+import type { AppleMailListing, AppleMailMessage, AppleMailRecoveryState, AppleMailTarget, AppleSourceState, AppleUnavailableMessage } from './types.ts';
 
 export const MAIL_THREAD_KEY = 'mail:';
 export const MAIL_MESSAGE_KEY = 'mail-message:';
-/** Messages per targeted helper call (one batch). */
-export const APPLE_MAIL_TARGET_MAX = 25;
+export { APPLE_MAIL_TARGET_MAX };
 /**
- * Messages re-read by id per run (at most RECOVERY_MAX / TARGET_MAX helper calls): a bounded cost. Whole recovery units
- * (one message, or one thread's remembered list) are packed in least-recently-attempted order, so what does not fit is
- * first in line on the next run and nothing starves.
+ * Messages asked for by id per run (at most RECOVERY_MAX / TARGET_MAX helper calls): a bounded cost. A call asks only for
+ * what is still unresolved; what a run could not finish stays staged for the next one (mail-recovery.ts).
  */
 export const APPLE_MAIL_RECOVERY_MAX = 100;
 /** Messages remembered per failed thread import, so the thread can be rebuilt without its (old) listing. */
@@ -60,7 +66,10 @@ export const mailHoldGroup = (key: string, heldAtStart = false): string | null =
 /**
  * Locator stored on a failed thread import (`ref`):
  *   `{"m":[[id,date],...]}`  the (id, date) of every message the page is built from (at most APPLE_THREAD_REF_MAX);
- *   `{"w":n}`                a thread of n messages too long for a list: it is recovered by a whole-window walk.
+ *   `{"w":n,"o":date}`       a thread of n messages too long for a list: it is recovered by a whole-window walk. `o` is the
+ *                            oldest message date known when the locator was made; a walk whose window starts after it cannot
+ *                            reach every message, so it proves nothing about this thread. An older locator without `o` is
+ *                            trusted only by the count of messages the walk finds (never as proof of identity).
  * A locator is only ever REPLACED by `mergeThreadRef`, which unions what is remembered with what is listed, so a growing
  * thread never keeps a stale shorter list and never keeps a partial one.
  */
@@ -71,14 +80,27 @@ export interface ThreadLocator {
   walk: boolean;
   /** Messages the locator stands for. */
   size: number;
+  /** Walk locators: the oldest message date the locator knew (ISO), when it knew one. */
+  oldest?: string;
+}
+
+/** Whether a whole-window walk starting at `since` can reach every message a walk locator stands for. */
+export function walkReaches(locator: ThreadLocator, since: string | Date): 'yes' | 'no' | 'unknown' {
+  if (!locator.walk) return 'yes';
+  if (!locator.oldest) return 'unknown';
+  const start = since instanceof Date ? since.getTime() : Date.parse(since);
+  return Number.isFinite(start) && Date.parse(locator.oldest) > start ? 'yes' : 'no';
 }
 
 export function parseThreadLocator(ref: string | null | undefined): ThreadLocator {
   const unlocatable: ThreadLocator = { targets: [], walk: true, size: 0 };
   if (!ref) return unlocatable;
   try {
-    const parsed = JSON.parse(ref) as { m?: unknown; w?: unknown };
-    if (typeof parsed.w === 'number' && Number.isFinite(parsed.w)) return { targets: [], walk: true, size: Math.max(0, Math.floor(parsed.w)) };
+    const parsed = JSON.parse(ref) as { m?: unknown; w?: unknown; o?: unknown };
+    if (typeof parsed.w === 'number' && Number.isFinite(parsed.w)) {
+      const oldest = typeof parsed.o === 'string' && Number.isFinite(Date.parse(parsed.o)) ? parsed.o : undefined;
+      return { targets: [], walk: true, size: Math.max(0, Math.floor(parsed.w)), ...(oldest ? { oldest } : {}) };
+    }
     if (!Array.isArray(parsed.m) || parsed.m.length === 0 || parsed.m.length > APPLE_THREAD_REF_MAX) return unlocatable;
     const targets: AppleMailTarget[] = [];
     for (const pair of parsed.m) {
@@ -91,20 +113,28 @@ export function parseThreadLocator(ref: string | null | undefined): ThreadLocato
 }
 
 const listRef = (targets: readonly AppleMailTarget[]): string => JSON.stringify({ m: targets.map((t) => [t.id, t.date]) });
-const walkRef = (size: number): string => JSON.stringify({ w: size });
+const walkRef = (size: number, oldest?: string): string => JSON.stringify(oldest ? { w: size, o: oldest } : { w: size });
+const olderOf = (a: string | undefined, b: string | undefined): string | undefined =>
+  a === undefined || !Number.isFinite(Date.parse(a)) ? (b !== undefined && Number.isFinite(Date.parse(b)) ? b : undefined) : b === undefined || !Number.isFinite(Date.parse(b)) || Date.parse(a) <= Date.parse(b) ? a : b;
 
 /**
  * The locator for a thread import that failed now: the union of what the previous record remembered and the messages of
  * this run, by id. `previous` is the stored record (absent = a first failure). Longer than the bound, or built on a
- * locator that cannot be trusted, it becomes a walk locator; the stale list is never kept.
+ * locator that cannot be trusted, it becomes a walk locator; the stale list is never kept. A walk locator remembers the
+ * oldest message date it ever knew (`pageFirst` is the stored page's first message, when the thread already has a page); an
+ * untrusted or boundary-less previous locator stays boundary-less: a boundary is never invented from a partial view.
  */
-export function mergeThreadRef(previous: { ref: string | null } | undefined, messages: ReadonlyArray<Pick<AppleMailMessage, 'id' | 'date'>>): string {
+export function mergeThreadRef(previous: { ref: string | null } | undefined, messages: ReadonlyArray<Pick<AppleMailMessage, 'id' | 'date'>>, pageFirst?: string | null): string {
   const before = previous ? parseThreadLocator(previous.ref) : null;
-  if (before?.walk) return walkRef(Math.max(before.size, messages.length));
+  const oldestOf = (dates: Array<string | undefined>): string | undefined => dates.reduce<string | undefined>((a, d) => olderOf(a, d), undefined);
+  const seenOldest = oldestOf([...messages.map((m) => m.date), pageFirst ?? undefined]);
+  if (before?.walk) return walkRef(Math.max(before.size, messages.length), before.oldest ? olderOf(before.oldest, seenOldest) : undefined);
   const union = new Map<string, AppleMailTarget>();
   for (const t of before?.targets ?? []) union.set(t.id, t);
   for (const m of messages) union.set(m.id, { id: m.id, date: m.date });
-  return union.size > APPLE_THREAD_REF_MAX ? walkRef(union.size) : listRef([...union.values()]);
+  return union.size > APPLE_THREAD_REF_MAX
+    ? walkRef(union.size, oldestOf([...union.values()].map((t) => t.date).concat(pageFirst ?? [])))
+    : listRef([...union.values()]);
 }
 
 /** The locator of a thread seen for the first time (no record). */
@@ -117,28 +147,48 @@ export function applyThreadRefs(state: unknown, refs: ReadonlyMap<string, string
   for (const [key, ref] of refs) if (items[key]) items[key]!.ref = ref;
 }
 
-/** One re-read: a held message, or a thread's remembered messages. Whole units only, so a thread is never half-read. */
+/** One re-read: a held message, or a thread's remembered messages. Whole units only, so a thread is never half-rendered. */
 export interface RecoveryUnit {
   key: string;
   kind: 'message' | 'thread';
   targets: AppleMailTarget[];
-  /** Least recently attempted first (persisted `last_failed_at`), so the order rotates as units are re-attempted. */
+  /** Tie-break only (persisted `last_failed_at`); the rotation itself is the staging's turn (mail-recovery.ts). */
   order: string;
 }
 
 export interface MailHoldPlan {
   /** Held message ids this run must not read. */
   exclude: string[];
-  /** What is due for a re-read by id, least recently attempted first. */
+  /** What is due for a re-read by id. */
   units: RecoveryUnit[];
-  /** A due record no list can rebuild (oversize or unreadable locator): this run needs a whole-window recovery walk. */
+  /** A due record no list can rebuild (oversize or unreadable locator) that a walk starting at the window can reach: this run needs a whole-window recovery walk. */
   walk: boolean;
+  /** Held walk-locator threads the current window cannot reach (their oldest known message is older than it): no walk is asked for them. */
+  unreachable: string[];
+}
+
+/** The (id, date) targets of every Mail hold that can be read by id (a thread's remembered list, a message), due or not: what the staging may keep. */
+export function retainedUnits(holdsState: unknown): Map<string, AppleMailTarget[]> {
+  const out = new Map<string, AppleMailTarget[]>();
+  const items = (holdsState as { items?: Record<string, { key: string; ref: string | null; meta?: { upstream_at?: string | null } }> } | null)?.items ?? {};
+  for (const record of Object.values(items)) {
+    if (isMessageHoldKey(record.key)) {
+      const date = record.meta?.upstream_at;
+      if (date && Number.isFinite(Date.parse(date))) out.set(record.key, [{ id: record.key.slice(MAIL_MESSAGE_KEY.length), date }]);
+      continue;
+    }
+    if (!record.key.startsWith(MAIL_THREAD_KEY)) continue;
+    const locator = parseThreadLocator(record.ref);
+    if (!locator.walk) out.set(record.key, locator.targets);
+  }
+  return out;
 }
 
 /** What the sweep must act on before it reads: which held messages to skip and which to re-read wherever they are. */
-export function planMailHolds(holds: ConnectorHoldSession): MailHoldPlan {
+export function planMailHolds(holds: ConnectorHoldSession, windowStart: Date = new Date(0)): MailHoldPlan {
   const exclude: string[] = [];
   const units: RecoveryUnit[] = [];
+  const unreachable: string[] = [];
   let walk = false;
   for (const record of Object.values(holds.holds.initial().items)) {
     if (isMessageHoldKey(record.key)) {
@@ -152,12 +202,18 @@ export function planMailHolds(holds: ConnectorHoldSession): MailHoldPlan {
       // A failing thread import (not yet held) is re-attempted too: its cursor pin only re-reads the main slice.
       if (record.state !== 'failing' && !holds.holds.shouldAttempt(record.key)) continue;
       const locator = parseThreadLocator(record.ref);
-      if (locator.walk) { if (record.state === 'held') walk = true; continue; }
+      if (locator.walk) {
+        if (record.state !== 'held') continue;
+        // A walk cannot reach a message older than its window: asking for one would be a whole-window read that proves nothing.
+        if (walkReaches(locator, windowStart) === 'no') unreachable.push(record.key.slice(MAIL_THREAD_KEY.length));
+        else walk = true;
+        continue;
+      }
       units.push({ key: record.key, kind: 'thread', targets: locator.targets, order: record.last_failed_at });
     }
   }
   units.sort((a, b) => a.order.localeCompare(b.order) || a.key.localeCompare(b.key));
-  return { exclude, units, walk };
+  return { exclude, units, walk, unreachable };
 }
 
 /** One run's settlement of the Mail holds; the sweep reads its verdicts, `settleReadMessages` completes it after the pages land. */
@@ -217,9 +273,16 @@ export class MailHoldRun {
   }
 }
 
+const byDateId = (a: AppleMailTarget, b: AppleMailTarget): number => a.date.localeCompare(b.date) || a.id.localeCompare(b.id);
+
 /**
  * Settles the reader's unavailable-message verdicts and re-reads the due targets. Reader errors of the targeted read
  * are source-level and never counted (the run goes on without it); only an abort propagates.
+ *
+ * The re-read is resumable. Evidence read by id is kept in the bounded staging (`state.mail_recovery`, mail-recovery.ts),
+ * so a thread the helper can only hand over a few messages at a time is finished across runs; each call asks only for what
+ * is still unresolved. A unit (a held message, or a held thread's remembered list) is used for rendering only when every
+ * target is resolved, whether this run or an earlier one resolved it.
  */
 export async function readMailHolds(input: {
   holds: ConnectorHoldSession;
@@ -227,10 +290,14 @@ export async function readMailHolds(input: {
   listing: AppleMailListing;
   mailboxes: string[];
   readTargets: ((opts: { mailboxes: string[]; targets: AppleMailTarget[]; signal?: AbortSignal }) => Promise<AppleMailListing>) | undefined;
+  state: AppleSourceState;
+  now?: () => number;
   signal?: AbortSignal;
   log: (msg: string) => void;
 }): Promise<MailHoldRun> {
-  const { holds, plan, listing, log } = input;
+  const { holds, plan, listing, log, state } = input;
+  const nowMs = (input.now ?? Date.now)();
+  const nowIso = new Date(nowMs).toISOString();
   const run = new MailHoldRun(holds, log);
   const proven = listing.unavailableMessages ?? [];
   const accounted = new Set(proven.map((m) => m.threadId));
@@ -239,48 +306,111 @@ export async function readMailHolds(input: {
   if (run.deferred.size > 0) run.pin = true;
   for (const m of proven) await run.fail(m);
 
-  // Targeted re-read of what is due and was not already part of this run's listing. Whole units are packed (a thread is
-  // read completely or not at all this run) within the per-run budget, least recently attempted first.
-  const seen = new Set<string>([...listing.messages.map((m) => m.id), ...proven.map((m) => m.id)]);
-  const wanted = new Map<string, AppleMailTarget>();
-  const chosen: Array<{ unit: RecoveryUnit; need: AppleMailTarget[] }> = [];
-  for (const unit of plan.units) {
-    const need = unit.targets.filter((t) => !seen.has(t.id));
-    if (need.length === 0) continue;
-    const fresh = need.filter((t) => !wanted.has(t.id));
-    if (wanted.size + fresh.length > APPLE_MAIL_RECOVERY_MAX) continue; // first in line on the next run
-    for (const t of fresh) wanted.set(t.id, t);
-    chosen.push({ unit, need });
-  }
-  if (wanted.size === 0) return run;
-  if (!input.readTargets) {
-    log(`[apple] ${wanted.size} held mail message(s) are due for a re-read, but this reader cannot read a message by id; they stay held`);
-    return run;
-  }
-  const read = new Map<string, AppleMailMessage>();
-  const batches: AppleMailTarget[][] = [];
-  const all = [...wanted.values()];
-  for (let i = 0; i < all.length; i += APPLE_MAIL_TARGET_MAX) batches.push(all.slice(i, i + APPLE_MAIL_TARGET_MAX));
+  // Staging in line with the holds that exist, before anything reads or renders: expired or orphaned evidence is gone.
+  reconcileRecovery(state, retainedUnits(holds.holds.initial()), nowMs);
+  const rec: AppleMailRecoveryState = state.mail_recovery ?? { version: 1, turn: 0, units: {}, staged: {}, gone: {} };
+  const attach = (): void => { if (!state.mail_recovery && !isEmptyRecovery(rec)) state.mail_recovery = rec; };
+  // A message already known to be gone upstream (read earlier) needs no read now.
+  for (const unit of plan.units) for (const t of unit.targets) if (rec.gone[t.id]) run.gone.add(t.id);
+
+  // Everything that is accounted for this run: listed, proven unreadable (listing or this run's reads), gone, staged or read now.
+  const resolvedNow = new Set<string>([...listing.messages.map((m) => m.id), ...proven.map((m) => m.id)]);
+  const fresh = new Map<string, AppleMailMessage>();
   const unavailable = new Map<string, AppleUnavailableMessage>();
-  try {
-    for (const targets of batches) {
-      const result = await input.readTargets({ mailboxes: input.mailboxes, targets, ...(input.signal ? { signal: input.signal } : {}) });
-      for (const m of result.messages) read.set(m.id, m);
-      for (const m of result.unavailableMessages ?? []) unavailable.set(m.id, m);
-      for (const id of result.targetMissing ?? []) run.gone.add(id);
+  const have = (id: string): boolean => resolvedNow.has(id) || run.gone.has(id) || rec.staged[id] !== undefined || fresh.has(id);
+  const pendingOf = (unit: RecoveryUnit): AppleMailTarget[] => unit.targets.filter((t) => !have(t.id)).sort(byDateId);
+
+  const works = plan.units.filter((u) => u.targets.length > 0);
+  const waiting = works.filter((u) => pendingOf(u).length > 0);
+  if (waiting.length > 0) {
+    if (!input.readTargets) {
+      log(`[apple] ${waiting.reduce((n, u) => n + pendingOf(u).length, 0)} held mail message(s) are due for a re-read, but this reader cannot read a message by id; they stay held`);
+    } else {
+      // Room in the staging for the whole unit, or none (then it is read within the run only, as it always was).
+      for (const u of waiting) admit(rec, u.key, u.targets.length, nowIso);
+      attach();
+      const turn = ++rec.turn;
+      const served = new Set<string>();
+      const dead = new Set<string>();
+      const progressed = new Set<string>();
+      const maxCalls = Math.ceil(APPLE_MAIL_RECOVERY_MAX / APPLE_MAIL_TARGET_MAX);
+      let capacity = Math.max(1, Math.min(APPLE_MAIL_TARGET_MAX, rec.capacity ?? APPLE_MAIL_TARGET_MAX));
+      const stageable = (id: string): boolean => works.some((u) => rec.units[u.key] && u.targets.some((t) => t.id === id));
+      for (let call = 0; call < maxCalls; call++) {
+        // Longest waiting first (the persisted turn, bumped once a run), then the least left to read, so what is started is
+        // finished and small units are not held up behind a large one; a unit that fits whole is asked whole, a larger one alone.
+        // A unit that could not be admitted to the staging is read only if this run can finish it (it would otherwise be read
+        // again from scratch every run and starve the admitted ones); it is admitted as soon as a reservation frees up.
+        const reachable = capacity * (maxCalls - call);
+        const order = waiting.filter((u) => !dead.has(u.key) && pendingOf(u).length > 0 && (rec.units[u.key] !== undefined || pendingOf(u).length <= reachable)).sort((a, b) =>
+          (rec.units[a.key]?.turn ?? 0) - (rec.units[b.key]?.turn ?? 0) || pendingOf(a).length - pendingOf(b).length
+          || a.order.localeCompare(b.order) || a.key.localeCompare(b.key));
+        const batch = new Map<string, AppleMailTarget>();
+        const members: RecoveryUnit[] = [];
+        for (const u of order) {
+          const need = pendingOf(u).filter((t) => !batch.has(t.id));
+          const room = capacity - batch.size;
+          if (need.length === 0 || room <= 0) continue;
+          if (need.length <= room) { for (const t of need) batch.set(t.id, t); members.push(u); }
+          else if (batch.size === 0) { for (const t of need.slice(0, room)) batch.set(t.id, t); members.push(u); }
+          if (batch.size >= capacity) break;
+        }
+        if (batch.size === 0) break;
+        let result: AppleMailListing;
+        try {
+          result = await input.readTargets({ mailboxes: input.mailboxes, targets: [...batch.values()], ...(input.signal ? { signal: input.signal } : {}) });
+        } catch (e) {
+          if (input.signal?.aborted) throw e;
+          // A targeted read that fails or times out is a SOURCE problem: not an item failure, not a hold. Whatever earlier
+          // calls resolved is kept. The batch is halved next time (a smaller ask may fit) and its units go to the back.
+          log(`[apple] re-reading held mail messages failed (${e instanceof Error ? e.message : String(e)}); they stay held`);
+          run.readFailed = true;
+          rec.capacity = capacity = Math.max(1, Math.floor(batch.size / 2));
+          for (const u of members) served.add(u.key);
+          break;
+        }
+        let progress = 0;
+        const resolveOne = (id: string): void => { if (!resolvedNow.has(id) && !run.gone.has(id) && !fresh.has(id) && rec.staged[id] === undefined) { progress++; progressed.add(id); } };
+        for (const m of result.messages) {
+          if (!batch.has(m.id)) continue; // never accept what was not asked for
+          resolveOne(m.id);
+          fresh.set(m.id, m);
+          if (stageable(m.id)) stage(rec, m, nowIso); // refused at a bound: kept for this run only
+        }
+        for (const m of result.unavailableMessages ?? []) if (batch.has(m.id)) { resolveOne(m.id); unavailable.set(m.id, m); resolvedNow.add(m.id); }
+        for (const id of result.targetMissing ?? []) {
+          if (!batch.has(id)) continue;
+          resolveOne(id);
+          run.gone.add(id);
+          if (stageable(id)) rec.gone[id] = nowIso;
+        }
+        const exhausted = result.budgetExhausted === true || result.truncated === true;
+        if (exhausted && progress > 0 && progress < batch.size) rec.capacity = capacity = Math.max(1, progress);
+        else if (!exhausted && batch.size >= capacity && capacity < APPLE_MAIL_TARGET_MAX) rec.capacity = capacity = Math.min(APPLE_MAIL_TARGET_MAX, capacity * 2);
+        for (const u of members) {
+          const gained = u.targets.some((t) => batch.has(t.id) && have(t.id));
+          if (gained || !exhausted) served.add(u.key);
+          if (!gained && !exhausted) dead.add(u.key); // silently dropped by the helper: not asked again this run
+        }
+        // The helper's body-time budget ran out without resolving anything: Mail is stalled right now; another call would only
+        // spend another budget. What was resolved is kept; nothing is counted (truncation is not poison).
+        if (exhausted && progress === 0) { log('[apple] re-reading held mail messages made no progress within the helper\'s time budget; they are read again on the next run'); break; }
+      }
+      // The rotation moves once per run, for the units this run really worked on (or asked in full): never by a failure count.
+      for (const key of served) if (rec.units[key]) rec.units[key]!.turn = turn;
+      for (const u of works) if (rec.units[u.key] && u.targets.some((t) => progressed.has(t.id))) rec.units[u.key]!.at = nowIso;
+      const left = works.reduce((n, u) => n + pendingOf(u).length, 0);
+      if (left > 0) log(`[apple] held mail recovery is partial: ${left} message(s) of ${waiting.length} held record(s) still to be read; progress is kept for the next run`);
     }
-  } catch (e) {
-    if (input.signal?.aborted) throw e;
-    // A targeted read that fails or times out is a SOURCE problem: not an item failure, not a hold. Whatever the earlier
-    // batches resolved is kept below; a unit that is not completely resolved is not used at all.
-    log(`[apple] re-reading held mail messages failed (${e instanceof Error ? e.message : String(e)}); they stay held`);
-    run.readFailed = true;
   }
-  const resolved = (id: string): boolean => read.has(id) || unavailable.has(id) || run.gone.has(id);
-  // Units fully resolved by the batches (or already in the listing) may feed rendering; a half-read thread feeds nothing.
+  attach();
+
+  // Units fully resolved (this run or earlier) may feed rendering; a half-read thread feeds nothing.
   const usable = new Set<string>();
-  for (const { unit, need } of chosen) if (need.every((t) => resolved(t.id))) for (const t of unit.targets) usable.add(t.id);
-  run.extra = [...read.values()].filter((m) => usable.has(m.id));
+  for (const unit of works) if (unit.targets.every((t) => have(t.id))) for (const t of unit.targets) usable.add(t.id);
+  const evidence = (id: string): AppleMailMessage | undefined => fresh.get(id) ?? rec.staged[id]?.m;
+  const listed = new Set(listing.messages.map((m) => m.id));
+  run.extra = [...usable].filter((id) => !listed.has(id)).map(evidence).filter((m): m is AppleMailMessage => m !== undefined).map((m) => structuredClone(m));
   for (const m of unavailable.values()) await run.fail(m);
   for (const id of run.gone) {
     // Deleted or moved upstream: nothing left to read, so nothing left to hold.

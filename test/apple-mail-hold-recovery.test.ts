@@ -226,7 +226,7 @@ describe('Mail thread recovery — a thread too long for a list is recovered by 
       const big = threadMsgs('thr-big', 101, 25);
       const f = fakeMail([...big, mk('<ok@x>', 'thr-ok', 24)]);
       const blocker = await heldThread(dir, raw, f, 'thr-big', big);
-      expect(JSON.parse(threadHold(dir, 'thr-big')!.ref!)).toEqual({ w: 101 });
+      expect(JSON.parse(threadHold(dir, 'thr-big')!.ref!)).toEqual({ w: 101, o: big[0]!.date });
       rmSync(blocker, { recursive: true, force: true });
       if (via === 'retry-held') await retryHeld(engine, SID); else clock.t += 2 * HOUR;
       f.byId.length = 0; f.main.length = 0;
@@ -280,7 +280,7 @@ describe('Mail thread recovery — a thread too long for a list is recovered by 
     await sweep(dir, f, raw);
     expect(await pageOf('thr-big')).toBeUndefined();
     expect(threadHold(dir, 'thr-big')?.state).toBe('held');
-    expect(JSON.parse(threadHold(dir, 'thr-big')!.ref!)).toEqual({ w: 101 });
+    expect(JSON.parse(threadHold(dir, 'thr-big')!.ref!)).toEqual({ w: 101, o: msgs[0]!.date });
     rmSync(blocker, { recursive: true, force: true });
     await retryHeld(engine, SID);
     await sweep(dir, f, raw);

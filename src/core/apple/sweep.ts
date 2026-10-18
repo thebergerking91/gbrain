@@ -48,7 +48,7 @@ import {
   type AppleSyncSummary,
 } from './sweep-shared.ts';
 import { beginMailWalk } from './mail-walk.ts';
-import { MAIL_THREAD_KEY, mergeThreadRef, parseThreadLocator, planMailHolds, readMailHolds, settleReadMessages, threadHoldKey } from './mail-holds.ts';
+import { MAIL_THREAD_KEY, mergeThreadRef, parseThreadLocator, planMailHolds, readMailHolds, settleReadMessages, threadHoldKey, walkReaches } from './mail-holds.ts';
 import { appleLoopsAvailability } from './loops-status.ts';
 import { prepareLoopsState, trackMailLoops, type AppleLoopsRun } from './loops.ts';
 import type { AppleCalendarEvent, AppleContact, AppleMailListing, AppleSourceState } from './types.ts';
@@ -341,7 +341,10 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   // Held messages are not read (they cost body time and would starve their neighbours); the ones that are due for a
   // re-attempt (retry-held, a transient reconsideration, --full) are read again by id below, however old they are.
   // A due hold no remembered list can rebuild (oversize thread, unusable locator) asks for a whole-window recovery walk.
-  const plan = planMailHolds(ctx.holds);
+  const plan = planMailHolds(ctx.holds, windowStart);
+  if (plan.unreachable.length > 0) {
+    deps.log(`[apple] ${plan.unreachable.length} held mail thread(s) have messages older than the mail window (a_mail_days); a window read cannot recover them, so they stay held and mail coverage stays incomplete until the window covers them`);
+  }
   const walk = beginMailWalk(state, deps.cfg, windowStart, deps.opts.full === true, rereadAll, incrementalSince, plan.walk, new Date(deps.now()).toISOString());
   // A full or recovery walk is the evidence that can rebuild a held oversize thread; a held thread is cleared only when it ends.
   const recoveryWalk = walk.recover !== undefined;
@@ -364,7 +367,7 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
       : `[apple] mail listing truncated at ${deps.cfg.mailMax} messages (a_mail_max); the rest is read on the next run`);
   }
   const holdRun = await readMailHolds({ holds: ctx.holds, plan, listing, mailboxes: deps.cfg.mailMailboxes,
-    readTargets: deps.readers.mailMessages ? (o) => deps.readers.mailMessages!(o) : undefined, ...signalOf(ctx), log: deps.log });
+    readTargets: deps.readers.mailMessages ? (o) => deps.readers.mailMessages!(o) : undefined, state, now: deps.now, ...signalOf(ctx), log: deps.log });
   if (holdRun.readFailed) summary.status = 'partial';
   // The listing the cursor follows is the main read; messages read by id only feed rendering and open-loop evidence.
   const listed = new Set(messages.map((m) => m.id));
@@ -406,7 +409,7 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
     const record = ctx.holds.holds.record(holdKey);
     // What a later re-attempt needs to rebuild this thread when it is no longer in the incremental listing: everything the
     // record remembers plus what this run lists (never just this run's slice, never a stale shorter list).
-    const ref = mergeThreadRef(record, thread.messages);
+    const ref = mergeThreadRef(record, thread.messages, str(frontmatterByThread.get(thread.threadId)?.first_message_date));
     const detail: FailDetail = { ref, upstreamAt: thread.messages[thread.messages.length - 1]?.date ?? null };
     let walkKind = false; // a held thread only a whole-window walk can rebuild: never settled at a landing
     let walkBound = false; // ...and admitted by the walk now
@@ -416,7 +419,12 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
       // A thread with an outstanding import record is rebuilt only from COMPLETE evidence: every remembered message is
       // listed, on the page already, read by id this run or gone upstream; an oversize thread needs the whole-window walk.
       const have = new Set<string>([...thread.messages.map((m) => m.id), ...strList(frontmatterByThread.get(thread.threadId)?.apple_message_ids)]);
-      const complete = locator.walk ? record.state !== 'held' || recoveryWalk : locator.targets.every((t) => have.has(t.id) || holdRun.gone.has(t.id) || holdRun.unreadable.has(t.id));
+      // A whole-window walk proves a held oversize thread only when its oldest known message lies inside the walk's window
+      // (a locator without that boundary is trusted only when this view names at least as many messages as it stands for).
+      // Otherwise rebuilding from what the window still lists would land a partial page and clear the hold falsely.
+      const reach = locator.walk ? walkReaches(locator, walk.since) : 'yes';
+      const provable = reach === 'yes' || (reach === 'unknown' && have.size >= locator.size);
+      const complete = locator.walk ? record.state !== 'held' || (recoveryWalk && provable) : locator.targets.every((t) => have.has(t.id) || holdRun.gone.has(t.id) || holdRun.unreadable.has(t.id));
       if (!complete) {
         live.add(thread.threadId);
         notLanded.add(thread.threadId);
@@ -557,7 +565,8 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
       const id = record.key.slice(MAIL_THREAD_KEY.length);
       if (ctx.failedKeys?.has(record.key) || notLanded.has(id)) continue;
       if (landed.has(id)) ctx.holds.succeed(record.key);
-      else if (!live.has(id)) { ctx.holds.shouldAttempt(record.key); ctx.holds.drop(record.key); }
+      // Never seen by a walk that reaches all of it: gone upstream. One the window cannot reach (or whose reach is unknown) stays.
+      else if (!live.has(id) && walkReaches(parseThreadLocator(record.ref), walk.since) === 'yes') { ctx.holds.shouldAttempt(record.key); ctx.holds.drop(record.key); }
     }
   }
   if (!unresolved && truncated && messages.length > 0) {
