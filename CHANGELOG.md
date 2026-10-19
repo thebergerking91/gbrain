@@ -30,8 +30,8 @@ The new `apple` source also feeds the open-loop engine for Mail (owner identity 
 
 - New code lives under `src/core/apple/`, `src/commands/apple*.ts`, `src/cli/commands/apple.ts` and the helpers in `scripts/apple/`. The two Apple files that write pages or freshness stamps are listed in `docs/architecture/canonical-writers.tsv`.
 - The PGLite snapshot cache key in `.github/workflows/{test,e2e,stress}.yml` now hashes `src/core/apple/source-config.ts` and `src/core/apple/types.ts`, which the snapshot imports.
-- The doctor goldens carry `apple_permissions` between `google_calendar_readable` and `atom_retirements_restorable`; the PGLite hot-check and content goldens changed only in the persisted-byte counters that grow with the extra check. The Postgres hot-check golden needs a Postgres regeneration (`GBRAIN_TEST_UPDATE_GOLDENS=1`, see `docs/TESTING.md`).
-- Real-Mac permission and account-enumeration behavior is qualified separately from the synthetic tests in this PR.
+- The doctor goldens carry `apple_permissions` between `google_calendar_readable` and `atom_retirements_restorable`. The PGLite hot-check and content goldens gain that one entry and nothing else: their persisted-byte counters (`terminal_bytes`) are unchanged from master. The Postgres hot-check golden still needs a Postgres run to confirm; the targeted doctor golden files passed on Linux, not the full suite.
+- Real-Mac permission and account-enumeration behavior was qualified on an earlier candidate of this change, apart from the synthetic tests in this PR. It has not been repeated on this candidate.
 
 ## [0.60.310.0] - 2026-10-19
 
