@@ -512,18 +512,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 68719476736,
-                    "max_day_7d": 195921,
-                    "net_per_day_7d": 58816,
+                    "max_day_7d": 196421,
+                    "net_per_day_7d": 58916,
                     "pct": 0,
-                    "per_day_7d": 195921,
-                    "reclaimable_bytes": 137105,
+                    "per_day_7d": 196421,
+                    "reclaimable_bytes": 137505,
                     "recommended_limit": 137438953472,
                     "resource": "terminal_bytes",
                     "scope": "brain",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 195921,
+                    "used": 196421,
                     "window_days": 1
                   },
                   {
@@ -549,18 +549,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 17179869184,
-                    "max_day_7d": 195921,
-                    "net_per_day_7d": 58816,
+                    "max_day_7d": 196421,
+                    "net_per_day_7d": 58916,
                     "pct": 0,
-                    "per_day_7d": 195921,
-                    "reclaimable_bytes": 137105,
+                    "per_day_7d": 196421,
+                    "reclaimable_bytes": 137505,
                     "recommended_limit": 34359738368,
                     "resource": "terminal_bytes",
                     "scope": "principal:local_cli:<uuid>",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 195921,
+                    "used": 196421,
                     "window_days": 1
                   }
                 ],
@@ -1791,6 +1791,18 @@
             "elapsed_ms": "<volatile>",
             "message": "No Google source recorded an unreadable calendar at its last sync.",
             "name": "google_calendar_readable",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "count": 0,
+              "docs": "docs/guides/apple-connect.md#permissions",
+              "services": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No Apple source recorded a denied permission at its last sync.",
+            "name": "apple_permissions",
             "status": "ok"
           },
           {
@@ -4810,18 +4822,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 68719476736,
-                    "max_day_7d": 195921,
-                    "net_per_day_7d": 58816,
+                    "max_day_7d": 196421,
+                    "net_per_day_7d": 58916,
                     "pct": 0,
-                    "per_day_7d": 195921,
-                    "reclaimable_bytes": 137105,
+                    "per_day_7d": 196421,
+                    "reclaimable_bytes": 137505,
                     "recommended_limit": 137438953472,
                     "resource": "terminal_bytes",
                     "scope": "brain",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 195921,
+                    "used": 196421,
                     "window_days": 1
                   },
                   {
@@ -4847,18 +4859,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 17179869184,
-                    "max_day_7d": 195921,
-                    "net_per_day_7d": 58816,
+                    "max_day_7d": 196421,
+                    "net_per_day_7d": 58916,
                     "pct": 0,
-                    "per_day_7d": 195921,
-                    "reclaimable_bytes": 137105,
+                    "per_day_7d": 196421,
+                    "reclaimable_bytes": 137505,
                     "recommended_limit": 34359738368,
                     "resource": "terminal_bytes",
                     "scope": "principal:local_cli:<uuid>",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 195921,
+                    "used": 196421,
                     "window_days": 1
                   }
                 ],
@@ -6089,6 +6101,18 @@
             "elapsed_ms": "<volatile>",
             "message": "No Google source recorded an unreadable calendar at its last sync.",
             "name": "google_calendar_readable",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "count": 0,
+              "docs": "docs/guides/apple-connect.md#permissions",
+              "services": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No Apple source recorded a denied permission at its last sync.",
+            "name": "apple_permissions",
             "status": "ok"
           },
           {
