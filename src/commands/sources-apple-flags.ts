@@ -154,7 +154,7 @@ export function buildAppleAddOptions(raw: AppleAddRaw): AppleAddOptions {
 export function mailConfirmationRequired(via: '--services' | 'set-services'): AppleAddFlagError {
   return new AppleAddFlagError('mail_confirmation_required',
     'Mail needs an explicit confirmation: it is the most sensitive Apple service.',
-    `gbrain will read the subject, sender, recipients, date and plain-text body of recent messages from Mail.app and store them as pages in your brain (attachments are never downloaded). Nothing is sent to an AI provider unless you separately pass --consent-loops-extraction (with --mail-owner-addresses): that sends Mail thread text to the chat provider configured for this brain. `
+    `gbrain will read the subject, sender, recipients, date and plain-text body of recent messages from Mail.app and store them as pages in your brain (attachments are never downloaded). Mail accounts hosted by Google (Gmail, Google Workspace) are never read through Apple Mail: connect them with: gbrain google setup. An account whose provider cannot be determined stops the whole Mail sync instead. Nothing is sent to an AI provider unless you separately pass --consent-loops-extraction (with --mail-owner-addresses): that sends Mail thread text to the chat provider configured for this brain. `
     + (via === '--services'
       ? 'If the user agrees, add --confirm-mail to the same command (and keep mail in --services).'
       : 'If the user agrees, re-run with --confirm-mail.')

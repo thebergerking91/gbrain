@@ -18,13 +18,14 @@
  * neither macOS nor a spawned process.
  */
 import type { BrainEngine } from '../core/engine.ts';
-import type { AppleReaders, AppleService, AppleSourceConfig } from '../core/apple/types.ts';
+import type { AppleMailRouting, AppleReaders, AppleService, AppleSourceConfig } from '../core/apple/types.ts';
 import { ALL_APPLE_SERVICES } from '../core/apple/types.ts';
 import { parseAppleSourceConfig } from '../core/apple/source-config.ts';
 import { parseSourceConfig } from '../core/sources-load.ts';
 import { permissionGuide, guideLines, USER_ACTION_CODES, type PermissionGuide } from '../core/apple/permission-guide.ts';
 import { APPLE_DEFAULT_ACCOUNT } from '../core/apple/source-config.ts';
 import { APPLE_LOOPS_EXTRACT_DISCLOSURE, appleLoopsAvailability } from '../core/apple/loops-status.ts';
+import { APPLE_MAIL_GOOGLE_DISCLOSURE, GOOGLE_SETUP_COMMAND, routingSummary } from '../core/apple/mail-routing.ts';
 import { AppleAddFlagError, appleAddPlatformWarning, buildAppleAddOptions, parseAppleServicesFlag } from './sources-apple-flags.ts';
 import { emitEnvelope, errorEnvelope, showUserBlock, type AppleOut } from './apple-output.ts';
 
@@ -73,7 +74,7 @@ Subcommands:
   setup     check macOS permissions, register the source, run a first sync (one command; idempotent)
             --services calendar,contacts,mail   which services (default: all three)
             --account <label>                   free label for this Mac's account (default: local; not a credential)
-            --yes | --confirm-mail              required when Mail is selected (Mail is the most sensitive service)
+            --yes | --confirm-mail              required when Mail is selected (Mail is the most sensitive service; Google-hosted Mail accounts are never read here: use gbrain google setup)
             --no-sync                           register only; sync later with: gbrain sync --source <id>
             --sync-budget-ms <ms>               first-sync wall-clock budget (default 90000)
             --source <id>                       source id (default: apple-<account>)
@@ -274,7 +275,8 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
     const command = setupCommand(f, services, ['--confirm-mail']);
     const message = 'Mail is the most sensitive service: gbrain will read the subject, sender, recipients, date and plain-text body of recent messages '
       + `(mailboxes ${effectiveCfg.mailMailboxes.join(', ')}, last ${effectiveCfg.mailDays} days) from Mail.app and store them as pages in your brain. `
-      + 'Attachments are never downloaded. Nothing leaves this Mac except the text sent to your configured AI provider if atom extraction runs on those pages, or if you separately consent to commitment extraction (--consent-loops-extraction, which needs --mail-owner-addresses and sends Mail thread text to the chat provider configured for this brain). '
+      + 'Attachments are never downloaded. ' + APPLE_MAIL_GOOGLE_DISCLOSURE + ' '
+      + 'Nothing leaves this Mac except the text sent to your configured AI provider if atom extraction runs on those pages, or if you separately consent to commitment extraction (--consent-loops-extraction, which needs --mail-owner-addresses and sends Mail thread text to the chat provider configured for this brain). '
       + (effectiveCfg.loopsExtractConsent ? 'Commitment extraction is currently enabled for this source and sends eligible Mail threads to your configured chat provider. ' : '')
       + `Skip Mail with --services calendar,contacts. Confirm Mail by re-running with --confirm-mail (or --yes).`;
     emitEnvelope(out, { ok: false, status: 'awaiting_confirmation', services, source_id: sourceId, next: { command, user_message: message } },
@@ -291,6 +293,7 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
   const denied: PermissionGuide[] = [];
   const pending: PermissionGuide[] = [];
   const broken: Array<{ service: AppleService; code: string; fix: string }> = [];
+  let mailRouting: AppleMailRouting | undefined;
   for (const service of services) {
     let result = await readers.probe(service);
     // Not yet asked (permission_not_determined) is not a denial: macOS has not shown its prompt. A probe never
@@ -299,16 +302,34 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
       await readers.requestAccess(service);
       result = await readers.probe(service);
     }
-    if (result.ok) { probes.push({ service, ok: true }); continue; }
+    if (result.ok) { probes.push({ service, ok: true }); if (service === 'mail' && result.routing) mailRouting = result.routing; continue; }
     probes.push({ service, ok: false, code: result.code, fix: result.fix });
     if (result.code === 'permission_not_determined') pending.push(permissionGuide(service, result.code, result.fix));
     else if (USER_ACTION_CODES.includes(result.code)) denied.push(permissionGuide(service, result.code, result.fix));
     else broken.push({ service, code: result.code, fix: result.fix });
   }
+  // Mail accounts are classified from public metadata only. One that cannot be told apart from Google stops setup before
+  // anything is registered or synced, Calendar and Contacts included: the owner decides (fix the account, or opt Mail out).
+  const unknownMail = broken.find((b) => b.service === 'mail' && b.code === 'mail_routing_unknown');
+  if (unknownMail) {
+    const withoutMail = services.filter((x) => x !== 'mail');
+    return fail(errorEnvelope('mail_routing_unknown', 'Mail has an enabled account whose provider cannot be told apart from Google.',
+      'Reading it could import Google mail through Apple Mail, so setup stopped before registering or syncing anything (Calendar and Contacts included).',
+      unknownMail.fix, withoutMail.length > 0 ? { command: setupCommand(f, withoutMail), user_message: 'Re-run without Mail to connect Calendar and Contacts only.' } : undefined));
+  }
   if (broken.length > 0) {
     const first = broken[0]!;
     return fail(errorEnvelope('probe_failed', `The ${first.service} probe failed (${first.code}).`,
       broken.map((b) => `${b.service}: ${b.code}`).join('; '), first.fix, { command: setupCommand(f, services, services.includes('mail') ? ['--confirm-mail'] : []) }));
+  }
+  if (mailRouting?.status === 'google_only') {
+    // Every enabled Mail account is Google-hosted: the Google connector owns that mail. Nothing is registered or synced.
+    const withoutMail = services.filter((x) => x !== 'mail');
+    const message = 'Every enabled account in Mail.app is a Google account (Gmail or Google Workspace). gbrain reads that mail through the Google connector, never through Apple Mail, so Apple Mail has nothing to read. '
+      + `Connect Google: ${GOOGLE_SETUP_COMMAND}. ${withoutMail.length > 0 ? `To connect only ${withoutMail.join(' and ')} here, re-run with --services ${withoutMail.join(',')}. ` : ''}Nothing was registered or synced.`;
+    emitEnvelope(out, { ok: false, status: 'awaiting_google_setup', services, source_id: sourceId, probes, mail_routing: routingSummary(mailRouting), next: { command: GOOGLE_SETUP_COMMAND, user_message: message } },
+      [showUserBlock(message, GOOGLE_SETUP_COMMAND), '', `Next: ${GOOGLE_SETUP_COMMAND}`]);
+    return 2;
   }
   if (denied.length > 0 || pending.length > 0) {
     const command = setupCommand(f, services, services.includes('mail') ? ['--confirm-mail'] : []);
@@ -374,12 +395,15 @@ async function runSetup(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promis
     const warning = appleAddPlatformWarning(platform);
     emitEnvelope(out, {
       ok: true, status: 'ok', source_id: registeredId, registered, already_registered: !registered, services: effective, probes,
+      ...(mailRouting ? { mail_routing: routingSummary(mailRouting) } : {}),
       ...(syncSummary ? { sync: { status: syncSummary.status, added: syncSummary.added, modified: syncSummary.modified, deleted: syncSummary.deleted, partial: syncSummary.partial } } : {}),
       ...(existing && existing.cfg.services.join(',') !== services.join(',') ? { note: `Source ${existing.id} already exists with services ${existing.cfg.services.join(', ')}; change them with: gbrain sources set-services ${existing.id} --add|--remove <service>` } : {}),
-      next: { command: next, user_message: `Apple source ${registeredId} ${registered ? 'registered' : 'already registered'} (${effective.join(', ')}).` },
+      next: { command: next, user_message: `Apple source ${registeredId} ${registered ? 'registered' : 'already registered'} (${effective.join(', ')}).`
+        + (mailRouting && mailRouting.google.length > 0 ? ` ${mailRouting.google.length} Google-hosted Mail account(s) are excluded from Apple Mail; read those only through ${GOOGLE_SETUP_COMMAND}.` : '') },
     }, [
       `${registered ? 'Registered' : 'Already registered'} source "${registeredId}" (${effective.join(', ')}); permissions OK for ${services.join(', ')}.`,
       humanSync, ...(warning ? [warning] : []),
+      ...(mailRouting && mailRouting.google.length > 0 ? [`Mail: ${mailRouting.google.length} Google-hosted account(s) are excluded from Apple Mail and read only through the Google connector (${GOOGLE_SETUP_COMMAND}); ${mailRouting.eligible.length} other account(s) are read.`] : []),
       `Unattended runs (autopilot, a daemon) cannot show macOS permission prompts: if a service was never granted, run \`gbrain sync --source ${registeredId}\` once from a terminal on this Mac so macOS can ask. Next: ${next}`,
     ]);
     return 0;
@@ -409,6 +433,7 @@ async function runStatus(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promi
     const { readConnectorCursorState, readAllSourceHolds } = await import('../core/connectors/item-holds-store.ts');
     const report: Array<Record<string, unknown>> = [];
     let unreadable = false;
+    let googleOnly = false;
     for (const s of sources) {
       let recorded: Record<string, { ok: boolean; at: string; code?: string }> = {};
       try { recorded = ((await readConnectorCursorState(engine, { id: s.id, incarnation: s.incarnation, local_path: s.local_path, config: s.config }))?.last_probe ?? {}) as typeof recorded; } catch { /* unknown stays empty */ }
@@ -418,7 +443,8 @@ async function runStatus(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promi
         if (readers) {
           const result = await readers.probe(service);
           if (!result.ok) unreadable = true;
-          perService[service] = result.ok ? { enabled: true, ok: true, live: true }
+          if (result.ok && result.routing?.status === 'google_only') googleOnly = true;
+          perService[service] = result.ok ? { enabled: true, ok: true, live: true, ...(service === 'mail' && result.routing ? { routing: routingSummary(result.routing) } : {}) }
             : { enabled: true, ok: false, live: true, code: result.code, fix: result.fix, ...pick(permissionGuide(service, result.code, result.fix)) };
         } else {
           const last = recorded[service];
@@ -433,15 +459,18 @@ async function runStatus(f: Flags, deps: AppleCommandDeps, out: AppleOut): Promi
     const first = report[0]!;
     emitEnvelope(out, {
       ok: !unreadable, status: unreadable ? 'degraded' : 'ok', sources: report,
-      next: unreadable ? { command: 'gbrain apple setup', user_message: 'An enabled Apple service is unreadable; setup prints the exact System Settings pane to fix.' } : { command: `gbrain sync --source ${String(first.id)}` },
+      next: unreadable ? { command: 'gbrain apple setup', user_message: 'An enabled Apple service is unreadable; setup prints the exact System Settings pane to fix.' }
+        : googleOnly ? { command: GOOGLE_SETUP_COMMAND, user_message: 'Every enabled Mail account is Google-hosted, so Apple Mail reads nothing; connect that mail through the Google connector.' }
+          : { command: `gbrain sync --source ${String(first.id)}` },
     }, report.flatMap((r) => {
-      const svc = r.services as Record<string, { enabled: boolean; ok?: boolean | null; code?: string; fix?: string }>;
+      const svc = r.services as Record<string, { enabled: boolean; ok?: boolean | null; code?: string; fix?: string; routing?: { status: string; apple_accounts: number; google_accounts_excluded: number } }>;
       return [
         `${String(r.id)}  account=${String(r.account)}  last sync: ${String(r.last_sync_at ?? 'never')}  held items: ${String(r.held_items)}`,
         ...ALL_APPLE_SERVICES.map((name) => {
           const v = svc[name]!;
           const state = !v.enabled ? 'disabled' : v.ok === true ? 'readable' : v.ok === false ? `UNREADABLE (${v.code})` : 'not yet probed';
-          return `  ${name}: ${state}${v.ok === false && v.fix ? `\n    fix: ${v.fix}` : ''}`;
+          const route = v.routing ? `\n    accounts: ${v.routing.apple_accounts} read here, ${v.routing.google_accounts_excluded} Google-hosted excluded (read only via ${GOOGLE_SETUP_COMMAND})${v.routing.status === 'google_only' ? '; Apple Mail reads nothing' : ''}` : '';
+          return `  ${name}: ${state}${v.ok === false && v.fix ? `\n    fix: ${v.fix}` : ''}${route}`;
         }),
       ];
     }));

@@ -15,6 +15,7 @@ import { withEnv } from './helpers/with-env.ts';
 import { runCli } from './helpers/cli-spawn.ts';
 import { deriveAppleSourceId, runApple, type AppleCommandDeps } from '../src/commands/apple.ts';
 import type { AppleReaders, AppleService } from '../src/core/apple/types.ts';
+import { buildMailRouting } from '../src/core/apple/mail-routing.ts';
 import type { AppleReaderErrorCode } from '../src/core/apple/readers/errors.ts';
 
 let engine: PGLiteEngine;
@@ -114,6 +115,75 @@ describe('setup', () => {
     expect(bad.code).toBe(1);
     expect(bad.json.error.code).toBe('unknown_service');
     expect((await engine.executeRaw('SELECT id FROM sources WHERE id LIKE $1', ['apple%'])).length).toBe(0);
+  });
+
+  test('Google-only Mail probe waits for gbrain google setup before registration or sync; the relay explains the exclusion', async () => {
+    const google = buildMailRouting([{ id: 'google-account-example', serverName: 'imap.gmail.com', accountType: 'imap', enabled: true }]);
+    let synced = false;
+    const rd: AppleReaders = {
+      async calendar() { throw new Error('setup never reads Calendar data'); },
+      async contacts() { throw new Error('setup never reads Contacts data'); },
+      async mail() { throw new Error('setup never reads Mail data'); },
+      async probe(service) { return service === 'mail' ? { ok: true as const, routing: google } : { ok: true as const }; },
+    };
+    const r = await run(['setup', '--json', '--yes'], { readers: rd, sync: (async () => { synced = true; return okSync(); }) as never });
+    expect(r.code).toBe(2);
+    expect(r.json).toMatchObject({ ok: false, status: 'awaiting_google_setup', mail_routing: { status: 'google_only', google_accounts_excluded: 1 } });
+    expect(r.json.next_action.command).toBe('gbrain google setup');
+    expect(r.json.next_action.user_message).toContain('never through Apple Mail');
+    expect(synced).toBe(false);
+    expect(await engine.executeRaw('SELECT id FROM sources WHERE id LIKE $1', ['apple%'])).toHaveLength(0);
+  });
+
+  test('Apple status points a Google-only Mail account to gbrain google setup, without exposing the Mail account id', async () => {
+    const google = buildMailRouting([{ id: 'google-account-example', serverName: 'imap.gmail.com', accountType: 'imap', enabled: true }]);
+    await engine.executeRaw(`INSERT INTO sources (id, name, local_path, config) VALUES ($1, $1, $2, $3::text::jsonb)`,
+      ['apple-status-example', home, JSON.stringify({ kind: 'apple', a_services: 'mail', a_account: 'status-example' })]);
+    const rd: AppleReaders = {
+      async calendar() { throw new Error('status never reads Calendar data'); }, async contacts() { throw new Error('status never reads Contacts data'); },
+      async mail() { throw new Error('status never reads Mail data'); },
+      async probe(service) { return service === 'mail' ? { ok: true as const, routing: google } : { ok: true as const }; },
+    };
+    const r = await run(['status', '--json', '--source', 'apple-status-example'], { readers: rd });
+    expect(r.code).toBe(0);
+    expect(r.json.next_action.command).toBe('gbrain google setup');
+    expect(r.json.sources[0].services.mail.routing.status).toBe('google_only');
+    expect(JSON.stringify(r.json)).not.toContain('google-account-example');
+  });
+
+  test('an unknown Mail provider stops setup explicitly before registration/sync; Calendar and Contacts may still sync in ordinary syncs', async () => {
+    const rd: AppleReaders = {
+      async calendar() { throw new Error('setup never reads Calendar data'); },
+      async contacts() { throw new Error('setup never reads Contacts data'); },
+      async mail() { throw new Error('setup never reads Mail data'); },
+      async probe(service) { return service === 'mail' ? { ok: false as const, code: 'mail_routing_unknown', fix: 'Disable the account or opt Mail out.' } : { ok: true as const }; },
+    };
+    let synced = false;
+    const r = await run(['setup', '--json', '--yes'], { readers: rd, sync: (async () => { synced = true; return okSync(); }) as never });
+    expect(r.code).toBe(1);
+    expect(r.json.error.code).toBe('mail_routing_unknown');
+    expect(r.json.error.cause).toContain('stopped before registering or syncing');
+    expect(r.json.error.fix).toContain('Disable the account');
+    expect(synced).toBe(false);
+    expect(await engine.executeRaw('SELECT id FROM sources WHERE id LIKE $1', ['apple%'])).toHaveLength(0);
+  });
+
+  test('mixed Mail setup surfaces the Google exclusion without placing account ids/hosts in its public routing summary', async () => {
+    const mixed = buildMailRouting([
+      { id: 'apple-account-example', serverName: 'imap.example.com', accountType: 'imap', enabled: true },
+      { id: 'google-account-example', serverName: 'imap.gmail.com', accountType: 'imap', enabled: true },
+    ]);
+    const rd: AppleReaders = {
+      async calendar() { throw new Error('setup never reads Calendar data'); }, async contacts() { throw new Error('setup never reads Contacts data'); },
+      async mail() { throw new Error('setup never reads Mail data'); },
+      async probe(service) { return service === 'mail' ? { ok: true as const, routing: mixed } : { ok: true as const }; },
+    };
+    const r = await run(['setup', '--json', '--yes', '--no-sync'], { readers: rd });
+    expect(r.code).toBe(0);
+    expect(r.json.mail_routing).toMatchObject({ status: 'mixed', apple_accounts: 1, google_accounts_excluded: 1 });
+    expect(JSON.stringify(r.json.mail_routing)).not.toContain('google-account-example');
+    expect(r.out).not.toContain('imap.gmail.com');
+    expect(r.json.next_action.user_message).toContain('gbrain google setup');
   });
 
   test('a denied service prints a [SHOW USER] block with the exact pane and app, status awaiting_permission, exit 2, nothing registered', async () => {

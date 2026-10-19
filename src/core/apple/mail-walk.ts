@@ -3,8 +3,9 @@ import { appleOwnerDigest } from './loops-status.ts';
 import type { AppleSourceConfig, AppleSourceState } from './types.ts';
 
 export function beginMailWalk(state: AppleSourceState, cfg: AppleSourceConfig, windowStart: Date, full: boolean, reread: boolean,
-  incrementalSince: Date, recover = false, nowIso = new Date().toISOString()): NonNullable<AppleSourceState['mail']['walk']> {
-  const scope = JSON.stringify([cfg.mailDays, [...cfg.mailMailboxes].sort(), appleOwnerDigest(cfg.mailOwnerAddresses)]);
+  incrementalSince: Date, recover = false, nowIso = new Date().toISOString(), routingFingerprint?: string): NonNullable<AppleSourceState['mail']['walk']> {
+  // The routing fingerprint (Mail accounts the walk reads) is part of the scope: a walk begun under other accounts is never resumed.
+  const scope = JSON.stringify([cfg.mailDays, [...cfg.mailMailboxes].sort(), appleOwnerDigest(cfg.mailOwnerAddresses), ...(routingFingerprint ? [routingFingerprint] : [])]);
   const old = state.mail.walk;
   // A hold-recovery walk (`recover`) is a whole-window re-read like an identity reread; it removes nothing. Once begun it
   // runs to completion even after the hold that asked for it is gone, never restarting as an incremental read.

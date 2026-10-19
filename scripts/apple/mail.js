@@ -2,9 +2,23 @@
 //
 // Usage (run by src/core/apple/readers/mail.ts, never from user input):
 //   osascript -l JavaScript mail.js --probe
-//   osascript -l JavaScript mail.js --since <ISO8601> --mailboxes INBOX,Sent [--max 500] [--budget-ms 45000] [--timeout-ms 120000]
+//   osascript -l JavaScript mail.js --accounts
+//   osascript -l JavaScript mail.js --since <ISO8601> --mailboxes INBOX,Sent --routing '[{"id":"<account id>","server_name":"<host>","account_type":"imap"},...]'
+//                                   [--max 500] [--budget-ms 45000] [--timeout-ms 120000]
 //                                   [--after-date <ISO8601> --after-id <id>] [--exclude '["<id>",...]']
-//   osascript -l JavaScript mail.js --targets '[{"id":"<id>","date":"<ISO8601>"},...]' --mailboxes INBOX,Sent [--budget-ms ..] [--timeout-ms ..]
+//   osascript -l JavaScript mail.js --targets '[{"id":"<id>","date":"<ISO8601>"},...]' --mailboxes INBOX,Sent --routing '[...]' [--budget-ms ..] [--timeout-ms ..]
+//
+// Account routing (Google-hosted accounts are read by the Google connector, never here). `--accounts` prints ONLY public
+// account metadata: {"items":[],"accounts":[{"id","server_name","account_type","enabled"}...]} (id, `server name`,
+// `account type`, `enabled`; a property that cannot be read is null). It never reads an account's password, user name,
+// email addresses, full name or display name, and never guesses a provider from an address. gbrain decides which accounts
+// are eligible and passes exactly those, with the metadata it decided on, as `--routing`. Every read REQUIRES `--routing`:
+// the helper re-reads each listed account's metadata and refuses (mail_routing_changed) when an account is gone, disabled
+// or has another server/type, then reads ONLY the mailboxes OF THOSE ACCOUNTS. It never touches Mail's unified INBOX /
+// Sent mailboxes, which would mix every account in. INBOX and Sent are role labels: each routed account must have exactly
+// one top-level mailbox that fits (INBOX: "INBOX"; Sent: Sent, Sent Messages, Sent Items or Sent Mail, case-insensitive),
+// else selection_not_found / selection_ambiguous (no guessing from a localized name). Any other name is matched exactly
+// in each routed account and must exist in at least one.
 //
 // Protocol: prints exactly ONE JSON document on stdout.
 //   success: {"items":[AppleMailMessage...], "truncated":bool, "budget_exhausted":bool, "unavailable":[threadId...],
@@ -91,17 +105,22 @@ function classify(e) {
 }
 
 function parseArgs(argv) {
-  var out = { probe: false, since: null, mailboxes: [], max: DEFAULT_MAX, afterDate: null, afterId: null, budgetMs: DEFAULT_BUDGET_MS, timeoutMs: DEFAULT_TIMEOUT_MS, exclude: null, targets: null };
+  var out = { probe: false, accounts: false, routing: null, since: null, mailboxes: [], max: DEFAULT_MAX, afterDate: null, afterId: null, budgetMs: DEFAULT_BUDGET_MS, timeoutMs: DEFAULT_TIMEOUT_MS, exclude: null, targets: null };
   for (var i = 0; i < argv.length; i++) {
     var a = String(argv[i]);
     if (a === '--') continue;
     if (a === '--probe') { out.probe = true; continue; }
-    if (a === '--since' || a === '--mailboxes' || a === '--max' || a === '--after-date' || a === '--after-id' || a === '--budget-ms' || a === '--timeout-ms' || a === '--exclude' || a === '--targets') {
+    if (a === '--accounts') { out.accounts = true; continue; }
+    if (a === '--since' || a === '--routing' || a === '--mailboxes' || a === '--max' || a === '--after-date' || a === '--after-id' || a === '--budget-ms' || a === '--timeout-ms' || a === '--exclude' || a === '--targets') {
       if (i + 1 >= argv.length) fail('helper_failed', 'missing value for ' + a, 2);
       var v = String(argv[++i]);
       if (a === '--since') out.since = v;
       else if (a === '--after-date') out.afterDate = v;
       else if (a === '--after-id') out.afterId = v;
+      else if (a === '--routing') {
+        try { out.routing = JSON.parse(v); } catch (e) { fail('helper_failed', '--routing must be JSON', 2); }
+        if (!out.routing || !Array.isArray(out.routing.eligible) || !Array.isArray(out.routing.account_ids) || !Array.isArray(out.routing.observed)) fail('helper_failed', '--routing must contain eligible, observed and account_ids arrays', 2);
+      }
       else if (a === '--exclude') out.exclude = parseJsonArray(a, v, function (x) { return typeof x === 'string' && x.length > 0; });
       else if (a === '--targets') {
         out.targets = parseJsonArray(a, v, function (x) { return x && typeof x.id === 'string' && x.id.length > 0 && typeof x.date === 'string' && !isNaN(new Date(x.date).getTime()); });
@@ -177,39 +196,117 @@ function automationFlags(headers) {
   };
 }
 
-function resolveMailboxes(Mail, names) {
+// Public metadata of one account: id, `server name`, `account type`, `enabled` and nothing else. Each read is isolated, so
+// one that fails is null (the caller then cannot classify the account and fails closed). The account's password, user
+// name, email addresses, full name and display name are NEVER read.
+function accountMeta(acct) {
+  function text(f) { try { var v = f(); return typeof v === 'string' ? v : null; } catch (e) { return null; } }
+  var type = null;
+  try { var t = acct.accountType(); type = (t === undefined || t === null) ? null : String(t); } catch (e) { type = null; }
+  var enabled = null;
+  try { var en = acct.enabled(); enabled = typeof en === 'boolean' ? en : null; } catch (e) { enabled = null; }
+  return {
+    id: text(function () { return acct.id(); }),
+    server_name: text(function () { return acct.serverName(); }),
+    account_type: type,
+    enabled: enabled
+  };
+}
+
+// The accounts gbrain decided on (--routing), each re-verified against Mail NOW: still present exactly once, still
+// enabled, same server name and type. Anything else means the routing decision is stale: nothing is read.
+function verifyRouting(accts, routing) {
+  var allowed = routing.eligible;
+  var accountsById = Object.create(null);
+  var dup = Object.create(null);
+  for (var i = 0; i < accts.length; i++) {
+    var m = accountMeta(accts[i]);
+    if (m.id === null) continue;
+    if (accountsById[m.id]) dup[m.id] = true;
+    accountsById[m.id] = { acct: accts[i], meta: m };
+  }
+  var seenAll = Object.keys(accountsById).sort();
+  var expectedAll = routing.account_ids.slice().sort();
+  if (JSON.stringify(seenAll) !== JSON.stringify(expectedAll) || Object.keys(dup).length > 0) fail('mail_routing_changed', 'The Mail accounts changed after gbrain decided which ones to read (an account was added, removed, or duplicated); nothing was read.');
+  // Also compare the public metadata of EVERY account, not just eligible ones: e.g. a Google account re-pointed to an
+  // Apple host under the same id must invalidate this decision before it can be silently skipped or read.
+  var expectedMeta = Object.create(null);
+  routing.observed.forEach(function (m) { expectedMeta[m.id] = m; });
+  for (var oi = 0; oi < seenAll.length; oi++) {
+    var id = seenAll[oi];
+    var current = accountsById[id].meta;
+    var expected = expectedMeta[id];
+    if (!expected || current.server_name !== expected.server_name || current.account_type !== expected.account_type || current.enabled !== expected.enabled) {
+      fail('mail_routing_changed', 'The Mail accounts changed after gbrain decided which ones to read (an account provider or enabled state changed); nothing was read.');
+    }
+  }
+  var scoped = [];
+  var seen = Object.create(null);
+  for (var k = 0; k < allowed.length; k++) {
+    var want = allowed[k];
+    var have = accountsById[want.id];
+    if (seen[want.id] || dup[want.id] || !have || have.meta.enabled !== true || have.meta.server_name !== want.server_name || have.meta.account_type !== want.account_type) {
+      fail('mail_routing_changed', 'The Mail accounts changed after gbrain decided which ones to read (an account was added, removed, disabled, or its server changed); nothing was read.');
+    }
+    seen[want.id] = true;
+    scoped.push({ id: want.id, acct: have.acct });
+  }
+  return scoped;
+}
+
+// INBOX and Sent are ROLES: every routed account must have exactly one top-level mailbox that fits, else this fails
+// explicitly (a localized or unusual folder name is never guessed). Any other name is matched exactly, per account.
+var ROLE_NAMES = { inbox: ['inbox'], sent: ['sent', 'sent messages', 'sent items', 'sent mail'] };
+
+function resolveMailboxes(scoped, names) {
   var found = [];
   var seen = {};
   var missing = [];
-  function add(label, mb) {
-    var key = label + '|' + (function () { try { return mb.id(); } catch (e) { return label; } })();
-    if (seen[key]) return;
-    seen[key] = true;
-    found.push({ label: label, mb: mb });
-  }
-  names.forEach(function (name) {
-    var lower = name.toLowerCase();
-    if (lower === 'inbox') { add('INBOX', Mail.inbox); return; }
-    if (lower === 'sent') { add('Sent', Mail.sentMailbox); return; }
-    if (lower === 'drafts') { add('Drafts', Mail.draftsMailbox); return; }
-    if (lower === 'junk') { add('Junk', Mail.junkMailbox); return; }
-    if (lower === 'trash') { add('Trash', Mail.trash); return; }
-    var before = found.length;
-    var accounts = Mail.accounts();
-    for (var i = 0; i < accounts.length; i++) {
-      var boxes = accounts[i].mailboxes();
+  var lists = scoped.map(function (s) {
+    var named = [];
+    function collect(boxes, prefix) {
       for (var j = 0; j < boxes.length; j++) {
         var bn = '';
         try { bn = String(boxes[j].name()); } catch (e) { continue; }
-        if (bn.toLowerCase() === lower) add(name, boxes[j]);
+        var id = '';
+        try { id = String(boxes[j].id()); } catch (e) { id = prefix + j; }
+        named.push({ idx: prefix + id, name: bn.toLowerCase(), mb: boxes[j] });
+        // Mailbox names are local to each account; nested mailboxes are permitted, but every match remains in that account.
+        try { collect(boxes[j].mailboxes(), prefix + id + '/'); } catch (e) { /* no child mailboxes */ }
       }
     }
+    collect(s.acct.mailboxes(), '');
+    return { id: s.id, boxes: named };
+  });
+  function add(label, accountId, idx, mb) {
+    var key = JSON.stringify([accountId, idx]);
+    if (seen[key]) return;
+    seen[key] = true;
+    found.push({ label: label, key: key, accountId: accountId, mb: mb });
+  }
+  names.forEach(function (name) {
+    var lower = name.toLowerCase();
+    if (lower === 'inbox' || lower === 'sent') {
+      var label = lower === 'inbox' ? 'INBOX' : 'Sent';
+      var accepted = ROLE_NAMES[lower];
+      lists.forEach(function (l) {
+        var hits = l.boxes.filter(function (b) { return accepted.indexOf(b.name) >= 0; });
+        if (hits.length === 0) fail('selection_not_found', 'Mail account ' + l.id + ' has no mailbox for the ' + label + ' role (looked for: ' + accepted.join(', ') + '); name the exact mailbox in the mailbox list.');
+        if (hits.length > 1) fail('selection_ambiguous', 'Mail account ' + l.id + ' has ' + hits.length + ' mailboxes that fit the ' + label + ' role (' + accepted.join(', ') + '); name the exact mailbox in the mailbox list.');
+        add(label, l.id, hits[0].idx, hits[0].mb);
+      });
+      return;
+    }
+    var before = found.length;
+    lists.forEach(function (l) {
+      l.boxes.forEach(function (b) { if (b.name === lower) add(name, l.id, b.idx, b.mb); });
+    });
     if (found.length === before) missing.push(name);
   });
   // A configured mailbox that matches nothing would shrink the listing silently, and a --full
   // sweep reads a short listing as deletions: refuse instead.
   if (missing.length > 0) {
-    fail('selection_not_found', 'No mailbox in Mail.app matches: ' + missing.join(', ') + '.');
+    fail('selection_not_found', 'No mailbox in the routed Mail accounts matches: ' + missing.join(', ') + '.');
   }
   return found;
 }
@@ -220,8 +317,14 @@ function whoseSince(mb, since, until) {
   return mb.messages.whose({ _and: [after, { dateReceived: { _lessThanEquals: until } }] });
 }
 
-function stableMessageId(label, appId, rfcId, headers) {
-  return firstMsgId(String(rfcId || '')) || firstMsgId(headerValue(String(headers || ''), 'Message-ID')) || ('mail-id:' + label + ':' + appId);
+function stableMessageId(entry, appId, rfcId, headers) {
+  var rfc = firstMsgId(String(rfcId || '')) || firstMsgId(headerValue(String(headers || ''), 'Message-ID'));
+  return rfc || ('mail-id:' + entry.accountId + ':' + entry.label + ':' + appId);
+}
+
+// The per-run identity of one message inside one routed mailbox (two accounts can both have an INBOX and equal app ids).
+function msgKey(entry, appId) {
+  return JSON.stringify([entry.key, appId]);
 }
 
 // Metadata-only pass across the mailbox; bodies are fetched only for the bounded page below.
@@ -235,7 +338,7 @@ function listCandidates(entries, since, until) {
     var dates = spec.dateReceived();
     for (var i = 0; i < ids.length; i++) {
       var date = new Date(dates[i]).toISOString();
-      all.push({ entry: entry, appId: ids[i], id: stableMessageId(entry.label, ids[i], rfcIds[i], heads[i]), date: date });
+      all.push({ entry: entry, appId: ids[i], id: stableMessageId(entry, ids[i], rfcIds[i], heads[i]), date: date });
     }
   });
   return all;
@@ -268,10 +371,10 @@ function readMeta(entry, appIds, metaByKey, state) {
   }
   for (var i = 0; i < ids.length; i++) {
     var threadId = '';
-    var key = entry.label + '|' + ids[i];
+    var key = msgKey(entry, ids[i]);
     try {
       var headers = String(heads[i] || '');
-      var id = stableMessageId(entry.label, ids[i], rfcIds[i], headers);
+      var id = stableMessageId(entry, ids[i], rfcIds[i], headers);
       var ref = firstMsgId(headerValue(headers, 'References'));
       var irt = firstMsgId(headerValue(headers, 'In-Reply-To'));
       var subject = String(subjects[i] || '');
@@ -341,7 +444,7 @@ function readBodies(entry, appIds, metaByKey, items, seenIds, state) {
     got[String(ids[q])] = true;
   }
   for (var i = 0; i < ids.length; i++) {
-    var key = entry.label + '|' + ids[i];
+    var key = msgKey(entry, ids[i]);
     var meta = metaByKey[key];
     if (!meta) continue; // no usable metadata: flagUnresolved reports it
     try {
@@ -352,14 +455,14 @@ function readBodies(entry, appIds, metaByKey, items, seenIds, state) {
         state.resolved[key] = true;
         continue;
       }
-      if (seenIds[meta.id]) { state.resolved[key] = true; continue; }
+      if (seenIds[key]) { state.resolved[key] = true; continue; }
       var body = bodies[i];
       if (body.length > BODY_CAP) body = body.slice(0, BODY_CAP);
       var item = {};
       for (var k in meta) item[k] = meta[k];
       item.body = body;
       items.push(item);
-      seenIds[meta.id] = true;
+      seenIds[key] = true;
       state.resolved[key] = true;
     } catch (e) {
       state.unavailable[meta.threadId] = true;
@@ -413,21 +516,21 @@ function readSelectedBodies(selected, metaByKey, items, seenIds, state, clock) {
     var batch = selected.slice(i, i + n);
     i += n;
     var t0 = Date.now();
-    batch.forEach(function (c) { state.attempted[c.entry.label + '|' + c.appId] = true; });
+    batch.forEach(function (c) { state.attempted[msgKey(c.entry, c.appId)] = true; });
     var failed = [];
     groupByEntry(batch).forEach(function (cands, entry) {
       var appIds = cands.map(function (c) { return c.appId; });
       // A group that was already a single read and failed is genuinely unreadable: no point re-reading it.
       if (!readBodies(entry, appIds, metaByKey, items, seenIds, state)) {
         if (cands.length > 1) failed = failed.concat(cands);
-        else state.single[cands[0].entry.label + '|' + cands[0].appId] = true;
+        else state.single[msgKey(cands[0].entry, cands[0].appId)] = true;
       }
     });
     clock.perMessageMs = Math.max(clock.perMessageMs, (Date.now() - t0) / batch.length);
     for (var f = 0; f < failed.length; f++) {
       if (!mayStart(1, clock, false)) return true; // the rest stay unresolved -> unavailable
       var t1 = Date.now();
-      if (!readBodies(failed[f].entry, [failed[f].appId], metaByKey, items, seenIds, state)) state.single[failed[f].entry.label + '|' + failed[f].appId] = true;
+      if (!readBodies(failed[f].entry, [failed[f].appId], metaByKey, items, seenIds, state)) state.single[msgKey(failed[f].entry, failed[f].appId)] = true;
       clock.perMessageMs = Math.max(clock.perMessageMs, Date.now() - t1);
     }
   }
@@ -440,7 +543,7 @@ function readSelectedBodies(selected, metaByKey, items, seenIds, state, clock) {
 // beyond the truncated listing. Metadata-less selected messages are incomplete whether attempted or not.
 function flagUnresolved(selected, metaByKey, state) {
   selected.forEach(function (c) {
-    var key = c.entry.label + '|' + c.appId;
+    var key = msgKey(c.entry, c.appId);
     var meta = metaByKey[key];
     if (!meta) {
       if (!state.metaHandled[key]) state.incomplete = true;
@@ -480,11 +583,18 @@ function run(argv) {
     fail(c[0], c[1]);
   }
   if (args.probe) emit({ items: [], status: 'available' }, 0);
+  if (args.accounts) {
+    var metas = [];
+    for (var ai = 0; ai < accts.length; ai++) metas.push(accountMeta(accts[ai]));
+    emit({ items: [], accounts: metas }, 0);
+  }
 
   if (!args.targets && !args.since) fail('helper_failed', '--since is required', 2);
   var since = args.since ? new Date(args.since) : null;
   if (since && isNaN(since.getTime())) fail('helper_failed', '--since must be ISO8601', 2);
   if (args.mailboxes.length === 0) fail('helper_failed', '--mailboxes is required', 2);
+  // Fail closed: without the accounts gbrain decided on, the only thing left to read would be Mail's unified mailboxes.
+  if (!args.routing || args.routing.eligible.length === 0) fail('helper_failed', '--routing is required: the helper reads only the accounts it is given, never Mail\'s unified mailboxes', 2);
 
   var items = [];
   var state = { unavailable: {}, incomplete: false, metaHandled: {}, attempted: {}, resolved: {}, single: {}, bad: {}, deferred: {}, cand: {} };
@@ -492,7 +602,8 @@ function run(argv) {
   var budgetExhausted = false;
   var targetMissing = [];
   try {
-    var entries = resolveMailboxes(Mail, args.mailboxes);
+    var scoped = verifyRouting(accts, args.routing);
+    var entries = resolveMailboxes(scoped, args.mailboxes);
     var candidates;
     var targetMode = !!args.targets;
     if (targetMode) {
@@ -513,12 +624,14 @@ function run(argv) {
       candidates = listCandidates(entries, since);
     }
     candidates.sort(function (a, b) { return a.date === b.date ? (a.id < b.id ? -1 : a.id > b.id ? 1 : 0) : (a.date < b.date ? -1 : 1); });
-    var candidateIds = {};
-    var excluded = {};
+    var candidateIds = Object.create(null);
+    var excluded = Object.create(null);
     (args.exclude || []).forEach(function (id) { excluded[id] = true; });
     candidates = candidates.filter(function (c) {
-      if (candidateIds[c.id]) return false;
-      candidateIds[c.id] = true;
+      // Deduplicate one message only inside the same account+mailbox; never collapse equal app ids across Mail accounts.
+      var messageKey = msgKey(c.entry, c.appId);
+      if (candidateIds[messageKey]) return false;
+      candidateIds[messageKey] = true;
       if (targetMode) return true;
       // A held message is never listed, read or reported: it costs no body time and cannot starve its neighbours.
       if (excluded[c.id]) return false;
@@ -528,7 +641,7 @@ function run(argv) {
     var selected = targetMode ? candidates : candidates.slice(0, args.max);
     var selectedByEntry = new Map();
     selected.forEach(function (c) {
-      state.cand[c.entry.label + '|' + c.appId] = c;
+      state.cand[msgKey(c.entry, c.appId)] = c;
       if (!selectedByEntry.has(c.entry)) selectedByEntry.set(c.entry, []);
       selectedByEntry.get(c.entry).push(c.appId);
     });

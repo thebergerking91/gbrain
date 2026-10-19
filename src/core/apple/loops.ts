@@ -219,10 +219,11 @@ export async function trackMailLoops(input: TrackInput): Promise<void> {
     return;
   }
   delete loops.complete_at;
-  if (run.gaps.every(gap => gap === 'held_messages')) {
-    // The whole window was re-read cleanly and only held messages remain: nothing more to re-read for them.
+  if (run.gaps.every(gap => gap === 'held_messages' || gap === 'google_routed' || gap === 'disabled_routed')) {
+    // The whole window was re-read cleanly and only held messages, Google-hosted mail (Google connector owns it), or disabled
+    // Mail accounts remain; nothing more to re-read for these excluded items.
     delete loops.reread;
-    log('[apple] mail loops not fresh this run (held_messages); coverage stays incomplete until the held message(s) are read again');
+    log(`[apple] mail loops not fresh this run (${[...new Set(run.gaps)].join(', ')}); coverage stays incomplete until held messages recover and Google/disabled accounts are covered`);
     return;
   }
   loops.reread = true;

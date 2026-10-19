@@ -19,6 +19,7 @@ import { createAppleReaders } from '../src/core/apple/readers/index.ts';
 import { CALENDAR_SCRIPT, normalizeEvent } from '../src/core/apple/readers/calendar.ts';
 import { CONTACTS_SCRIPT, normalizeContact } from '../src/core/apple/readers/contacts.ts';
 import { MAIL_SCRIPT, MAIL_BODY_CAP, normalizeMessage } from '../src/core/apple/readers/mail.ts';
+import { ROUTE_ARGV, singleAccountApp } from './helpers/apple-mail-vm.ts';
 
 let dir = '';
 let fake = '';
@@ -223,7 +224,15 @@ describe('createAppleReaders with a fake helper', () => {
       expect(bad.code).toBe('permission_denied');
       expect(bad.fix).toContain('Contacts');
     }
-    expect(await createAppleReaders(fakeOverrides('ok')).probe('mail')).toEqual({ ok: true });
+    // Mail's probe is the account-metadata read: a helper that returns no `accounts` cannot classify anything, so it is a failure, never a silent pass.
+    const noAccounts = await createAppleReaders(fakeOverrides('ok')).probe('mail');
+    expect(noAccounts.ok).toBe(false);
+    if (!noAccounts.ok) expect(noAccounts.code).toBe('malformed_output');
+    const accounts = join(dir, 'probe-accounts.js');
+    writeFileSync(accounts, `process.stdout.write(JSON.stringify({items:[],accounts:[{id:'a1',server_name:'imap.example.com',account_type:'imap',enabled:true}]}))`);
+    const okMail = await createAppleReaders({ command: process.execPath, scriptArgs: [accounts], platform: 'darwin' }).probe('mail');
+    expect(okMail.ok).toBe(true);
+    if (okMail.ok) expect(okMail.routing?.status).toBe('apple');
   });
 
   test('calendar/contacts/mail normalize helper items', async () => {
@@ -409,7 +418,7 @@ describe('mail listing document', () => {
         content: () => indexes.map((i) => `body-${i}`),
       };
     } };
-    const mailApp = { running: () => true, accounts: () => [{}], inbox: mailbox, sentMailbox: mailbox };
+    const mailApp = singleAccountApp({ INBOX: mailbox });
     const invoke = (argv: string[]): any => {
       let output = '';
       const $: any = (value: string) => ({ dataUsingEncoding: () => value });
@@ -422,7 +431,7 @@ describe('mail listing document', () => {
       expect(exitCode).toBe(0);
       return JSON.parse(output);
     };
-    const argv = ['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX', '--max', '500'];
+    const argv = ['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX', '--max', '500', ...ROUTE_ARGV];
     const first = invoke(argv);
     expect(first.items).toHaveLength(500);
     expect(first.truncated).toBe(true);
@@ -463,7 +472,7 @@ describe('mail listing document', () => {
         content: () => { contentCalls++; fakeNow += bodyMs * indexes.length; return indexes.map((i) => `body-${i}`); },
       };
     } };
-    const mailApp = { running: () => true, accounts: () => [{}], inbox: mailbox, sentMailbox: mailbox };
+    const mailApp = singleAccountApp({ INBOX: mailbox });
     const invoke = (argv: string[]): any => {
       let output = '';
       const $: any = (value: string) => ({ dataUsingEncoding: () => value });
@@ -476,7 +485,7 @@ describe('mail listing document', () => {
       expect(exitCode).toBe(0);
       return JSON.parse(output);
     };
-    const argv = ['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX', '--max', '500', '--budget-ms', '45000'];
+    const argv = ['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX', '--max', '500', '--budget-ms', '45000', ...ROUTE_ARGV];
     // Run 1: the first batch (3 bodies, 60 s of Mail time) spends the budget; the helper keeps it and stops.
     const first = invoke(argv);
     expect(first.items.map((m: { id: string }) => m.id)).toEqual(['<id-000>', '<id-001>', '<id-002>']);
@@ -536,7 +545,7 @@ type MailVmOpts = {
   driftIdsOnContent?: boolean; // the id list changes while content() runs
 };
 const mailDates = (m: number) => new Date(Date.UTC(2026, 9, 10, 8, m));
-const MAIL_ARGV = ['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX,Sent', '--max', '500', '--budget-ms', '45000'];
+const MAIL_ARGV = ['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX,Sent', '--max', '500', '--budget-ms', '45000', ...ROUTE_ARGV];
 
 function makeMailVm(opts: MailVmOpts) {
   const { readFileSync } = require('node:fs') as typeof import('node:fs');
@@ -586,7 +595,7 @@ function makeMailVm(opts: MailVmOpts) {
     } };
     mboxes[label] = mb;
   }
-  const mailApp: any = { running: () => true, accounts: () => { clock.now += opts.accountsMs ?? 0; return [{}]; }, inbox: mboxes.INBOX, sentMailbox: mboxes.Sent };
+  const mailApp: any = singleAccountApp(mboxes, { accountsHook: () => { clock.now += opts.accountsMs ?? 0; } });
   const invoke = (argv: string[]): any => {
     let output = '';
     const $: any = (value: string) => ({ dataUsingEncoding: () => value });
@@ -771,13 +780,13 @@ describe('mail.js message-level verdicts (real helper in a vm, synthetic mailbox
     expect(doc.unavailable).toEqual([]);
     expect(doc.unavailable_messages).toEqual([]);
     expect(t.contentCalls.flat()).not.toContain(1);
-    const capped = ids6().invoke(['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX,Sent', '--max', '3', '--budget-ms', '45000', '--exclude', JSON.stringify([idOf(1)])]);
+    const capped = ids6().invoke(['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX,Sent', '--max', '3', '--budget-ms', '45000', '--exclude', JSON.stringify([idOf(1)]), ...ROUTE_ARGV]);
     expect(idsOf(capped)).toEqual([0, 2, 3].map(idOf));
     expect(capped.truncated).toBe(true);
   });
 
   test('--targets reads exactly the named messages wherever they are (outside any window), reports the missing ones, and proves unreadable ones', () => {
-    const argv = (targets: Array<{ id: string; date: string }>) => ['--targets', JSON.stringify(targets), '--mailboxes', 'INBOX,Sent', '--budget-ms', '45000'];
+    const argv = (targets: Array<{ id: string; date: string }>) => ['--targets', JSON.stringify(targets), '--mailboxes', 'INBOX,Sent', '--budget-ms', '45000', ...ROUTE_ARGV];
     const t = ids6({ throwFor: (ids) => ids.includes(4) });
     const doc = t.invoke(argv([
       { id: idOf(2), date: mailDates(2).toISOString() },
@@ -847,6 +856,14 @@ describe('helper scripts: source-level guards (static; the scripts are not run h
     expect(run.indexOf('Mail.running()')).toBeLessThan(run.indexOf('Mail.accounts()'));
     expect(run.indexOf('args.probe')).toBeGreaterThan(run.indexOf('Mail.running()')); // the check precedes the probe branch
     expect(js).not.toContain('byId');
+    // The unified application mailboxes mix every account (Google included): the helper reads only the accounts it is given.
+    const code = js.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    for (const unified of ['Mail.inbox', 'Mail.sentMailbox', 'Mail.draftsMailbox', 'Mail.junkMailbox', 'Mail.trash', 'Mail.outbox']) expect(code).not.toContain(unified);
+    // Public account metadata only: never a credential, an address or a display name.
+    for (const secret of ['password', 'userName', 'emailAddresses', 'fullName', '.name()']) {
+      const metaFn = code.slice(code.indexOf('function accountMeta'), code.indexOf('function verifyRouting'));
+      expect(metaFn).not.toContain(secret);
+    }
   });
   test('swift helpers separate not-determined from denied and honour --request-access', () => {
     for (const f of [CALENDAR_SCRIPT, CONTACTS_SCRIPT]) {

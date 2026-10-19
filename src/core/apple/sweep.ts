@@ -48,10 +48,12 @@ import {
   type AppleSyncSummary,
 } from './sweep-shared.ts';
 import { beginMailWalk } from './mail-walk.ts';
+import { describeUnknownRouting, routingCoversAllAccounts } from './mail-routing.ts';
+import { readerError } from './readers/errors.ts';
 import { MAIL_THREAD_KEY, mergeThreadRef, parseThreadLocator, planMailHolds, readMailHolds, settleReadMessages, threadHoldKey, walkReaches } from './mail-holds.ts';
 import { appleLoopsAvailability } from './loops-status.ts';
 import { prepareLoopsState, trackMailLoops, type AppleLoopsRun } from './loops.ts';
-import type { AppleCalendarEvent, AppleContact, AppleMailListing, AppleSourceState } from './types.ts';
+import type { AppleCalendarEvent, AppleContact, AppleMailListing, AppleMailRouting, AppleSourceState } from './types.ts';
 
 const DAY_MS = 86_400_000;
 
@@ -331,11 +333,69 @@ export function mailReadSince(state: AppleSourceState, windowStart: Date, full: 
   return new Date(Math.max(windowStart.getTime(), from));
 }
 
+/**
+ * Which Mail accounts this run may read. A reader without `mailRouting` (an injected fake) is read as before. An
+ * unclassifiable enabled account stops the WHOLE Mail sweep before anything is read or any state is touched (fail closed).
+ */
+async function resolveMailRouting(ctx: AppleSweepCtx): Promise<AppleMailRouting | undefined> {
+  const { deps } = ctx;
+  if (!deps.readers.mailRouting) return undefined;
+  const routing = await deps.readers.mailRouting(signalOf(ctx));
+  if (routing.status === 'unknown') throw readerError('mail_routing_unknown', 'mail', `${describeUnknownRouting(routing)} The whole Mail sync was skipped and nothing was read.`);
+  if (routing.status === 'no_enabled_accounts') throw readerError('mail_not_running_or_unconfigured', 'mail', 'Mail.app has no enabled account to read.');
+  return routing;
+}
+
+/**
+ * Binds every Mail cursor to the routing scope. A different fingerprint (or none: a cursor from before routing existed)
+ * restarts the read of the window and drops staged recovery evidence, because both were made under another set of accounts
+ * (staged bodies may have come from an account that is now Google). Stored pages and holds are NEVER touched: a hold is not
+ * cleared as gone because its message is no longer in scope, and the sticky `legacy` mark keeps `--full` from removing any
+ * mail page once pages of unknown account origin exist.
+ */
+function applyMailRouting(ctx: AppleSweepCtx, routing: AppleMailRouting, hasPages: boolean): void {
+  const { deps, state } = ctx;
+  const stored = state.mail.routing;
+  if (stored && stored.v === routing.version && stored.fp === routing.fingerprint) return;
+  const m = state.mail;
+  const hashed = Object.keys(m.hashes).length > 0;
+  const hadMail = hasPages || hashed || m.since !== undefined || m.newest !== undefined || m.resume_from !== undefined || m.walk !== undefined || state.mail_recovery !== undefined;
+  const legacy = stored?.legacy === true || hasPages || hashed;
+  state.mail.routing = { v: routing.version, fp: routing.fingerprint, ...(legacy ? { legacy: true as const } : {}) };
+  if (!stored && !hadMail) return; // a first Mail read: nothing was made under another scope
+  delete m.newest; delete m.resume_from; delete m.resume_id; delete m.walk;
+  const staged = state.mail_recovery ? Object.keys(state.mail_recovery.staged).length : 0;
+  delete state.mail_recovery;
+  if (state.mail_loops) { state.mail_loops.reread = true; delete state.mail_loops.complete_at; }
+  deps.log(`[apple] mail account routing ${stored ? 'changed' : 'is new for this cursor'}: the mail window is read again from its start and ${staged} staged recovery message(s) are dropped (they may have come from an account that is no longer read); stored pages and holds are kept`);
+}
+
+/** A read must have been made under exactly the routing this run resolved; anything else is refused before it is rendered. */
+function assertListingScope(listing: AppleMailListing, routing: AppleMailRouting): void {
+  if (listing.routing?.version !== routing.version || listing.routing.fingerprint !== routing.fingerprint) {
+    throw readerError('mail_routing_changed', 'mail', 'the Mail read was not made under the account routing this run resolved');
+  }
+}
+
 export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   const { deps, state, summary } = ctx;
   const windowStart = new Date(deps.now() - deps.cfg.mailDays * DAY_MS);
   // Owner changes and unresolved coverage require a scope-bound whole-window walk.
   const trackLoops = ctx.loops !== undefined && appleLoopsAvailability(deps.cfg).available;
+  // Which Mail accounts may be read at all (Google-hosted ones never are). Resolved first: an unknown account stops here.
+  const routing = await resolveMailRouting(ctx);
+  const ownedPages = await loadOwnedPages(deps, 'apple_thread_id');
+  if (routing) {
+    applyMailRouting(ctx, routing, ownedPages.length > 0);
+    if (routing.eligible.length === 0) {
+      // Every enabled account is Google: Apple Mail has nothing to read, and the mail the Google connector owns is not ours to judge.
+      summary.itemsSeen.mail = 0;
+      summary.incomplete.push('mail:google_only');
+      deps.log('[apple] every enabled Mail account is hosted by Google, so Apple Mail reads nothing (connect them with `gbrain google setup`); stored pages and holds are kept');
+      if (trackLoops && state.mail_loops) { delete state.mail_loops.complete_at; ctx.loops?.gaps.push('google_routed'); }
+      return;
+    }
+  }
   const rereadAll = trackLoops && prepareLoopsState(state, deps.cfg);
   const incrementalSince = mailReadSince(state, windowStart, false);
   // Held messages are not read (they cost body time and would starve their neighbours); the ones that are due for a
@@ -345,7 +405,7 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   if (plan.unreachable.length > 0) {
     deps.log(`[apple] ${plan.unreachable.length} held mail thread(s) have messages older than the mail window (a_mail_days); a window read cannot recover them, so they stay held and mail coverage stays incomplete until the window covers them`);
   }
-  const walk = beginMailWalk(state, deps.cfg, windowStart, deps.opts.full === true, rereadAll, incrementalSince, plan.walk, new Date(deps.now()).toISOString());
+  const walk = beginMailWalk(state, deps.cfg, windowStart, deps.opts.full === true, rereadAll, incrementalSince, plan.walk, new Date(deps.now()).toISOString(), routing?.fingerprint);
   // A full or recovery walk is the evidence that can rebuild a held oversize thread; a held thread is cleared only when it ends.
   const recoveryWalk = walk.recover !== undefined;
   const since = new Date(Math.max(Date.parse(walk.since), Date.parse(state.mail.resume_from ?? '') - 1 || 0));
@@ -353,8 +413,9 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
   const pinsBefore = ctx.pins ?? 0;
   const read = await deps.readers.mail({ since, mailboxes: deps.cfg.mailMailboxes, max: deps.cfg.mailMax,
     ...(state.mail.resume_from && state.mail.resume_id ? { after: { date: state.mail.resume_from, id: state.mail.resume_id } } : {}),
-    ...(plan.exclude.length > 0 ? { exclude: plan.exclude } : {}), ...signalOf(ctx) });
+    ...(plan.exclude.length > 0 ? { exclude: plan.exclude } : {}), ...(routing ? { routing } : {}), ...signalOf(ctx) });
   const listing: AppleMailListing = Array.isArray(read) ? { messages: read } : read;
+  if (routing) assertListingScope(listing, routing);
   const messages = listing.messages;
   const truncated = listing.truncated === true;
   const readable = listing.incomplete !== true;
@@ -367,7 +428,7 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
       : `[apple] mail listing truncated at ${deps.cfg.mailMax} messages (a_mail_max); the rest is read on the next run`);
   }
   const holdRun = await readMailHolds({ holds: ctx.holds, plan, listing, mailboxes: deps.cfg.mailMailboxes,
-    readTargets: deps.readers.mailMessages ? (o) => deps.readers.mailMessages!(o) : undefined, state, now: deps.now, ...signalOf(ctx), log: deps.log });
+    readTargets: deps.readers.mailMessages ? (o) => deps.readers.mailMessages!(o) : undefined, ...(routing ? { routing } : {}), state, now: deps.now, ...signalOf(ctx), log: deps.log });
   if (holdRun.readFailed) summary.status = 'partial';
   // The listing the cursor follows is the main read; messages read by id only feed rendering and open-loop evidence.
   const listed = new Set(messages.map((m) => m.id));
@@ -385,7 +446,7 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
 
   const pathByThread = new Map<string, string>();
   const frontmatterByThread = new Map<string, Record<string, unknown>>();
-  for (const o of await loadOwnedPages(deps, 'apple_thread_id')) {
+  for (const o of ownedPages) {
     const id = str(o.frontmatter.apple_thread_id);
     if (id === null) continue;
     pathByThread.set(id, o.sourcePath);
@@ -506,7 +567,12 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
       // Threads that began before the mail window are out of enumeration scope.
       if (Number.isFinite(firstDate) && firstDate >= windowStart.getTime()) gone.push({ key: tid, path });
     }
-    if (await reconcileRemovals(ctx, 'mail', gone, live.size)) {
+    if (state.mail.routing?.legacy === true) {
+      // Pages of unknown account origin exist (imported before account routing, or from an account since routed away or
+      // disabled), and a page cannot tell which account a thread came from: not listed is NOT proof it was deleted. No mail
+      // page is ever removed automatically here; removing them is an explicit cleanup the owner approves.
+      if (gone.length > 0) deps.log(`[apple] --full kept ${gone.length} mail page(s) no longer listed: some stored mail pages may come from an account the Apple connector no longer reads, so none is removed automatically`);
+    } else if (await reconcileRemovals(ctx, 'mail', gone, live.size)) {
       for (const g of gone) delete state.mail.hashes[g.key];
       for (const tid of Object.keys(state.mail.hashes)) {
         if (!live.has(tid) && !pathByThread.has(tid)) delete state.mail.hashes[tid];
@@ -519,6 +585,11 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
     else if (walk.purpose !== 'incremental' && !truncated && live.size > 0 && summary.failedFiles === failedBefore
       && !holdRun.pin) delete state.mail_loops.coverage_gap;
     if (state.mail_loops.coverage_gap) ctx.loops?.gaps.push('unresolved_coverage');
+  }
+  // Mail the Google connector owns is never read here, so the answer is never "complete": it does not force a re-read (nothing more to read).
+  if (trackLoops && ctx.loops && routing) {
+    if (routing.google.length > 0) ctx.loops.gaps.push('google_routed');
+    if (routing.disabled.length > 0) ctx.loops.gaps.push('disabled_routed');
   }
   if (trackLoops && ctx.loops) {
     const slugByThread = new Map(landedSlug);
@@ -566,7 +637,11 @@ export async function sweepMail(ctx: AppleSweepCtx): Promise<void> {
       if (ctx.failedKeys?.has(record.key) || notLanded.has(id)) continue;
       if (landed.has(id)) ctx.holds.succeed(record.key);
       // Never seen by a walk that reaches all of it: gone upstream. One the window cannot reach (or whose reach is unknown) stays.
-      else if (!live.has(id) && walkReaches(parseThreadLocator(record.ref), walk.since) === 'yes') { ctx.holds.shouldAttempt(record.key); ctx.holds.drop(record.key); }
+      else if (!live.has(id) && (!routing || routingCoversAllAccounts(routing)) && walkReaches(parseThreadLocator(record.ref), walk.since) === 'yes') {
+        // An incomplete provider scope may simply have excluded every message in this held thread (Google / disabled account).
+        // Never clear an old thread hold as gone merely because it was filtered; the owner can remove it explicitly.
+        ctx.holds.shouldAttempt(record.key); ctx.holds.drop(record.key);
+      }
     }
   }
   if (!unresolved && truncated && messages.length > 0) {

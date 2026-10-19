@@ -1,9 +1,10 @@
 # Connecting Apple (Calendar, Contacts, Mail on macOS)
 
-gbrain's apple connector ingests your Mac's Calendar events, Contacts and Mail
+gbrain's apple connector ingests your Mac's Calendar events, Contacts and eligible Mail
 threads into your brain as pages, the same way the [google connector](google-connect.md)
-does for Google accounts, but with no cloud account in the middle: it reads the
-data already on your Mac.
+does for Google accounts. It reads data already on your Mac, but Mail accounts hosted by Google
+(Gmail and Google Workspace) are **excluded from Apple Mail** and read only through the Google
+connector.
 
 It is **read-only** toward Apple, holds **no credentials**, and works **only on
 macOS 14 (Sonoma) or newer with Xcode Command Line Tools 15 or newer**
@@ -25,7 +26,7 @@ gbrain apple setup
 `setup` is idempotent (re-running is always safe) and walks the chain:
 
 1. resolves the effective source and privacy scope, then confirms **Mail** with you (it is the most sensitive service; see
-   [Mail confirmation](#mail-confirmation)),
+   [Mail confirmation](#mail-confirmation)), including the exclusion of Google-hosted accounts,
 2. probes each selected service for the macOS permission it needs. A service
    macOS has **not asked about yet** (`permission_not_determined`, not a denial)
    gets its prompt: when you run setup in a terminal (or pass `--yes`) gbrain
@@ -68,6 +69,42 @@ contacts only**. Including Mail needs `mail` in `--services` **and**
 `--confirm-mail` (error `mail_confirmation_required` otherwise).
 An unknown or empty value is an error (`unknown_service` / `empty_services`);
 it is never widened to "everything", because Mail and Contacts are private data.
+
+### Google Mail account routing
+
+When Mail is selected, setup and each Mail sync read only Mail's **public account metadata**: account id,
+server name, account type and enabled state. They never read account passwords, user names, email addresses
+or full names. A Google address is not used as a provider signal: the decision is based on Mail's configured
+receiving server, so a `gmail.com` address hosted elsewhere is not assumed to be Google and Google Workspace
+on a custom domain is still excluded when its receiving server is Gmail's.
+
+The documented Gmail receiving hosts are `imap.gmail.com`, `imap.googlemail.com`, `pop.gmail.com` and
+`pop.googlemail.com`. Enabled accounts on these hosts are excluded from Apple Mail; connect them with
+`gbrain google setup`. Other enabled accounts are read one account at a time. Apple Mail's unified Inbox and
+Sent mailboxes are never used, because they can mix all accounts. The default `INBOX,Sent` mailboxes are
+resolved separately in every Apple-eligible account. A missing or ambiguous localized Sent mailbox is an
+explicit `selection_not_found` / `selection_ambiguous` error; gbrain does not guess which folder is meant.
+
+An enabled account with an unreadable account id, enabled state, server name, malformed/Google-like but
+undocumented host, or unsupported account type makes provider routing unknown. **The entire Mail read stops
+before reading any Mail, rather than risk importing Google mail.** Setup will not register or sync that source;
+an ordinary sync reports `mail_routing_unknown` for Mail while Calendar and Contacts can still run. Fix or
+disable that account in Mail, or opt Mail out with `gbrain sources set-services <source> --remove mail`.
+If all enabled accounts are Google-hosted, Apple Mail reads nothing: setup waits for `gbrain google setup`;
+Calendar and Contacts can still be connected separately.
+
+The Mail cursor is bound to a fingerprint of the eligible account ids, normalized hosts and account types. A
+provider change under the same account id is a scope change: the next read starts over from the configured
+window, not a stale cursor. Recovered Mail text staged under the previous account scope is dropped. Account
+routing changes never delete or replace stored Mail pages, never clear a hold because a message was filtered,
+and never claim Mail coverage for Google messages Apple did not read.
+
+When account routing is first introduced to an existing Apple Mail source, its old pages have no saved owner-account
+id: their provider can no longer be proved. They and the old hashes/holds remain. A later `--full` keeps **all**
+Mail pages that are no longer listed, even if mass-reconcile is enabled: not listed under the new provider filter is
+not evidence that the message was deleted. Explicit cleanup is not automatic; remove legacy pages only after you
+have reviewed and approved that cleanup. New pages written under a known, unchanged routed scope can still be
+reconciled normally by `--full` until a routing change makes their origin unknown.
 
 Change them later with `gbrain sources set-services <source> --add|--remove <service>`
 (`--add mail` also needs `--confirm-mail`).
@@ -134,7 +171,7 @@ Because Mail is the most sensitive service, `setup` refuses to touch it without
 an explicit `--confirm-mail` (or `--yes`) and exits 2 with `awaiting_confirmation`
 and the exact command to run. The confirmation message states what is read
 (subject, sender, recipients, date and plain-text body of recent messages from the
-configured mailboxes), and that attachments are never downloaded. Opting Mail out
+configured mailboxes), that attachments are never downloaded, and that Gmail / Google Workspace mail is not read here and must use the Google connector. Opting Mail out
 (`--services calendar,contacts`) needs no confirmation.
 
 An explicit `--source` takes precedence over account labels. Without it, duplicate
@@ -342,7 +379,11 @@ gbrain apple loops --source apple-local --mail-owner-addresses me@example.com   
 | `mail_not_running_or_unconfigured` | Mail.app has no account / is not ready | open Mail, add an account, retry |
 | `helper_timeout` | a helper ran over its 120 s limit | retry (Mail bodies are budgeted and resume, so a repeat usually means a stuck permission dialog); narrow the window or mailboxes |
 | `permission_not_determined` | macOS has not asked yet (not a denial) | run `gbrain apple setup` interactively and click Allow |
-| `selection_not_found` | a configured calendar id or mailbox matches nothing | fix `--calendar-ids` / `--mail-mailboxes` |
+| `selection_not_found` | a configured calendar id or mailbox matches nothing (INBOX/Sent must resolve per eligible account) | fix `--calendar-ids` / `--mail-mailboxes` |
+| `selection_ambiguous` | more than one mailbox fits the INBOX/Sent role in one account | name the exact mailbox in `--mail-mailboxes` |
+| `mail_routing_unknown` | an enabled Mail account's provider cannot be safely determined | disable/fix that account, or opt Mail out; sync reads no Mail |
+| `mail_routing_changed` | Mail account set/provider changed during a read | retry the sync; it starts over under the new routing |
+| `awaiting_google_setup` | every enabled Mail account is Google-hosted | connect Mail with `gbrain google setup`; Apple Mail reads nothing |
 | `macos_too_old` | the helper needs macOS 14+ / Command Line Tools 15+ | update macOS and the tools (`xcode-select --install`) |
 | `helper_failed` | the helper crashed | install Xcode Command Line Tools 15+ (`xcode-select --install`) |
 | `mail_confirmation_required` | `sources add` / `set-services` included Mail without `--confirm-mail` | confirm with the user, then add `--confirm-mail` |

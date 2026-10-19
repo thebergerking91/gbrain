@@ -78,6 +78,8 @@ export function normalizeAppleState(parsed: unknown): AppleSourceState {
       ...(typeof mail.newest === 'string' ? { newest: mail.newest } : {}),
       ...(typeof mail.resume_from === 'string' ? { resume_from: mail.resume_from } : {}),
       ...(typeof mail.resume_id === 'string' ? { resume_id: mail.resume_id } : {}),
+      ...(isRecord(mail.routing) && typeof mail.routing.v === 'number' && Number.isFinite(mail.routing.v) && typeof mail.routing.fp === 'string' && mail.routing.fp.length > 0
+        ? { routing: { v: mail.routing.v, fp: mail.routing.fp, ...(mail.routing.legacy === true ? { legacy: true as const } : {}) } } : {}),
       ...(isRecord(mail.walk) && typeof mail.walk.key === 'string' && typeof mail.walk.since === 'string'
         && ['full', 'reread', 'incremental'].includes(String(mail.walk.purpose)) && Array.isArray(mail.walk.seen)
         ? { walk: { key: mail.walk.key, since: mail.walk.since, purpose: mail.walk.purpose as 'full' | 'reread' | 'incremental',

@@ -87,6 +87,55 @@ export interface AppleMailMessage {
   bulk?: boolean;
 }
 
+/** Public Mail account metadata the Apple reader may read, as the helper echoes it back to prove the scope it was given. */
+export interface AppleMailAccountScope {
+  id: string;
+  /** The account's `server name` exactly as Mail reported it (not normalized). */
+  serverName: string;
+  /** The account's `account type` exactly as Mail reported it (imap, pop, iCloud). */
+  accountType: string;
+}
+
+export type AppleMailRoutingStatus = 'apple' | 'mixed' | 'google_only' | 'no_enabled_accounts' | 'unknown';
+
+export interface AppleMailRoutingUnknown {
+  /** The account id, or null when Mail would not give one. Never a name or an address. */
+  id: string | null;
+  reason: 'account_id_unreadable' | 'duplicate_account_id' | 'enabled_unreadable' | 'server_name_unreadable' | 'server_name_malformed'
+    | 'google_like_host' | 'account_type_unsupported';
+}
+
+/**
+ * Which Mail accounts the Apple connector may read (mail-routing.ts). Additive: a reader without `mailRouting` behaves as
+ * before. `fingerprint` binds a read, a cursor and staged evidence to the exact scope they were made under.
+ */
+export interface AppleMailAccountObservation {
+  /** Public Mail dictionary metadata echoed back to the helper to refuse a stale routing decision. */
+  id: string;
+  serverName: string | null;
+  accountType: string | null;
+  enabled: boolean | null;
+}
+
+export interface AppleMailRouting {
+  version: number;
+  /** Public identity metadata for every account seen, including Google and disabled; the helper compares it before reading. */
+  observed: AppleMailAccountObservation[];
+  /** Stable ids for every account seen by the metadata probe, including Google and disabled (the helper validates this set). */
+  accountIds: string[];
+  /** SHA-256 of the policy version and every eligible account's (id, host, type); not of Google or disabled accounts. */
+  fingerprint: string;
+  status: AppleMailRoutingStatus;
+  /** Enabled accounts on a non-Google provider: the only accounts a Mail read may touch. */
+  eligible: AppleMailAccountScope[];
+  /** Enabled accounts on a documented Google host: routed to the Google connector, never read here (ids only). */
+  google: string[];
+  /** Disabled accounts: never read (ids only). */
+  disabled: string[];
+  /** Enabled accounts whose provider cannot be determined: any entry makes `status` unknown and stops the Mail sweep. */
+  unknown: AppleMailRoutingUnknown[];
+}
+
 /** One message the reader proved unreadable (stable id, received date, owning thread). */
 export interface AppleUnavailableMessage {
   id: string;
@@ -125,8 +174,15 @@ export interface AppleMailListing {
    * next to `unavailableMessages`, every unavailable thread without a proven message is treated as deferred.
    */
   deferredThreads?: string[];
-  /** Targeted reads only: requested messages the mailbox no longer has (deleted or moved); their holds can be dropped. */
+  /** Targeted reads only: requested messages the mailbox no longer has (deleted or moved); their holds can be dropped. Reported only when the read scope covered every Mail account. */
   targetMissing?: string[];
+  /**
+   * Targeted reads only: requested messages not found in the scoped accounts while other accounts (Google, disabled) are
+   * outside the scope. They may be gone OR merely routed away, so they are never `targetMissing`: their holds are kept.
+   */
+  targetOutOfScope?: string[];
+  /** The routing scope this read was made under (echoed from the request); the sweep refuses a read made under another. */
+  routing?: { version: number; fingerprint: string };
   /** A message could not even be attributed to a thread: nothing may be swept as deleted this run. */
   incomplete?: boolean;
 }
@@ -147,16 +203,23 @@ export interface AppleReaders {
     after?: { date: string; id: string };
     /** Stable ids of held messages the reader must not read (it neither lists nor reports them). */
     exclude?: string[];
+    /** The accounts to read (from `mailRouting`). The macOS helper refuses a read without it: it never reads unified mailboxes. */
+    routing?: AppleMailRouting;
     signal?: AbortSignal;
   }): Promise<AppleMailMessage[] | AppleMailListing>;
   /**
    * Re-reads specific messages by stable id and received date, wherever they are. Optional: a reader without it
    * cannot retry a held message outside the incremental window (the hold stays, visible).
    */
-  mailMessages?(opts: { mailboxes: string[]; targets: AppleMailTarget[]; signal?: AbortSignal }): Promise<AppleMailListing>;
+  mailMessages?(opts: { mailboxes: string[]; targets: AppleMailTarget[]; routing?: AppleMailRouting; signal?: AbortSignal }): Promise<AppleMailListing>;
+  /**
+   * Which Mail accounts may be read (public metadata only: id, server name, account type, enabled). Optional so a read-only
+   * fake needs no stub; a reader without it is read exactly as before.
+   */
+  mailRouting?(opts?: { signal?: AbortSignal }): Promise<AppleMailRouting>;
   probe(
     service: AppleService,
-  ): Promise<{ ok: true } | { ok: false; code: AppleReaderErrorCode; fix: string }>;
+  ): Promise<{ ok: true; routing?: AppleMailRouting } | { ok: false; code: AppleReaderErrorCode; fix: string }>;
   /**
    * Show the macOS permission prompt for a service that has not been asked yet
    * (probe reports `permission_not_determined`) without reading any item.
@@ -254,6 +317,12 @@ export interface AppleSourceState {
     resume_from?: string;
     /** Stable message id at that timestamp, to paginate timestamp ties without repeating them. */
     resume_id?: string;
+    /**
+     * The Mail routing scope every cursor, hash and staged message here was made under (mail-routing.ts). A different
+     * fingerprint (or none: a legacy cursor) resets the cursors and drops staged evidence; stored pages and holds are kept.
+     * `legacy` is sticky: pages may exist that came from accounts the scope no longer reads, so a `--full` never removes mail pages.
+     */
+    routing?: { v: number; fp: string; legacy?: true };
     /** Stable enumeration scope/purpose. A suffix cannot stand in for a different full/identity walk. */
     walk?: {
       key: string; since: string; purpose: 'full' | 'reread' | 'incremental'; seen: string[];

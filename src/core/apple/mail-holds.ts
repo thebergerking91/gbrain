@@ -32,13 +32,18 @@
  *    unresolved, oldest first, in whole-unit packs sized to what the helper has been seen to resolve; units rotate by a
  *    persisted turn (not by failures: truncation is not poison and never counts); a call that resolves nothing ends the run's
  *    reads; the thread is rendered and its hold cleared only when every remembered message is resolved.
+ *  - a targeted read uses the SAME routing scope as the main read (Google-hosted accounts are never read), and a read made
+ *    under another scope aborts the sweep before anything is rendered. A target the scoped read cannot find while accounts
+ *    are routed away or disabled is `targetOutOfScope`, never `targetMissing`: it may live in an account that is no longer
+ *    read, so its hold is kept (the hold is visible, nothing is cleared as gone merely because it was filtered).
  *  - a whole-window walk can prove a thread only when the thread's remembered oldest message lies inside the walk's window
  *    (`ThreadLocator.oldest`); otherwise the hold, the thread and the coverage gap stay until the window covers it again.
  */
 import type { ConnectorHoldSession } from '../connectors/connector-hold-session.ts';
 import { ConnectorItemUnreadableError } from '../connectors/item-holds.ts';
+import { AppleReaderError, readerError } from './readers/errors.ts';
 import { admit, APPLE_MAIL_TARGET_MAX, isEmptyRecovery, reconcileRecovery, stage } from './mail-recovery.ts';
-import type { AppleMailListing, AppleMailMessage, AppleMailRecoveryState, AppleMailTarget, AppleSourceState, AppleUnavailableMessage } from './types.ts';
+import type { AppleMailListing, AppleMailMessage, AppleMailRecoveryState, AppleMailRouting, AppleMailTarget, AppleSourceState, AppleUnavailableMessage } from './types.ts';
 
 export const MAIL_THREAD_KEY = 'mail:';
 export const MAIL_MESSAGE_KEY = 'mail-message:';
@@ -289,7 +294,9 @@ export async function readMailHolds(input: {
   plan: MailHoldPlan;
   listing: AppleMailListing;
   mailboxes: string[];
-  readTargets: ((opts: { mailboxes: string[]; targets: AppleMailTarget[]; signal?: AbortSignal }) => Promise<AppleMailListing>) | undefined;
+  readTargets: ((opts: { mailboxes: string[]; targets: AppleMailTarget[]; routing?: AppleMailRouting; signal?: AbortSignal }) => Promise<AppleMailListing>) | undefined;
+  /** The routing scope this run reads under (absent for a reader without account routing). */
+  routing?: AppleMailRouting;
   state: AppleSourceState;
   now?: () => number;
   signal?: AbortSignal;
@@ -358,9 +365,11 @@ export async function readMailHolds(input: {
         if (batch.size === 0) break;
         let result: AppleMailListing;
         try {
-          result = await input.readTargets({ mailboxes: input.mailboxes, targets: [...batch.values()], ...(input.signal ? { signal: input.signal } : {}) });
+          result = await input.readTargets({ mailboxes: input.mailboxes, targets: [...batch.values()], ...(input.routing ? { routing: input.routing } : {}), ...(input.signal ? { signal: input.signal } : {}) });
         } catch (e) {
           if (input.signal?.aborted) throw e;
+          // The Mail accounts changed under this run: nothing read so far may be rendered, and nothing here counts as a failure.
+          if (e instanceof AppleReaderError && e.code === 'mail_routing_changed') throw e;
           // A targeted read that fails or times out is a SOURCE problem: not an item failure, not a hold. Whatever earlier
           // calls resolved is kept. The batch is halved next time (a smaller ask may fit) and its units go to the back.
           log(`[apple] re-reading held mail messages failed (${e instanceof Error ? e.message : String(e)}); they stay held`);
@@ -368,6 +377,9 @@ export async function readMailHolds(input: {
           rec.capacity = capacity = Math.max(1, Math.floor(batch.size / 2));
           for (const u of members) served.add(u.key);
           break;
+        }
+        if (input.routing && (result.routing?.fingerprint !== input.routing.fingerprint || result.routing.version !== input.routing.version)) {
+          throw readerError('mail_routing_changed', 'mail', 'a targeted Mail read was not made under this run\'s account routing');
         }
         let progress = 0;
         const resolveOne = (id: string): void => { if (!resolvedNow.has(id) && !run.gone.has(id) && !fresh.has(id) && rec.staged[id] === undefined) { progress++; progressed.add(id); } };
@@ -378,6 +390,8 @@ export async function readMailHolds(input: {
           if (stageable(m.id)) stage(rec, m, nowIso); // refused at a bound: kept for this run only
         }
         for (const m of result.unavailableMessages ?? []) if (batch.has(m.id)) { resolveOne(m.id); unavailable.set(m.id, m); resolvedNow.add(m.id); }
+        const outOfScope = (result.targetOutOfScope ?? []).filter((id) => batch.has(id));
+        if (outOfScope.length > 0) log(`[apple] ${outOfScope.length} held mail message(s) were not found in the Mail accounts the Apple connector reads (other accounts are routed away or disabled); they may be gone or may live there, so their holds stay`);
         for (const id of result.targetMissing ?? []) {
           if (!batch.has(id)) continue;
           resolveOne(id);

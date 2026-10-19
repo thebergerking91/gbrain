@@ -14,6 +14,9 @@ export type AppleReaderErrorCode =
   | 'mail_not_running_or_unconfigured'
   | 'permission_not_determined'
   | 'selection_not_found'
+  | 'selection_ambiguous'
+  | 'mail_routing_unknown'
+  | 'mail_routing_changed'
   | 'macos_too_old';
 
 export const APPLE_READER_ERROR_CODES: readonly AppleReaderErrorCode[] = [
@@ -26,6 +29,9 @@ export const APPLE_READER_ERROR_CODES: readonly AppleReaderErrorCode[] = [
   'mail_not_running_or_unconfigured',
   'permission_not_determined',
   'selection_not_found',
+  'selection_ambiguous',
+  'mail_routing_unknown',
+  'mail_routing_changed',
   'macos_too_old',
 ];
 
@@ -73,8 +79,14 @@ export function fixFor(code: AppleReaderErrorCode, service: AppleReaderService):
       return `macOS has not asked for ${SERVICE_LABEL[service]} access yet (not a denial). Run \`gbrain apple setup\` from an interactive session on the Mac (or \`gbrain sync --source <id>\` once) so macOS can show its permission prompt, then click Allow.`;
     case 'selection_not_found':
       return service === 'mail'
-        ? 'A configured mailbox name matched no mailbox in Mail.app, so the listing would be incomplete and nothing was read. Fix a_mail_mailboxes (names as shown in Mail.app, or INBOX/Sent), then retry.'
+        ? 'A configured mailbox name matched no mailbox in Mail.app (INBOX and Sent must exist in EVERY account the Apple connector reads; any other name must exist in at least one), so the listing would be incomplete and nothing was read. Fix a_mail_mailboxes (names exactly as shown in Mail.app; a localized Sent folder needs its own name), then retry.'
         : 'A configured calendar id (a_calendar_ids) matched no calendar on this Mac, so the listing would be incomplete and nothing was read. Remove or correct that id, then retry.';
+    case 'selection_ambiguous':
+      return 'More than one mailbox in a single Mail account fits a role name (INBOX or Sent), and gbrain does not guess which one is meant. Name the exact mailbox in a_mail_mailboxes (names as shown in Mail.app), then retry.';
+    case 'mail_routing_unknown':
+      return 'Mail has an enabled account whose provider gbrain cannot tell apart from Google (an unreadable or Google-like-but-undocumented server name, or an account type it does not know), so the whole Mail sync was skipped and nothing was read. Disable or remove that account in Mail > Settings > Accounts, or opt Mail out: gbrain sources set-services <source> --remove mail. Calendar and Contacts are not affected.';
+    case 'mail_routing_changed':
+      return 'Mail\'s account setup changed while gbrain was reading (an account was added, removed, disabled, or its server changed). Nothing from that read was imported and your stored pages are untouched; run the sync again.';
     case 'macos_too_old':
       return 'The Calendar and Contacts helpers need macOS 14 (Sonoma) or newer with Xcode Command Line Tools 15 or newer. Update macOS and the tools (xcode-select --install, or Software Update), then retry.';
     case 'automation_denied':

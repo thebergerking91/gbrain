@@ -1,6 +1,7 @@
 /** Mail reader: Mail.app public scripting dictionary via scripts/apple/mail.js (JXA, read-only). */
 import { fileURLToPath } from 'node:url';
-import type { AppleMailListing, AppleMailMessage, AppleMailTarget, AppleUnavailableMessage } from '../types.ts';
+import type { AppleMailListing, AppleMailMessage, AppleMailRouting, AppleMailTarget, AppleUnavailableMessage } from '../types.ts';
+import { buildMailRouting, routingCoversAllAccounts, type AppleMailAccountMeta } from '../mail-routing.ts';
 import { readerError } from './errors.ts';
 import { DEFAULT_HELPER_TIMEOUT_MS, runHelperDocument } from './run-helper.ts';
 import { str, strArray, withScriptArgs, type HelperOverrides } from './calendar.ts';
@@ -68,8 +69,27 @@ function unavailableMessagesOf(doc: Record<string, unknown>): { messages: AppleU
   return { messages, malformed };
 }
 
-function listingOf(items: unknown[], doc: Record<string, unknown>): AppleMailListing {
+/**
+ * The `--routing` argument: exactly the accounts the caller decided on, with the metadata it decided on (the helper
+ * re-verifies each against Mail and refuses on any difference). Omitted without routing: the macOS helper then refuses the
+ * read (it never reads unified mailboxes), which is the fail-closed behaviour; injected fake helpers are unaffected.
+ */
+function routingArgs(routing: AppleMailRouting | undefined): string[] {
+  if (!routing) return [];
+  if (routing.eligible.length === 0) throw readerError('mail_not_running_or_unconfigured', 'mail', 'No Mail account is eligible for the Apple connector to read.');
+  return ['--routing', JSON.stringify({
+    eligible: routing.eligible.map((a) => ({ id: a.id, server_name: a.serverName, account_type: a.accountType })),
+    account_ids: routing.accountIds,
+    observed: routing.observed.map((a) => ({ id: a.id, server_name: a.serverName, account_type: a.accountType, enabled: a.enabled })),
+  })];
+}
+
+function listingOf(items: unknown[], doc: Record<string, unknown>, routing?: AppleMailRouting): AppleMailListing {
   const proven = unavailableMessagesOf(doc);
+  // A target missing from the scoped accounts proves the message is GONE only when the scope covered every Mail account.
+  // With a Google or disabled account outside it the message may live there, so it is reported as out of scope instead.
+  const notFound = Array.isArray(doc.target_missing) ? strArray(doc.target_missing) : undefined;
+  const covers = !routing || routingCoversAllAccounts(routing);
   return {
     messages: items.map(normalizeMessage),
     truncated: doc.truncated === true,
@@ -77,40 +97,57 @@ function listingOf(items: unknown[], doc: Record<string, unknown>): AppleMailLis
     unavailableThreads: strArray(doc.unavailable),
     ...(Array.isArray(doc.unavailable_messages) ? { unavailableMessages: proven.messages } : {}),
     ...(Array.isArray(doc.deferred) ? { deferredThreads: strArray(doc.deferred) } : {}),
-    ...(Array.isArray(doc.target_missing) ? { targetMissing: strArray(doc.target_missing) } : {}),
+    ...(notFound && covers ? { targetMissing: notFound } : {}),
+    ...(notFound && !covers ? { targetOutOfScope: notFound } : {}),
+    ...(routing ? { routing: { version: routing.version, fingerprint: routing.fingerprint } } : {}),
     incomplete: doc.incomplete === true || proven.malformed,
   };
 }
 
 export async function readMail(
-  opts: { since: Date; mailboxes: string[]; max?: number; after?: { date: string; id: string }; exclude?: string[]; signal?: AbortSignal },
+  opts: { since: Date; mailboxes: string[]; max?: number; after?: { date: string; id: string }; exclude?: string[]; routing?: AppleMailRouting; signal?: AbortSignal },
   o: HelperOverrides = {},
 ): Promise<AppleMailListing> {
   const { items, doc } = await withScriptArgs('mail.js', o, OSASCRIPT_PREFIX, async (scriptArgs) => {
-    const args = [...scriptArgs, '--since', opts.since.toISOString(), '--mailboxes', opts.mailboxes.join(',')];
+    const args = [...scriptArgs, '--since', opts.since.toISOString(), '--mailboxes', opts.mailboxes.join(','), ...routingArgs(opts.routing)];
     if (opts.max !== undefined) args.push('--max', String(opts.max));
     if (opts.after) args.push('--after-date', opts.after.date, '--after-id', opts.after.id);
     if (opts.exclude?.length) args.push('--exclude', JSON.stringify(opts.exclude));
     args.push('--budget-ms', String(MAIL_BODY_BUDGET_MS), '--timeout-ms', String(o.timeoutMs ?? DEFAULT_HELPER_TIMEOUT_MS));
     return runHelperDocument({ service: 'mail', command: o.command ?? OSASCRIPT_BIN, args, signal: opts.signal, timeoutMs: o.timeoutMs, maxStdoutBytes: o.maxStdoutBytes, platform: o.platform, env: o.env });
   });
-  return listingOf(items, doc);
+  return listingOf(items, doc, opts.routing);
 }
 
 /** Re-reads specific messages (stable id + received date) wherever they are; same time limits as a listing read. */
 export async function readMailMessages(
-  opts: { mailboxes: string[]; targets: AppleMailTarget[]; signal?: AbortSignal },
+  opts: { mailboxes: string[]; targets: AppleMailTarget[]; routing?: AppleMailRouting; signal?: AbortSignal },
   o: HelperOverrides = {},
 ): Promise<AppleMailListing> {
   const { items, doc } = await withScriptArgs('mail.js', o, OSASCRIPT_PREFIX, async (scriptArgs) => {
-    const args = [...scriptArgs, '--targets', JSON.stringify(opts.targets.map((t) => ({ id: t.id, date: t.date }))), '--mailboxes', opts.mailboxes.join(','),
+    const args = [...scriptArgs, '--targets', JSON.stringify(opts.targets.map((t) => ({ id: t.id, date: t.date }))), '--mailboxes', opts.mailboxes.join(','), ...routingArgs(opts.routing),
       '--budget-ms', String(MAIL_BODY_BUDGET_MS), '--timeout-ms', String(o.timeoutMs ?? DEFAULT_HELPER_TIMEOUT_MS)];
     return runHelperDocument({ service: 'mail', command: o.command ?? OSASCRIPT_BIN, args, signal: opts.signal, timeoutMs: o.timeoutMs, maxStdoutBytes: o.maxStdoutBytes, platform: o.platform, env: o.env });
   });
-  return listingOf(items, doc);
+  return listingOf(items, doc, opts.routing);
 }
 
 export async function probeMail(o: HelperOverrides = {}): Promise<void> {
   await withScriptArgs('mail.js', o, OSASCRIPT_PREFIX, (scriptArgs) =>
     runHelperDocument({ service: 'mail', command: o.command ?? OSASCRIPT_BIN, args: [...scriptArgs, '--probe'], timeoutMs: o.timeoutMs ?? 60_000, platform: o.platform, env: o.env }));
+}
+
+/**
+ * Which Mail accounts the Apple connector may read, from the helper's PUBLIC account metadata (id, server name, account
+ * type, enabled; nothing else is ever requested). A document without a well-formed `accounts` array is malformed output.
+ */
+export async function readMailRouting(o: HelperOverrides = {}, signal?: AbortSignal): Promise<AppleMailRouting> {
+  const { doc } = await withScriptArgs('mail.js', o, OSASCRIPT_PREFIX, (scriptArgs) =>
+    runHelperDocument({ service: 'mail', command: o.command ?? OSASCRIPT_BIN, args: [...scriptArgs, '--accounts'], signal, timeoutMs: o.timeoutMs ?? 60_000, platform: o.platform, env: o.env }));
+  if (!Array.isArray(doc.accounts)) throw readerError('malformed_output', 'mail', 'Mail account helper output has no "accounts" array.');
+  const metas: AppleMailAccountMeta[] = doc.accounts.map((raw) => {
+    const a = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+    return { id: a.id, serverName: a.server_name, accountType: a.account_type, enabled: a.enabled };
+  });
+  return buildMailRouting(metas);
 }

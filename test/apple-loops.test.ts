@@ -561,6 +561,7 @@ describe('apple loops — flags, setup disclosure, identity', () => {
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { MAIL_SCRIPT, normalizeMessage } from '../src/core/apple/readers/mail.ts';
+import { ROUTE_ARGV, singleAccountApp } from './helpers/apple-mail-vm.ts';
 
 describe('apple loops — mail.js header classification', () => {
   const headerSets: Array<[string, string, { automated: boolean; bulk: boolean }]> = [
@@ -589,8 +590,8 @@ describe('apple loops — mail.js header classification', () => {
     $.NSUTF8StringEncoding = 1;
     $.NSFileHandle = { fileHandleWithStandardOutput: { writeData: (s: string) => { output = s; } } };
     $.exit = () => {};
-    const sandbox = { ObjC: { import() {} }, $, Application: () => ({ running: () => true, accounts: () => [{}], inbox: mailbox, sentMailbox: mailbox }), console };
-    try { runInNewContext(`${js}\nrun(${JSON.stringify(['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX'])});`, sandbox); } catch (e) { if (!(e as { code?: number }).code) throw e; }
+    const sandbox = { ObjC: { import() {} }, $, Application: () => singleAccountApp({ INBOX: mailbox }), console };
+    try { runInNewContext(`${js}\nrun(${JSON.stringify(['--since', '2026-10-01T00:00:00.000Z', '--mailboxes', 'INBOX', ...ROUTE_ARGV])});`, sandbox); } catch (e) { if (!(e as { code?: number }).code) throw e; }
     const items = JSON.parse(output).items as Array<Record<string, unknown>>;
     expect(items).toHaveLength(headerSets.length);
     for (const item of items) {
