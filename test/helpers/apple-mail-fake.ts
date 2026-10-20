@@ -131,4 +131,3 @@ export function readersOf(f: FakeMail): AppleReaders {
   if (f.noById) delete readers.mailMessages;
   return readers;
 }
-
